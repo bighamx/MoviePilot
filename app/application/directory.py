@@ -316,14 +316,34 @@ def _normalize_download_root(dir_info: _SchemaTransferDirectoryConf) -> Optional
         return None
 
 
-def validate_download_save_path(save_path: str) -> str:
+def validate_download_save_path(
+        save_path: str,
+        allow_unconfigured: bool = False,
+) -> str:
     """
     校验用户传入的下载保存目录，/download/paths 暴露的下载目录配置是允许写入的公共合同。
 
     :param save_path: 下载保存目录，支持本地 /path、远端 <storage>:/path 和旧版订阅中的无前缀远程路径
+    :param allow_unconfigured: 是否允许手动下载使用未配置的绝对路径
     :return: 可直接传给下载接口的规范化保存目录
     """
     value = str(save_path or "").strip()
+    if allow_unconfigured:
+        if value.startswith(("\\\\", "//")):
+            path = PureWindowsPath(value)
+            if not path.is_absolute() or ".." in path.parts:
+                raise ValueError("保存路径必须是绝对路径且不能包含上级目录")
+            return path.as_posix()
+        if WINDOWS_DRIVE_PATTERN.match(value):
+            path = PureWindowsPath(value)
+            if ".." in path.parts:
+                raise ValueError("保存路径不能包含上级目录")
+            return path.as_posix()
+        if value.startswith("/") and not value.startswith("//"):
+            path = _normalize_safe_posix_path(value)
+            return path.as_posix()
+        raise ValueError("保存路径必须是绝对路径")
+
     has_storage_prefix = any(value.startswith(f"{item.value}:") for item in StorageSchema)
     storage, raw_path = _split_file_uri(value)
     target_style, target_path = _normalize_download_path(raw_path, storage)

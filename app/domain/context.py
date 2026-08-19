@@ -726,6 +726,8 @@ class TorrentInfo:
     pri_order: int = 0
     # 种子分类 电影/电视剧/音乐
     category: str = None
+    # 是否为无需外部媒体库识别的成人影视资源
+    adult: bool = False
 
     def __post_init__(self) -> None:
         """将种子声明的媒体身份规范化为统一成对字段。"""

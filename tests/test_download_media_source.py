@@ -47,6 +47,7 @@ def test_download_add_passes_generic_media_source(monkeypatch) -> None:
     assert captured["recognize"]["media_source"] == MediaSource.AniList
     assert captured["recognize"]["media_id"] == "154587"
     assert captured["download"]["context"].media_info is media
+    assert captured["download"]["allow_unconfigured_save_path"] is True
 
 
 def test_download_add_rejects_source_without_media_id() -> None:
@@ -59,6 +60,69 @@ def test_download_add_rejects_source_without_media_id() -> None:
 
     assert response.success is False
     assert response.message == "媒体来源和媒体 ID 必须同时提供"
+
+
+def test_download_add_allows_unrecognized_adult_movie(monkeypatch) -> None:
+    """成人影视没有公共媒体库条目时仍应允许提交下载器。"""
+    captured = {}
+
+    class FakeMediaChain:
+        """模拟标题识别失败。"""
+
+        def recognize_by_meta(self, *_args, **_kwargs):
+            """返回空结果模拟 TMDB 无匹配。"""
+            return None
+
+    class FakeDownloadChain:
+        """记录成人影视下载上下文。"""
+
+        def download_single(self, **kwargs):
+            """保存下载上下文并返回任务ID。"""
+            captured.update(kwargs)
+            return "adult-download-1"
+
+    monkeypatch.setattr(download_endpoint, "MediaChain", FakeMediaChain)
+    monkeypatch.setattr(download_endpoint, "DownloadChain", FakeDownloadChain)
+
+    response = download_endpoint.add(
+        torrent_in=schemas.TorrentInfo(
+            title="PPPE-141 Adult Movie",
+            category=MediaType.MOVIE.value,
+            adult=True,
+        ),
+        current_user=SimpleNamespace(name="tester"),
+    )
+
+    assert response.success is True
+    media = captured["context"].media_info
+    assert media.type == MediaType.MOVIE
+    assert media.title == "Pppe 141"
+    assert media.original_title == "PPPE-141 Adult Movie"
+    assert media.adult is True
+
+
+def test_download_add_still_rejects_unrecognized_normal_movie(monkeypatch) -> None:
+    """普通影视识别失败时不得绕过原有校验。"""
+
+    class FakeMediaChain:
+        """模拟标题识别失败。"""
+
+        def recognize_by_meta(self, *_args, **_kwargs):
+            """返回空结果。"""
+            return None
+
+    monkeypatch.setattr(download_endpoint, "MediaChain", FakeMediaChain)
+
+    response = download_endpoint.add(
+        torrent_in=schemas.TorrentInfo(
+            title="Unknown Normal Movie",
+            category=MediaType.MOVIE.value,
+        ),
+        current_user=SimpleNamespace(name="tester"),
+    )
+
+    assert response.success is False
+    assert response.message == "无法识别媒体信息"
 
 
 def test_subtitle_download_passes_generic_media_source(monkeypatch) -> None:

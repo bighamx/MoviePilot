@@ -199,6 +199,38 @@ def test_validate_download_save_path_accepts_windows_configured_root_and_childre
 
 
 @pytest.mark.parametrize(
+    ("save_path", "expected"),
+    [
+        (r"D:\Adult\Movies", "D:/Adult/Movies"),
+        ("E:/Downloads/Other", "E:/Downloads/Other"),
+        (r"\\server\share\Movies", "//server/share/Movies"),
+        ("/remote/downloads", "/remote/downloads"),
+    ],
+)
+def test_validate_manual_download_save_path_accepts_unconfigured_absolute_path(
+    save_path,
+    expected,
+):
+    """手动下载可把任意绝对路径原样语义传给远程下载器。"""
+    assert validate_download_save_path(save_path, allow_unconfigured=True) == expected
+
+
+@pytest.mark.parametrize(
+    "save_path",
+    [
+        r"D:\Adult\..\Windows",
+        "relative/downloads",
+        "",
+        r"\\server\share\..\other",
+    ],
+)
+def test_validate_manual_download_save_path_rejects_ambiguous_path(save_path):
+    """手动直传仍拒绝相对路径和跨目录写法。"""
+    with pytest.raises(ValueError):
+        validate_download_save_path(save_path, allow_unconfigured=True)
+
+
+@pytest.mark.parametrize(
     "save_path",
     [
         "C:/other",

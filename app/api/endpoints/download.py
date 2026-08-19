@@ -118,6 +118,7 @@ def download(
         username=current_user.name,
         save_path=save_path,
         source="Manual",
+        allow_unconfigured_save_path=True,
     )
     if not did:
         return _SchemaResponse(success=False, message="任务添加失败")
@@ -188,6 +189,14 @@ def add(
             mtype=MediaType.MUSIC if is_music else None,
             music_type=normalized_music_type,
         )
+    if not mediainfo and torrent_in.adult and not is_music:
+        # 成人影视通常没有 TMDB 等公共媒体库条目，保留最小电影信息直接下载。
+        mediainfo = MediaInfo(
+            type=MediaType.MOVIE,
+            title=metainfo.name or torrent_in.title,
+            original_title=torrent_in.title,
+            adult=True,
+        )
     if not mediainfo:
         return _SchemaResponse(success=False, message="无法识别媒体信息")
     # 种子信息
@@ -204,6 +213,7 @@ def add(
         downloader=downloader,
         save_path=save_path,
         source="Manual",
+        allow_unconfigured_save_path=True,
     )
     if not did:
         return _SchemaResponse(success=False, message="任务添加失败")

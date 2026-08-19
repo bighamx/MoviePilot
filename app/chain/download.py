@@ -262,6 +262,7 @@ class DownloadChain(ChainBase):
     def _resolve_media_download_dir(
             media_info: MediaInfo,
             save_path: Optional[str] = None,
+            allow_unconfigured_save_path: bool = False,
     ) -> Tuple[Optional[str], Optional[Path], str]:
         """
         根据媒体信息解析下载目录。
@@ -269,7 +270,10 @@ class DownloadChain(ChainBase):
         storage = 'local'
         if save_path is not None:
             try:
-                validated_save_path = validate_download_save_path(save_path)
+                validated_save_path = validate_download_save_path(
+                    save_path,
+                    allow_unconfigured=allow_unconfigured_save_path,
+                )
             except ValueError as err:
                 logger.warn(str(err))
                 return None, None, str(err)
@@ -1011,7 +1015,9 @@ class DownloadChain(ChainBase):
                         username: Optional[str] = None,
                         label: Optional[str] = None,
                         return_detail: bool = False,
-                        custom_words: Optional[str] = None) -> Union[Optional[str], Tuple[Optional[str], Optional[str]]]:
+                        custom_words: Optional[str] = None,
+                        allow_unconfigured_save_path: bool = False
+                        ) -> Union[Optional[str], Tuple[Optional[str], Optional[str]]]:
         """
         下载及发送通知
         :param context: 资源上下文
@@ -1027,6 +1033,7 @@ class DownloadChain(ChainBase):
         :param label: 自定义标签
         :param return_detail: 是否返回详细结果；False 时返回下载任务 hash 或 None，True 时返回 (hash, error_msg)
         :param custom_words: 下载来源（如订阅）的完整自定义识别词文本，随下载记录存档，供整理时原样复现识别
+        :param allow_unconfigured_save_path: 是否允许手动下载把未配置的绝对路径直接传给下载器
         :return: return_detail=False 时返回下载任务 hash 或 None；return_detail=True 时返回 (hash, error_msg)
         """
         _torrent = context.torrent_info
@@ -1068,7 +1075,10 @@ class DownloadChain(ChainBase):
 
         if save_path is not None:
             try:
-                save_path = validate_download_save_path(save_path)
+                save_path = validate_download_save_path(
+                    save_path,
+                    allow_unconfigured=allow_unconfigured_save_path,
+                )
             except ValueError as err:
                 logger.warn(str(err))
                 return (None, str(err)) if return_detail else None
@@ -1125,6 +1135,7 @@ class DownloadChain(ChainBase):
         storage, download_dir, error_msg = self._resolve_media_download_dir(
             media_info=_media,
             save_path=save_path,
+            allow_unconfigured_save_path=allow_unconfigured_save_path,
         )
         if not download_dir:
             if error_msg == "未找到下载目录":
