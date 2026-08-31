@@ -398,6 +398,8 @@ class TorrentInfo(OptionalMediaIdentityMixin, BaseModel):
     pri_order: Optional[int] = 0
     # 种子分类 电影/电视剧/音乐
     category: Optional[str] = None
+    # 是否为无需外部媒体库识别的成人影视资源
+    adult: Optional[bool] = False
     # 促销
     volume_factor: Optional[str] = None
     # 剩余免费时间

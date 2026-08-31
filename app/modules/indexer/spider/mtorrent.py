@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import json
 import re
@@ -40,6 +41,11 @@ class MTorrentSpider:
     _tv_category = ['403', '402', '435', '438', '404', '405']
     # 音乐分类：434 为无损音乐，406 为演唱分区
     _music_category = ['434', '406']
+    # 成人影视分类：排除游戏、漫画和写真图集等非视频资源
+    _adult_movie_category = [
+        '410', '424', '437', '431', '429', '430',
+        '426', '432', '436', '440', '425', '412'
+    ]
 
     # API KEY
     _apikey = None
@@ -82,11 +88,14 @@ class MTorrentSpider:
             self._token = indexer.get('token')
             self._timeout = indexer.get('timeout') or 15
 
-    def __get_params(self, keyword: str, mtype: MediaType = None, page: Optional[int] = 0) -> dict:
+    def __get_params(self, keyword: str, mtype: MediaType = None,
+                     page: Optional[int] = 0, mode: str = "normal") -> dict:
         """
         获取请求参数
         """
-        if not mtype:
+        if mode == "adult":
+            categories = self._adult_movie_category
+        elif not mtype:
             categories = []
         elif mtype == MediaType.TV:
             categories = self._tv_category
@@ -99,11 +108,34 @@ class MTorrentSpider:
             keyword = f"https://www.imdb.com/title/{keyword}"
         return {
             "keyword": keyword,
+            "mode": mode,
             "categories": categories,
             "pageNumber": int(page) + 1,
             "pageSize": self._size,
             "visible": 1
         }
+
+    @staticmethod
+    def __get_search_modes(keyword: str, mtype: MediaType = None) -> List[str]:
+        """仅对有关键字的电影或未指定类型搜索同时查询普通区和成人区。"""
+        if keyword and mtype not in (MediaType.TV, MediaType.MUSIC):
+            return ["normal", "adult"]
+        return ["normal"]
+
+    @staticmethod
+    def __merge_search_results(result_groups: List[List[dict]]) -> List[dict]:
+        """按详情链接合并分区搜索结果并保持首次出现顺序。"""
+        merged = []
+        seen = set()
+        for results in result_groups:
+            for torrent in results:
+                identity = torrent.get("page_url") or torrent.get("enclosure")
+                if identity and identity in seen:
+                    continue
+                if identity:
+                    seen.add(identity)
+                merged.append(torrent)
+        return merged
 
     def __parse_result(self, results: List[dict]):
         """
@@ -120,7 +152,8 @@ class MTorrentSpider:
             elif category_value in self._tv_category \
                     and category_value not in self._movie_category:
                 category = MediaType.TV.value
-            elif category_value in self._movie_category:
+            elif category_value in self._movie_category \
+                    or category_value in self._adult_movie_category:
                 category = MediaType.MOVIE.value
             else:
                 category = MediaType.UNKNOWN.value
@@ -150,7 +183,8 @@ class MTorrentSpider:
                 'page_url': self._pageurl % (self._url, result.get('id')),
                 'imdbid': self.__find_imdbid(result.get('imdb')),
                 'labels': labels,
-                'category': category
+                'category': category,
+                'adult': category_value in self._adult_movie_category
             }
             if discount_end_time := status.get('discountEndTime'):
                 torrent['freedate'] = time_tools.format_timestamp(discount_end_time)
@@ -187,11 +221,7 @@ class MTorrentSpider:
         if not self._apikey:
             return True, []
 
-        # 获取请求参数
-        params = self.__get_params(keyword, mtype, page)
-
-        # 发送请求
-        res = RequestUtils(
+        request = RequestUtils(
             headers={
                 "Content-Type": "application/json",
                 "User-Agent": f"{self._ua}",
@@ -200,8 +230,23 @@ class MTorrentSpider:
             proxies=self._proxy,
             referer=f"{self._domain}browse",
             timeout=self._timeout
-        ).post_res(url=self._searchurl, json=params)
-        return self.__process_response(res)
+        )
+        result_groups = []
+        errors = []
+        for mode in self.__get_search_modes(keyword, mtype):
+            params = self.__get_params(keyword, mtype, page, mode)
+            res = request.post_res(url=self._searchurl, json=params)
+            if res and res.status_code == 200:
+                results = res.json().get('data', {}).get("data") or []
+                errors.append(False)
+                result_groups.append(self.__parse_result(results))
+            elif res is not None:
+                logger.warning(f"{self._name} {mode} 区搜索失败，错误码：{res.status_code}")
+                errors.append(True)
+            else:
+                logger.warning(f"{self._name} {mode} 区搜索失败，无法连接 {self._domain}")
+                errors.append(True)
+        return all(errors), self.__merge_search_results(result_groups)
 
     async def async_search(self, keyword: str, mtype: MediaType = None, page: Optional[int] = 0) -> Tuple[bool, List[dict]]:
         """
@@ -211,11 +256,7 @@ class MTorrentSpider:
         if not self._apikey:
             return True, []
 
-        # 获取请求参数
-        params = self.__get_params(keyword, mtype, page)
-
-        # 发送请求
-        res = await AsyncRequestUtils(
+        request = AsyncRequestUtils(
             headers={
                 "Content-Type": "application/json",
                 "User-Agent": f"{self._ua}",
@@ -224,8 +265,29 @@ class MTorrentSpider:
             proxies=self._proxy,
             referer=f"{self._domain}browse",
             timeout=self._timeout
-        ).post_res(url=self._searchurl, json=params)
-        return self.__process_response(res)
+        )
+        modes = self.__get_search_modes(keyword, mtype)
+        responses = await asyncio.gather(*(
+            request.post_res(
+                url=self._searchurl,
+                json=self.__get_params(keyword, mtype, page, mode)
+            )
+            for mode in modes
+        ))
+        result_groups = []
+        errors = []
+        for mode, res in zip(modes, responses):
+            if res and res.status_code == 200:
+                results = res.json().get('data', {}).get("data") or []
+                errors.append(False)
+                result_groups.append(self.__parse_result(results))
+            elif res is not None:
+                logger.warning(f"{self._name} {mode} 区搜索失败，错误码：{res.status_code}")
+                errors.append(True)
+            else:
+                logger.warning(f"{self._name} {mode} 区搜索失败，无法连接 {self._domain}")
+                errors.append(True)
+        return all(errors), self.__merge_search_results(result_groups)
 
     @staticmethod
     def __find_imdbid(imdb: str) -> str:

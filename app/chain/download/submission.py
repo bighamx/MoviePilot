@@ -8,7 +8,10 @@ from typing import Any, Dict, Optional, Set, Tuple, Union, cast
 from urllib.parse import urlencode, urljoin, urlparse
 
 from app.application.configuration import get_chain_runtime_config_snapshot
-from app.application.directory import validate_download_save_path
+from app.application.directory import (
+    normalize_manual_download_save_path,
+    validate_download_save_path,
+)
 from app.application.torrent.download import TorrentHelper
 from app.chain.download.contract import _DownloadOwnerBase
 from app.chain.download.ports import (
@@ -253,6 +256,8 @@ class DownloadSubmissionOwner(_DownloadOwnerBase):
         if save_path is None:
             return None, None
         try:
+            if source == "Manual":
+                return normalize_manual_download_save_path(save_path), None
             return validate_download_save_path(save_path), None
         except ValueError as err:
             logger.warn(str(err))

@@ -12,7 +12,10 @@ import app.chain.download.submission as download_submission
 import app.chain.download.subtitle as download_subtitle
 from app.agent.tools.impl.add_download_tasks import AddDownloadTasksTool
 from app.agent.tools.impl.update_download_tasks import UpdateDownloadTasksTool
-from app.application.directory import validate_download_save_path
+from app.application.directory import (
+    normalize_manual_download_save_path,
+    validate_download_save_path,
+)
 from app.chain.download import DownloadChain
 from app.domain.context import Context, MediaInfo, SubtitleInfo, TorrentInfo
 from app.domain.metainfo import MetaInfo
@@ -202,6 +205,38 @@ def test_validate_download_save_path_accepts_windows_configured_root_and_childre
     )
 
     assert validate_download_save_path(save_path) == expected
+
+
+@pytest.mark.parametrize(
+    ("save_path", "expected"),
+    [
+        (r"D:\Adult\Movies", "D:/Adult/Movies"),
+        ("E:/Downloads/Other", "E:/Downloads/Other"),
+        (r"\\server\share\Movies", "//server/share/Movies"),
+        ("/remote/downloads", "/remote/downloads"),
+    ],
+)
+def test_validate_manual_download_save_path_accepts_unconfigured_absolute_path(
+    save_path,
+    expected,
+):
+    """手动下载可把任意绝对路径原样语义传给远程下载器。"""
+    assert normalize_manual_download_save_path(save_path) == expected
+
+
+@pytest.mark.parametrize(
+    "save_path",
+    [
+        r"D:\Adult\..\Windows",
+        "relative/downloads",
+        "",
+        r"\\server\share\..\other",
+    ],
+)
+def test_validate_manual_download_save_path_rejects_ambiguous_path(save_path):
+    """手动直传仍拒绝相对路径和跨目录写法。"""
+    with pytest.raises(ValueError):
+        normalize_manual_download_save_path(save_path)
 
 
 @pytest.mark.parametrize(
@@ -409,6 +444,44 @@ def test_download_single_rejects_bad_save_path_before_downloader(monkeypatch):
     assert download_id is None
     assert "保存路径" in error_msg
     chain.download.assert_not_called()
+
+
+def test_manual_download_accepts_unconfigured_windows_save_path(monkeypatch):
+    """Web 手动下载可将 Windows 绝对路径直接传给远程下载器。"""
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
+
+    save_path, error_msg = DownloadChain._apply_resource_download_event(
+        context=_build_context(),
+        episodes=None,
+        channel=None,
+        source="Manual",
+        downloader="qbittorrent",
+        save_path=r"D:\Adult\Movies",
+        userid=None,
+        username="tester",
+    )
+
+    assert save_path == "D:/Adult/Movies"
+    assert error_msg is None
+
+
+def test_non_manual_download_still_rejects_unconfigured_save_path(monkeypatch):
+    """订阅和自动下载仍受已配置下载目录白名单保护。"""
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
+
+    save_path, error_msg = DownloadChain._apply_resource_download_event(
+        context=_build_context(),
+        episodes=None,
+        channel=None,
+        source="Subscribe",
+        downloader="qbittorrent",
+        save_path=r"D:\Adult\Movies",
+        userid=None,
+        username="tester",
+    )
+
+    assert save_path == r"D:\Adult\Movies"
+    assert "保存路径" in error_msg
 
 
 def test_download_single_rejects_event_overridden_bad_save_path_before_downloader(monkeypatch):

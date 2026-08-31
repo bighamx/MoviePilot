@@ -339,6 +339,24 @@ def _normalize_download_root(dir_info: _SchemaTransferDirectoryConf) -> Optional
         return None
 
 
+def normalize_manual_download_save_path(save_path: str) -> str:
+    """规范化手动下载传给远程下载器的任意绝对保存路径。"""
+    value = str(save_path or "").strip()
+    if value.startswith(("\\\\", "//")):
+        path = PureWindowsPath(value)
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError("保存路径必须是绝对路径且不能包含上级目录")
+        return path.as_posix()
+    if WINDOWS_DRIVE_PATTERN.match(value):
+        path = PureWindowsPath(value)
+        if ".." in path.parts:
+            raise ValueError("保存路径不能包含上级目录")
+        return path.as_posix()
+    if value.startswith("/") and not value.startswith("//"):
+        return _normalize_safe_posix_path(value).as_posix()
+    raise ValueError("保存路径必须是绝对路径")
+
+
 def validate_download_save_path(save_path: str) -> str:
     """
     校验用户传入的下载保存目录，/download/paths 暴露的下载目录配置是允许写入的公共合同。

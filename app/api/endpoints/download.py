@@ -108,6 +108,8 @@ def _build_unrecognized_media_info(
         type=media_type,
         title=metainfo.name or torrent.title,
         year=metainfo.year,
+        original_title=torrent.title if torrent.adult else None,
+        adult=bool(torrent.adult),
     )
 
 
@@ -256,7 +258,7 @@ def add(
         media_source,
         media_id,
         music_type,
-        allow_unrecognized,
+        allow_unrecognized or bool(torrent_in.adult),
     )
     if error:
         return error
