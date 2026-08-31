@@ -1,11 +1,10 @@
 from pathlib import Path
-from typing import Any, Optional, List, Dict
+from typing import Any, Dict, List, Optional, cast
 
-from app.schemas.workflow import FileItem as _SchemaFileItem
-from app.chain import ChainBase
-from app.runtime.config import settings
 from app.application.directory import DirectoryHelper
+from app.chain.base import ChainBase
 from app.runtime.log import logger
+from app.schemas.workflow import FileItem as _SchemaFileItem
 
 
 class StorageChain(ChainBase):
@@ -100,6 +99,21 @@ class StorageChain(ChainBase):
         """
         return self.run_module("get_file_item", storage=storage, path=path)
 
+    def get_file_item_strict(
+            self,
+            storage: str,
+            path: Path,
+    ) -> Optional[_SchemaFileItem]:
+        """严格查询文件项：确认不存在返回空，provider 或 I/O 失败直接抛出。"""
+        return cast(
+            Optional[_SchemaFileItem],
+            self.run_module_strict(
+                "get_file_item",
+                storage=storage,
+                path=path,
+            ),
+        )
+
     def get_parent_item(self, fileitem: _SchemaFileItem) -> Optional[_SchemaFileItem]:
         """
         获取上级目录项
@@ -148,7 +162,7 @@ class StorageChain(ChainBase):
         """
         删除媒体文件，以及不含媒体文件的目录
         """
-        media_exts = settings.RMT_MEDIAEXT + settings.DOWNLOAD_TMPEXT + settings.RMT_SUBEXT + settings.RMT_AUDIOEXT
+        media_exts = self.runtime_config.media_extensions
         fileitem_path = Path(fileitem.path) if fileitem.path else Path("")
         if len(fileitem_path.parts) <= 2:
             logger.warn(f"【{fileitem.storage}】{fileitem.path} 根目录或一级目录不允许删除")

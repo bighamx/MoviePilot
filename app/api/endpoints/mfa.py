@@ -4,46 +4,43 @@ MFA (Multi-Factor Authentication) API 端点
 """
 
 import json
-from typing import Any, Annotated, Optional
+from typing import Annotated, Any, Optional
 
-from fastapi import Depends, HTTPException, Body, Request, Response
+from fastapi import Body, Depends, HTTPException, Request, Response
 
+from app.adapters.web.security.access import set_or_refresh_resource_token_cookie
+from app.api.dependencies.auth import (
+    get_current_active_user,
+    get_current_active_user_async,
+    get_passkey_service,
+    get_user_service,
+)
+from app.api.principal import ApiPrincipal
+from app.api.response import RAW_RESPONSE_OPENAPI_KEY, ResponseAPIRouter
+from app.application.security.auth import get_configured_auth_service
+from app.application.security.otp import OtpUtils
+from app.application.security.passkey import (
+    PasskeyChallengeStore,
+    PassKeyHelper,
+    PassKeyRegistrationOriginMismatchError,
+    PassKeyRegistrationVerificationError,
+    PasskeyService,
+)
+from app.application.security.token import verify_password
+from app.application.security.user import (
+    UserService,
+    get_configured_user_id_lookup,
+    get_configured_user_name_lookup,
+)
+from app.runtime.log import logger
 from app.schemas.mcp import BaseModel as _SchemaBaseModel
 from app.schemas.mcp import JsonData as _SchemaJsonData
-from app.schemas.mfa import MfaStatusData as _SchemaMfaStatusData
 from app.schemas.mfa import OtpGenerateData as _SchemaOtpGenerateData
 from app.schemas.mfa import PasskeyInfo as _SchemaPasskeyInfo
 from app.schemas.mfa import PasskeyStartData as _SchemaPasskeyStartData
 from app.schemas.response import Response as _SchemaResponse
 from app.schemas.token import Token as _SchemaToken
 from app.schemas.token import TokenPayload as _SchemaTokenPayload
-from app.api.response import RAW_RESPONSE_OPENAPI_KEY, ResponseAPIRouter
-from app.adapters.web.security.access import set_or_refresh_resource_token_cookie
-from app.application.security.token import verify_password
-from app.application.security.auth import get_configured_auth_service
-from app.application.security.user import UserService
-from app.application.security.user import (
-    get_configured_user_id_lookup,
-    get_configured_user_name_lookup,
-)
-from app.application.security.passkeys import (
-    PasskeyService,
-)
-from app.api.principal import ApiPrincipal
-from app.api.deps import (
-    get_current_active_user,
-    get_current_active_user_async,
-    get_user_service,
-    get_passkey_service,
-)
-from app.application.security.passkey import (
-    PassKeyHelper,
-    PassKeyRegistrationOriginMismatchError,
-    PassKeyRegistrationVerificationError,
-    PasskeyChallengeStore,
-)
-from app.runtime.log import logger
-from app.application.security.otp import OtpUtils
 
 router = ResponseAPIRouter()
 
@@ -103,7 +100,11 @@ def _verify_passkey_and_update(
     )
 
     if success:
-        service.update_last_used(passkey, new_sign_count)
+        success = service.compare_and_update_sign_count(
+            passkey_id=passkey.id,
+            expected_sign_count=int(passkey.sign_count or 0),
+            sign_count=new_sign_count,
+        )
 
     return success, new_sign_count
 
@@ -129,31 +130,6 @@ class PassKeyDeleteRequest(_SchemaBaseModel):
 
     passkey_id: int
     password: str
-
-
-# ==================== 通用 MFA 接口 ====================
-
-
-@router.get(
-    "/status/{username}",
-    summary="判断用户是否开启二次验证",
-    response_model=_SchemaResponse[_SchemaMfaStatusData],
-)
-async def mfa_status(
-    username: str,
-    service: UserService = Depends(get_user_service),
-) -> Any:
-    """
-    检查指定用户是否启用了二次验证
-    """
-    user = await service.get_by_name(username)
-    if not user:
-        return _SchemaResponse(success=False, message="用户不存在")
-
-    # 检查是否启用了OTP
-    has_otp = user.is_otp
-
-    return _SchemaResponse(success=True, data={"enabled": bool(has_otp)})
 
 
 # ==================== OTP 相关接口 ====================

@@ -1,23 +1,38 @@
-from typing import List, Any, Annotated, Optional
+from typing import Annotated, Any, List, Optional
 
 import cn2an
-from fastapi import Request, BackgroundTasks, Depends, HTTPException, Header
+from fastapi import Depends, Header, HTTPException, Request
 
-from app.schemas.common import IdData as _SchemaIdData
-from app.schemas.response import Response as _SchemaResponse
-from app.schemas.subscribe import SubscrbieInfo as _SchemaSubscrbieInfo
-from app.schemas.subscribe import SubscribeShare as _SchemaSubscribeShare
-from app.schemas.subscribe import SubscribeShareStatistics as _SchemaSubscribeShareStatistics
-from app.schemas.token import TokenPayload as _SchemaTokenPayload
-from app.schemas.workflow import MediaInfo as _SchemaMediaInfo
-from app.schemas.workflow import Subscribe as _SchemaSubscribe
+from app.adapters.external.server import MoviePilotServerHelper
+from app.adapters.web.security.access import (
+    validate_api_credential_identity,
+    verify_apitoken,
+    verify_token,
+)
+from app.api.context import (
+    get_background_task_registry,
+    get_subscription_repository,
+    resolve_background_task_registry,
+)
+from app.api.dependencies.auth import (
+    get_current_active_user,
+    get_current_active_user_async,
+)
+from app.api.dependencies.subscription import (
+    get_delete_subscribe_command,
+    get_delete_subscriptions_by_identity_command,
+    get_search_subscriptions_command,
+    get_subscription_mutation_service,
+    get_subscription_query_service,
+)
+from app.api.principal import ApiPrincipal
 from app.api.response import ResponseAPIRouter
-from app.chain.subscribe import SubscribeChain
-from app.runtime.config import settings
-from app.domain.context import MediaInfo
-from app.runtime.events import eventmanager
-from app.domain.metainfo import MetaInfo
-from app.adapters.web.security.access import verify_token, verify_apitoken
+from app.application.configuration import (
+    get_api_runtime_config_snapshot,
+    get_configured_system_config,
+)
+from app.application.scheduling import get_scheduler
+from app.application.subscription.contract import SubscriptionQueryPort
 from app.application.subscription.delete import (
     DeleteSubscribeCommand,
     SubscribeDeletionActor,
@@ -25,39 +40,36 @@ from app.application.subscription.delete import (
 from app.application.subscription.identity import (
     DeleteSubscriptionsByIdentityCommand,
 )
-from app.application.subscription.search import (
-    SearchSubscriptionsCommand,
-    SubscribeSearchActor,
-)
-from app.api.principal import ApiPrincipal
-from app.application.subscription.query import SubscriptionQueryService
 from app.application.subscription.mutation import (
     SubscriptionActor,
     SubscriptionMutationService,
 )
-from app.application.configuration import get_configured_system_config
-from app.api.deps import (
-    get_current_active_user,
-    get_current_active_user_async,
-    get_delete_subscribe_command,
-    get_delete_subscriptions_by_identity_command,
-    get_search_subscriptions_command,
-    get_subscription_query_service,
-    get_subscription_mutation_service,
-    get_subscription_sync_mutation_service,
+from app.application.subscription.query import SubscriptionQueryService
+from app.application.subscription.search import (
+    SearchSubscriptionsCommand,
+    SubscribeSearchActor,
 )
-from app.adapters.external.server import MoviePilotServerHelper
-from app.application.scheduling import Scheduler
-from app.schemas.event import SubscribeModifiedEventData
+from app.chain.subscribe.facade import SubscribeChain
+from app.domain.context import MediaInfo
+from app.domain.metainfo import MetaInfo
+from app.runtime.execution import run_in_threadpool
+from app.runtime.tasks import TaskRegistry
+from app.schemas.common import IdData as _SchemaIdData
+from app.schemas.media import normalize_media_source, resolve_media_identity
+from app.schemas.response import Response as _SchemaResponse
+from app.schemas.subscribe import SubscrbieInfo as _SchemaSubscrbieInfo
+from app.schemas.subscribe import SubscribeShare as _SchemaSubscribeShare
+from app.schemas.subscribe import SubscribeShareStatistics as _SchemaSubscribeShareStatistics
+from app.schemas.token import TokenPayload as _SchemaTokenPayload
 from app.schemas.types import (
     MUSIC_ENTITY_ALBUM,
     MUSIC_ENTITY_RECORDING,
     MediaSource,
     MediaType,
-    EventType,
     SystemConfigKey,
 )
-from app.schemas.media import normalize_media_source, resolve_media_identity
+from app.schemas.workflow import MediaInfo as _SchemaMediaInfo
+from app.schemas.workflow import Subscribe as _SchemaSubscribe
 
 router = ResponseAPIRouter()
 
@@ -187,11 +199,8 @@ async def create_subscribe(
         subscribe_in.name = meta.name
         if subscribe_in.season is None:
             subscribe_in.season = meta.begin_season
-    # 标题转换
-    if subscribe_in.name:
-        title = subscribe_in.name
-    else:
-        title = None
+    # 空标题由订阅识别链按显式媒体身份补全，但调用契约始终使用字符串。
+    title = subscribe_in.name or ""
     subscribe_dict = subscribe_in.to_public_write_payload()
     identity_fields = {"media_source", "media_id"}.intersection(
         subscribe_in.model_fields_set
@@ -241,7 +250,6 @@ async def update_subscribe(
     subscribe = await mutation.get_accessible(subscribe_in.id, actor)
     if not subscribe:
         return _SchemaResponse(success=False, message="订阅不存在")
-    old_subscribe_dict = subscribe.to_dict()
     subscribe_dict = subscribe_in.to_public_write_payload(exclude_unset=True)
     identity_fields = {"media_source", "media_id"}.intersection(
         subscribe_in.model_fields_set
@@ -292,16 +300,6 @@ async def update_subscribe(
     )
     if not change:
         return _SchemaResponse(success=False, message="订阅不存在")
-    # 发送订阅调整事件
-    await eventmanager.async_send_event(
-        EventType.SubscribeModified,
-        SubscribeModifiedEventData(
-            subscribe_id=subscribe_in.id,
-            old_subscribe_info=change.old,
-            subscribe_info=change.new,
-            scene="update",
-        ).to_dict(),
-    )
     return _SchemaResponse(success=True)
 
 
@@ -325,16 +323,6 @@ async def update_subscribe_status(
     change = await mutation.update_status(subid, state, actor)
     if not change:
         return _SchemaResponse(success=False, message="订阅不存在")
-    # 发送订阅调整事件
-    await eventmanager.async_send_event(
-        EventType.SubscribeModified,
-        SubscribeModifiedEventData(
-            subscribe_id=subid,
-            old_subscribe_info=change.old,
-            subscribe_info=change.new,
-            scene="status",
-        ).to_dict(),
-    )
     return _SchemaResponse(success=True)
 
 
@@ -367,7 +355,7 @@ def refresh_subscribes(
     """
     if not current_user.is_superuser:
         return _SchemaResponse(success=False, message="订阅不存在")
-    Scheduler().start("subscribe_refresh")
+    get_scheduler().start("subscribe_refresh")
     return _SchemaResponse(success=True)
 
 
@@ -386,15 +374,6 @@ async def reset_subscribes(
     )
     change = await mutation.reset(subid, actor)
     if change:
-        await eventmanager.async_send_event(
-            EventType.SubscribeModified,
-            SubscribeModifiedEventData(
-                subscribe_id=subid,
-                old_subscribe_info=change.old,
-                subscribe_info=change.new,
-                scene="reset",
-            ).to_dict(),
-        )
         return _SchemaResponse(success=True)
     return _SchemaResponse(success=False, message="订阅不存在")
 
@@ -408,7 +387,7 @@ def check_subscribes(
     """
     if not current_user.is_superuser:
         return _SchemaResponse(success=False, message="订阅不存在")
-    Scheduler().start("subscribe_tmdb")
+    get_scheduler().start("subscribe_tmdb")
     return _SchemaResponse(success=True)
 
 
@@ -484,17 +463,19 @@ async def delete_subscribe_by_media_identity(
 )
 async def seerr_subscribe(
     request: Request,
-    background_tasks: BackgroundTasks,
+    task_registry: Annotated[TaskRegistry, Depends(get_background_task_registry)],
     authorization: Annotated[str | None, Header()] = None,
 ) -> Any:
     """
     Jellyseerr/Overseerr网络勾子通知订阅
     """
-    if not authorization or authorization != settings.API_TOKEN:
+    if not authorization or authorization != get_api_runtime_config_snapshot().api_token:
         raise HTTPException(
-            status_code=400,
+            status_code=401,
             detail="授权失败",
+            headers={"WWW-Authenticate": "Bearer"},
         )
+    await run_in_threadpool(validate_api_credential_identity)
     req_json = await request.json()
     if not req_json:
         raise HTTPException(
@@ -516,7 +497,7 @@ async def seerr_subscribe(
     user_name = req_json.get("request", {}).get("requestedBy_username")
     # 添加订阅
     if media_type == MediaType.MOVIE:
-        background_tasks.add_task(
+        resolve_background_task_registry(task_registry).create_sync(
             start_subscribe_add,
             mtype=media_type,
             media_source=MediaSource.TMDB,
@@ -526,6 +507,7 @@ async def seerr_subscribe(
             # 电影不传季号，避免被误判为剧集（S00）并污染通知标题
             season=None,
             username=user_name,
+            owner="api.subscribe.seerr",
         )
     else:
         seasons = []
@@ -538,7 +520,7 @@ async def seerr_subscribe(
                 ]
                 break
         for season in seasons:
-            background_tasks.add_task(
+            resolve_background_task_registry(task_registry).create_sync(
                 start_subscribe_add,
                 mtype=media_type,
                 media_source=MediaSource.TMDB,
@@ -547,6 +529,7 @@ async def seerr_subscribe(
                 year="",
                 season=season,
                 username=user_name,
+                owner="api.subscribe.seerr",
             )
 
     return _SchemaResponse(success=True)
@@ -674,7 +657,7 @@ async def user_subscribes(
 )
 def subscribe_files(
     subscribe_id: int,
-    mutation: SubscriptionMutationService = Depends(get_subscription_sync_mutation_service),
+    repository: SubscriptionQueryPort = Depends(get_subscription_repository),
     current_user: ApiPrincipal = Depends(get_current_active_user),
 ) -> Any:
     """
@@ -684,8 +667,8 @@ def subscribe_files(
         name=current_user.name,
         is_superuser=current_user.is_superuser,
     )
-    subscribe = mutation.get_accessible_sync(subscribe_id, actor)
-    if subscribe:
+    subscribe = repository.get(subscribe_id)
+    if subscribe is not None and SubscriptionMutationService.can_access(subscribe, actor):
         return SubscribeChain().subscribe_files_info(subscribe)
     return _SchemaSubscrbieInfo()
 

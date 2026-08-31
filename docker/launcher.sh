@@ -12,6 +12,8 @@ export PATH
 SOURCE_CONTROL_DIR="${MOVIEPILOT_SOURCE_CONTROL_DIR:-/app/docker}"
 IMAGE_CONTROL_DIR="${MOVIEPILOT_IMAGE_CONTROL_DIR:-/usr/local/lib/moviepilot/control}"
 RUNTIME_ROOT="${MOVIEPILOT_RUNTIME_CONTROL_ROOT:-/run/moviepilot/control}"
+UPDATE_PENDING_FILE="${CONFIG_DIR:-/config}/temp/__update_pending__"
+UPDATE_PREVIOUS_APP="/app.__update_previous__"
 CONTROL_FILES=()
 CONTROL_REQUIRED_FILES=(entrypoint.sh update.sh browser.sh cert.sh)
 
@@ -94,7 +96,43 @@ function source_bundle_is_trusted() {
     control_bundle_generation "${control_dir}" >/dev/null
 }
 
+function pending_update_state() {
+    [ -f "${UPDATE_PENDING_FILE}" ] || return 1
+    tr -d '\r\n' < "${UPDATE_PENDING_FILE}"
+}
+
+function pending_recovery_control_dir() {
+    local state
+    local previous_control_dir="${UPDATE_PREVIOUS_APP}/docker"
+
+    state="$(pending_update_state 2>/dev/null || true)"
+    case "${state}" in
+    prepared)
+        [ -e "${UPDATE_PREVIOUS_APP}" ] || return 1
+        if source_bundle_is_trusted "${previous_control_dir}"; then
+            printf '%s\n' "${previous_control_dir}"
+        else
+            # pending 恢复只能使用旧代或镜像控制脚本，不能执行尚未提交的新源码控制脚本。
+            printf '%s\n' "MoviePilot 旧代控制脚本不完整或不可信，回退到镜像内置版本。" >&2
+            printf '%s\n' "${IMAGE_CONTROL_DIR}"
+        fi
+        return 0
+        ;;
+    dependencies|blocked)
+        # 依赖阶段可能已切换到包含新迁移的当前 /app；必须使用当前或镜像控制脚本，
+        # 让 update.sh 保留新代际，而不是先执行旧代控制脚本触发数据库不兼容回退。
+        return 1
+        ;;
+    esac
+    return 1
+}
+
 function select_control_dir() {
+    local recovery_dir
+    if recovery_dir="$(pending_recovery_control_dir)"; then
+        printf '%s\n' "${recovery_dir}"
+        return 0
+    fi
     if source_bundle_is_trusted "${SOURCE_CONTROL_DIR}"; then
         printf '%s\n' "${SOURCE_CONTROL_DIR}"
         return 0

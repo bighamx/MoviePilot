@@ -6,7 +6,8 @@ import sys
 from datetime import datetime
 from typing import Any, Optional
 
-from app.runtime.config import settings
+from app.runtime.settings import get_runtime_setting
+
 from app.doctor.checks import default_checks
 from app.doctor.models import (
     DoctorFinding,
@@ -15,7 +16,7 @@ from app.doctor.models import (
     DoctorSeverity,
 )
 from app.adapters.system.host import SystemUtils
-from version import APP_VERSION
+from app.runtime.version import get_app_version
 
 
 class DoctorRunner:
@@ -34,7 +35,7 @@ class DoctorRunner:
         self.deep = deep
         self.report = DoctorReport(
             generated_at=datetime.now(),
-            version=APP_VERSION,
+            version=get_app_version(),
             environment=self._environment(),
         )
 
@@ -108,12 +109,12 @@ class DoctorRunner:
             "platform": platform.platform(),
             "python": sys.executable,
             "python_version": platform.python_version(),
-            "root_path": str(settings.ROOT_PATH),
-            "config_path": str(settings.CONFIG_PATH),
-            "log_path": str(settings.LOG_PATH),
-            "temp_path": str(settings.TEMP_PATH),
+            "root_path": str(get_runtime_setting('ROOT_PATH')),
+            "config_path": str(get_runtime_setting('CONFIG_PATH')),
+            "log_path": str(get_runtime_setting('LOG_PATH')),
+            "temp_path": str(get_runtime_setting('TEMP_PATH')),
             "is_docker": SystemUtils.is_docker(),
-            "safe_mode": settings.MOVIEPILOT_SAFE_MODE,
+            "safe_mode": get_runtime_setting('MOVIEPILOT_SAFE_MODE'),
             "pid": os.getpid(),
         }
 

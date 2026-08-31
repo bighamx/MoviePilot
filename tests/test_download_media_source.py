@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 from app import schemas
 from app.api.endpoints import download as download_endpoint
@@ -47,7 +48,6 @@ def test_download_add_passes_generic_media_source(monkeypatch) -> None:
     assert captured["recognize"]["media_source"] == MediaSource.AniList
     assert captured["recognize"]["media_id"] == "154587"
     assert captured["download"]["context"].media_info is media
-    assert captured["download"]["allow_unconfigured_save_path"] is True
 
 
 def test_download_add_rejects_source_without_media_id() -> None:
@@ -62,27 +62,61 @@ def test_download_add_rejects_source_without_media_id() -> None:
     assert response.message == "媒体来源和媒体 ID 必须同时提供"
 
 
+def test_download_add_requires_confirmation_when_recognition_fails(monkeypatch) -> None:
+    """未识别的影视资源必须先由用户确认，不能直接提交下载。"""
+    media_chain = Mock()
+    media_chain.recognize_by_meta.return_value = None
+    download_chain = Mock()
+    monkeypatch.setattr(download_endpoint, "MediaChain", lambda: media_chain)
+    monkeypatch.setattr(download_endpoint, "DownloadChain", lambda: download_chain)
+
+    response = download_endpoint.add(
+        torrent_in=schemas.TorrentInfo(
+            title="Harry Potter Complete Collection",
+            category=MediaType.MOVIE.value,
+        ),
+        current_user=SimpleNamespace(name="tester"),
+    )
+
+    assert response.success is False
+    assert response.message == "无法识别媒体信息"
+    assert response.data.requires_confirmation is True
+    download_chain.download_single.assert_not_called()
+
+
+def test_download_add_allows_confirmed_unrecognized_video(monkeypatch) -> None:
+    """用户确认后应使用种子元数据提交未识别的影视合集。"""
+    media_chain = Mock()
+    media_chain.recognize_by_meta.return_value = None
+    download_chain = Mock()
+    download_chain.download_single.return_value = "download-collection"
+    monkeypatch.setattr(download_endpoint, "MediaChain", lambda: media_chain)
+    monkeypatch.setattr(download_endpoint, "DownloadChain", lambda: download_chain)
+
+    response = download_endpoint.add(
+        torrent_in=schemas.TorrentInfo(
+            title="Harry Potter Complete Collection",
+            category="movie",
+        ),
+        allow_unrecognized=True,
+        current_user=SimpleNamespace(name="tester"),
+    )
+
+    assert response.success is True
+    context = download_chain.download_single.call_args.kwargs["context"]
+    assert context.media_info.type == MediaType.MOVIE
+    assert context.media_info.title == "Harry Potter Complete Collection"
+    assert context.media_info.media_id is None
+
+
 def test_download_add_allows_unrecognized_adult_movie(monkeypatch) -> None:
-    """成人影视没有公共媒体库条目时仍应允许提交下载器。"""
-    captured = {}
-
-    class FakeMediaChain:
-        """模拟标题识别失败。"""
-
-        def recognize_by_meta(self, *_args, **_kwargs):
-            """返回空结果模拟 TMDB 无匹配。"""
-            return None
-
-    class FakeDownloadChain:
-        """记录成人影视下载上下文。"""
-
-        def download_single(self, **kwargs):
-            """保存下载上下文并返回任务ID。"""
-            captured.update(kwargs)
-            return "adult-download-1"
-
-    monkeypatch.setattr(download_endpoint, "MediaChain", FakeMediaChain)
-    monkeypatch.setattr(download_endpoint, "DownloadChain", FakeDownloadChain)
+    """成人影视无需额外确认即可使用种子元数据提交下载。"""
+    media_chain = Mock()
+    media_chain.recognize_by_meta.return_value = None
+    download_chain = Mock()
+    download_chain.download_single.return_value = "adult-download"
+    monkeypatch.setattr(download_endpoint, "MediaChain", lambda: media_chain)
+    monkeypatch.setattr(download_endpoint, "DownloadChain", lambda: download_chain)
 
     response = download_endpoint.add(
         torrent_in=schemas.TorrentInfo(
@@ -94,35 +128,60 @@ def test_download_add_allows_unrecognized_adult_movie(monkeypatch) -> None:
     )
 
     assert response.success is True
-    media = captured["context"].media_info
-    assert media.type == MediaType.MOVIE
-    assert media.title == "Pppe 141"
-    assert media.original_title == "PPPE-141 Adult Movie"
-    assert media.adult is True
+    context = download_chain.download_single.call_args.kwargs["context"]
+    assert context.media_info.type == MediaType.MOVIE
+    assert context.media_info.title == "Pppe 141 Adult Movie"
+    assert context.media_info.original_title == "PPPE-141 Adult Movie"
+    assert context.media_info.adult is True
 
 
-def test_download_add_still_rejects_unrecognized_normal_movie(monkeypatch) -> None:
-    """普通影视识别失败时不得绕过原有校验。"""
-
-    class FakeMediaChain:
-        """模拟标题识别失败。"""
-
-        def recognize_by_meta(self, *_args, **_kwargs):
-            """返回空结果。"""
-            return None
-
-    monkeypatch.setattr(download_endpoint, "MediaChain", FakeMediaChain)
+def test_download_add_requires_confirmation_for_unrecognized_music(monkeypatch) -> None:
+    """未识别的音乐资源同样需要先由用户确认，不能直接提交下载。"""
+    media_chain = Mock()
+    media_chain.recognize_by_meta.return_value = None
+    download_chain = Mock()
+    monkeypatch.setattr(download_endpoint, "MediaChain", lambda: media_chain)
+    monkeypatch.setattr(download_endpoint, "DownloadChain", lambda: download_chain)
 
     response = download_endpoint.add(
         torrent_in=schemas.TorrentInfo(
-            title="Unknown Normal Movie",
-            category=MediaType.MOVIE.value,
+            title="Various Artists - 90s Collection",
+            category=MediaType.MUSIC.value,
         ),
+        music_type="album",
         current_user=SimpleNamespace(name="tester"),
     )
 
     assert response.success is False
     assert response.message == "无法识别媒体信息"
+    assert response.data.requires_confirmation is True
+    download_chain.download_single.assert_not_called()
+
+
+def test_download_add_allows_confirmed_unrecognized_music(monkeypatch) -> None:
+    """用户确认后音乐资源也应使用种子元数据继续下载。"""
+    media_chain = Mock()
+    media_chain.recognize_by_meta.return_value = None
+    download_chain = Mock()
+    download_chain.download_single.return_value = "download-music"
+    monkeypatch.setattr(download_endpoint, "MediaChain", lambda: media_chain)
+    monkeypatch.setattr(download_endpoint, "DownloadChain", lambda: download_chain)
+
+    response = download_endpoint.add(
+        torrent_in=schemas.TorrentInfo(
+            title="Various Artists - 90s Collection",
+            category="music",
+        ),
+        music_type="album",
+        allow_unrecognized=True,
+        current_user=SimpleNamespace(name="tester"),
+    )
+
+    assert response.success is True
+    context = download_chain.download_single.call_args.kwargs["context"]
+    assert context.media_info.type == MediaType.MUSIC
+    assert context.media_info.music_type == "album"
+    assert context.media_info.title == "90s Collection"
 
 
 def test_subtitle_download_passes_generic_media_source(monkeypatch) -> None:

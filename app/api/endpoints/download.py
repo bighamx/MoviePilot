@@ -1,7 +1,26 @@
-from typing import Any, List, Annotated, Optional, Union
+from typing import Annotated, Any, List, Optional, Union
 
-from fastapi import Depends, Body
+from fastapi import Body, Depends
 
+from app.adapters.web.security.access import verify_token
+from app.api.dependencies.auth import get_current_active_user
+from app.api.dependencies.site import get_site_sync_query_service
+from app.api.principal import ApiPrincipal
+from app.api.response import ResponseAPIRouter
+from app.application.configuration import get_configured_system_config
+from app.application.directory import DirectoryHelper
+from app.application.security.url import SecurityUtils
+from app.application.site.query import (
+    SiteQueryService,
+    get_configured_site_query_service,
+)
+from app.chain.download import DownloadChain
+from app.chain.media import MediaChain
+from app.domain.context import Context, MediaInfo, MusicInfo, SubtitleInfo, TorrentInfo
+from app.domain.media import is_music_media_source, normalize_music_type
+from app.domain.meta.metabase import MetaBase
+from app.domain.meta.metamusic import MetaMusic
+from app.domain.metainfo import MetaInfo
 from app.schemas.common import ServiceClientInfo as _SchemaServiceClientInfo
 from app.schemas.download import DownloadAddedData as _SchemaDownloadAddedData
 from app.schemas.download import DownloadDirectory as _SchemaDownloadDirectory
@@ -13,22 +32,6 @@ from app.schemas.system import TorrentInfo as _SchemaTorrentInfo
 from app.schemas.token import TokenPayload as _SchemaTokenPayload
 from app.schemas.transfer import DownloaderTorrent as _SchemaDownloaderTorrent
 from app.schemas.transfer import MusicInfo as _SchemaMusicInfo
-from app.schemas.workflow import MediaInfo as _SchemaMediaInfo
-from app.api.response import ResponseAPIRouter
-from app.chain.download import DownloadChain
-from app.chain.media import MediaChain
-from app.domain.context import Context, MediaInfo, MusicInfo, SubtitleInfo, TorrentInfo
-from app.domain.meta.metamusic import MetaMusic
-from app.domain.metainfo import MetaInfo
-from app.adapters.web.security.access import verify_token
-from app.api.principal import ApiPrincipal
-from app.application.configuration import get_configured_system_config
-from app.application.site.query import (
-    SiteQueryService,
-    get_configured_site_query_service,
-)
-from app.api.deps import get_current_active_user, get_site_sync_query_service
-from app.application.directory import DirectoryHelper
 from app.schemas.types import (
     MUSIC_ENTITY_RECORDING,
     MediaSource,
@@ -36,8 +39,7 @@ from app.schemas.types import (
     MusicTargetEntityType,
     SystemConfigKey,
 )
-from app.domain.media import is_music_media_source, normalize_music_type
-from app.application.security.url import SecurityUtils
+from app.schemas.workflow import MediaInfo as _SchemaMediaInfo
 
 router = ResponseAPIRouter()
 
@@ -69,6 +71,114 @@ def _prepare_subtitle_download(
     subtitle.site_ua = site.ua
     subtitle.site_proxy = bool(site.proxy)
     return True, ""
+
+
+def _build_unrecognized_media_info(
+    torrent: _SchemaTorrentInfo,
+    metainfo: MetaBase,
+    is_music: bool = False,
+    music_type: Optional[str] = None,
+) -> MediaInfo | MusicInfo:
+    """
+    为用户确认的未识别资源构造最小下载上下文，影视与音乐统一处理。
+
+    影视以种子分类兜底媒体类型并保留标题年份，音乐按解析标题构造音乐信息，
+    两者都不再要求识别出统一媒体信息即可继续下载。
+    """
+    if is_music:
+        return MusicInfo(
+            title=metainfo.title or torrent.title,
+            year=metainfo.year,
+            music_type=music_type or MUSIC_ENTITY_RECORDING,
+        )
+    try:
+        media_type = MediaType(torrent.category)
+    except (TypeError, ValueError):
+        media_type = MediaType.from_agent(torrent.category)
+    if media_type == MediaType.COLLECTION:
+        media_type = MediaType.MOVIE
+    if media_type not in (MediaType.MOVIE, MediaType.TV):
+        media_type = metainfo.type
+        # 合集类型在回退到元数据后同样归一为电影，避免落到 UNKNOWN
+        if media_type == MediaType.COLLECTION:
+            media_type = MediaType.MOVIE
+    if media_type not in (MediaType.MOVIE, MediaType.TV):
+        media_type = MediaType.UNKNOWN
+    return MediaInfo(
+        type=media_type,
+        title=metainfo.name or torrent.title,
+        year=metainfo.year,
+        original_title=torrent.title if torrent.adult else None,
+        adult=bool(torrent.adult),
+    )
+
+
+def _resolve_add_media(
+    torrent_in: _SchemaTorrentInfo,
+    media_source: MediaSource | None,
+    media_id: str | None,
+    music_type: MusicTargetEntityType | None,
+    allow_unrecognized: bool,
+) -> tuple[MetaBase | None, MediaInfo | MusicInfo | None, _SchemaResponse | None]:
+    """校验媒体身份并为无媒体信息下载构建识别上下文。"""
+    normalized_music_type = normalize_music_type(music_type, allow_artist=False)
+    if music_type is not None and not normalized_music_type:
+        return None, None, _SchemaResponse(
+            success=False,
+            message="音乐实体类型无效，仅支持 recording 或 album",
+        )
+    if (media_source is None) != (media_id is None):
+        return None, None, _SchemaResponse(
+            success=False,
+            message="媒体来源和媒体 ID 必须同时提供",
+        )
+    is_music = (
+        torrent_in.category in (MediaType.MUSIC, MediaType.MUSIC.value, "music")
+        or is_music_media_source(media_source)
+        or normalized_music_type is not None
+    )
+    if is_music and media_source and not is_music_media_source(media_source):
+        return None, None, _SchemaResponse(
+            success=False,
+            message="音乐下载只能使用音乐元数据源",
+        )
+    if is_music and not normalized_music_type:
+        normalized_music_type = MUSIC_ENTITY_RECORDING
+    metainfo = (
+        MetaMusic.parse_query(torrent_in.title)
+        if is_music
+        else MetaInfo(title=torrent_in.title, subtitle=torrent_in.description)
+    )
+    if media_source and media_id:
+        mediainfo = MediaChain().recognize_media(
+            meta=metainfo,
+            media_source=media_source,
+            media_id=media_id,
+            mtype=MediaType.MUSIC if is_music else None,
+            music_type=normalized_music_type,
+        )
+    else:
+        mediainfo = MediaChain().recognize_by_meta(
+            metainfo,
+            media_source=media_source,
+            obtain_images=False,
+            mtype=MediaType.MUSIC if is_music else None,
+            music_type=normalized_music_type,
+        )
+    if mediainfo:
+        return metainfo, mediainfo, None
+    if not allow_unrecognized:
+        return metainfo, None, _SchemaResponse(
+            success=False,
+            message="无法识别媒体信息",
+            data=_SchemaDownloadAddedData(requires_confirmation=True),
+        )
+    return metainfo, _build_unrecognized_media_info(
+        torrent_in,
+        metainfo,
+        is_music=is_music,
+        music_type=normalized_music_type,
+    ), None
 
 
 @router.get("/", summary="正在下载", response_model=List[_SchemaDownloaderTorrent])
@@ -118,7 +228,6 @@ def download(
         username=current_user.name,
         save_path=save_path,
         source="Manual",
-        allow_unconfigured_save_path=True,
     )
     if not did:
         return _SchemaResponse(success=False, message="任务添加失败")
@@ -135,6 +244,7 @@ def add(
     media_source: Annotated[MediaSource | None, Body()] = None,
     media_id: Annotated[str | None, Body()] = None,
     music_type: Annotated[MusicTargetEntityType | None, Body()] = None,
+    allow_unrecognized: Annotated[bool, Body()] = False,
     downloader: Annotated[str | None, Body()] = None,
     # 保存路径, 支持<storage>:<path>, 如rclone:/MP, smb:/server/share/Movies等
     save_path: Annotated[str | None, Body()] = None,
@@ -143,61 +253,16 @@ def add(
     """
     添加下载任务（不含媒体信息）
     """
-    normalized_music_type = normalize_music_type(music_type, allow_artist=False)
-    if music_type is not None and not normalized_music_type:
-        return _SchemaResponse(
-            success=False,
-            message="音乐实体类型无效，仅支持 recording 或 album",
-        )
-    if (media_source is None) != (media_id is None):
-        return _SchemaResponse(
-            success=False,
-            message="媒体来源和媒体 ID 必须同时提供",
-        )
-    is_music = (
-        torrent_in.category in (MediaType.MUSIC, MediaType.MUSIC.value, "music")
-        or is_music_media_source(media_source)
-        or normalized_music_type is not None
+    metainfo, mediainfo, error = _resolve_add_media(
+        torrent_in,
+        media_source,
+        media_id,
+        music_type,
+        allow_unrecognized or bool(torrent_in.adult),
     )
-    if is_music and media_source and not is_music_media_source(media_source):
-        return _SchemaResponse(
-            success=False,
-            message="音乐下载只能使用音乐元数据源",
-        )
-    if is_music and not normalized_music_type:
-        normalized_music_type = MUSIC_ENTITY_RECORDING
-    # 元数据
-    metainfo = (
-        MetaMusic.parse_query(torrent_in.title)
-        if is_music
-        else MetaInfo(title=torrent_in.title, subtitle=torrent_in.description)
-    )
-    # 媒体信息
-    if media_source and media_id:
-        mediainfo = MediaChain().recognize_media(
-            meta=metainfo,
-            media_source=media_source,
-            media_id=media_id,
-            mtype=MediaType.MUSIC if is_music else None,
-            music_type=normalized_music_type,
-        )
-    else:
-        mediainfo = MediaChain().recognize_by_meta(
-            metainfo,
-            media_source=media_source,
-            obtain_images=False,
-            mtype=MediaType.MUSIC if is_music else None,
-            music_type=normalized_music_type,
-        )
-    if not mediainfo and torrent_in.adult and not is_music:
-        # 成人影视通常没有 TMDB 等公共媒体库条目，保留最小电影信息直接下载。
-        mediainfo = MediaInfo(
-            type=MediaType.MOVIE,
-            title=metainfo.name or torrent_in.title,
-            original_title=torrent_in.title,
-            adult=True,
-        )
-    if not mediainfo:
+    if error:
+        return error
+    if metainfo is None or mediainfo is None:
         return _SchemaResponse(success=False, message="无法识别媒体信息")
     # 种子信息
     torrentinfo = TorrentInfo()
@@ -213,7 +278,6 @@ def add(
         downloader=downloader,
         save_path=save_path,
         source="Manual",
-        allow_unconfigured_save_path=True,
     )
     if not did:
         return _SchemaResponse(success=False, message="任务添加失败")

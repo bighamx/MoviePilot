@@ -1,11 +1,14 @@
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock
 
 from watchfiles import Change
 
-from app.monitor import DirectoryChangeEvent, LocalDirectoryWatcher, Monitor
+from app.application.history import TransferHistorySnapshot
 from app.monitor.dispatcher import TransferDispatcher
-from app.schemas import TransferDirectoryConf
+from app.monitor.monitor import Monitor
+from app.monitor.watcher import DirectoryChangeEvent, LocalDirectoryWatcher
+from app.schemas.system import TransferDirectoryConf
 from app.schemas.types import MediaType
 
 
@@ -42,6 +45,15 @@ def _build_monitor_with_dispatcher(handle_file: MagicMock = None):
     if handle_file is not None:
         dispatcher.handle_file = handle_file
     monitor._dispatcher = dispatcher
+    monitor._lifecycle_lock = threading.RLock()
+    monitor._owner_lock = threading.Lock()
+    monitor._work_stop_event = threading.Event()
+    monitor._shutdown_event = threading.Event()
+    monitor._closed = False
+    monitor._compensation_threads = {}
+    monitor._scheduler_shutdown_thread = None
+    monitor._scheduler_shutdown_succeeded = False
+    monitor._scheduler = None
     return monitor, dispatcher
 
 
@@ -246,12 +258,25 @@ def test_handle_file_skips_transfer_when_history_exists(monkeypatch):
             记录查询参数并返回已有记录。
             """
             lookups.append((src, storage))
-            return object()
+            return TransferHistorySnapshot(
+                id=1,
+                src=src,
+                src_storage=storage,
+                src_fileitem={"size": 1024},
+                status=True,
+            )
+
+        def get_success_by_src(self, src: str, storage: str = None):
+            """成功记录已由首次查询返回，无需二次回退。"""
+            return None
 
     transfer_chain = MagicMock()
     logger_info = MagicMock()
     logger_debug = MagicMock()
-    monkeypatch.setattr("app.monitor.dispatcher.TransferHistoryOper", FakeTransferHistoryOper)
+    monkeypatch.setattr(
+        "app.monitor.dispatcher.get_transfer_history_repository",
+        FakeTransferHistoryOper,
+    )
     monkeypatch.setattr("app.monitor.dispatcher.TransferChain", transfer_chain)
     monkeypatch.setattr("app.monitor.dispatcher.logger.info", logger_info)
     monkeypatch.setattr("app.monitor.dispatcher.logger.debug", logger_debug)
@@ -266,7 +291,7 @@ def test_handle_file_skips_transfer_when_history_exists(monkeypatch):
     assert lookups == [(event_path.as_posix(), "local")]
     transfer_chain.assert_not_called()
     logger_info.assert_not_called()
-    logger_debug.assert_not_called()
+    assert "已整理过且文件未变化" in logger_debug.call_args.args[0]
 
 
 def test_handle_file_invokes_transfer_when_history_missing(monkeypatch):
@@ -287,9 +312,16 @@ def test_handle_file_invokes_transfer_when_history_missing(monkeypatch):
             """
             return None
 
+        def get_success_by_src(self, src: str, storage: str = None):
+            """空仓储没有成功历史。"""
+            return None
+
     transfer_chain_instance = MagicMock()
     transfer_chain = MagicMock(return_value=transfer_chain_instance)
-    monkeypatch.setattr("app.monitor.dispatcher.TransferHistoryOper", FakeTransferHistoryOper)
+    monkeypatch.setattr(
+        "app.monitor.dispatcher.get_transfer_history_repository",
+        FakeTransferHistoryOper,
+    )
     monkeypatch.setattr("app.monitor.dispatcher.TransferChain", transfer_chain)
 
     handled = dispatcher.handle_file(

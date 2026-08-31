@@ -1,12 +1,18 @@
+import asyncio
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from pydantic import BaseModel, ValidationError
+from starlette.requests import Request
 from starlette.responses import Response as StarletteResponse
 from starlette.responses import StreamingResponse
 
@@ -20,8 +26,16 @@ from app.factory import (
     localized_http_exception_handler,
     localized_unhandled_exception_handler,
     localized_validation_exception_handler,
+    persistence_unavailable_handler,
+)
+from app.schemas.exception import (
+    AgentChatPersistenceUnavailableError,
+    DatabaseWorkerClosedError,
+    DatabaseWorkerOverloadedError,
+    PersistenceUnavailableError,
 )
 from app.runtime.localization import LocaleHelper
+from app.runtime.config import settings
 from app.schemas.common import JsonData
 from app.schemas.response import Response
 
@@ -33,6 +47,18 @@ class Item(BaseModel):
     """统一响应测试使用的业务数据模型。"""
 
     id: int
+
+
+def _v1_compat_routes() -> list[tuple[str, APIRoute]]:
+    """返回兼容 v1 导出的公开路由，不依赖 FastAPI 内部 include 包装器。"""
+    from app.api.routers import API_V1_ROUTER_SPECS
+
+    return [
+        (f"{spec.prefix}{route.path}", route)
+        for spec in API_V1_ROUTER_SPECS
+        for route in spec.router.routes
+        if isinstance(route, APIRoute)
+    ]
 
 
 @pytest.fixture()
@@ -47,6 +73,10 @@ def api_app() -> FastAPI:
     app = FastAPI()
     app.router.route_class = ResponseAPIRoute
     app.add_exception_handler(HTTPException, localized_http_exception_handler)
+    app.add_exception_handler(
+        PersistenceUnavailableError,
+        persistence_unavailable_handler,
+    )
     from fastapi.exceptions import RequestValidationError
 
     app.add_exception_handler(
@@ -99,6 +129,21 @@ def api_app() -> FastAPI:
     async def get_crash() -> Item:
         """抛出需要隐藏内部细节的未捕获异常。"""
         raise RuntimeError("private failure detail")
+
+    @app.get("/database-busy")
+    async def get_database_busy() -> None:
+        """模拟数据库短事务容量耗尽。"""
+        raise DatabaseWorkerOverloadedError("worker full")
+
+    @app.get("/database-closed")
+    async def get_database_closed() -> None:
+        """模拟数据库 worker 在关闭态拒绝新任务。"""
+        raise DatabaseWorkerClosedError("worker closed")
+
+    @app.get("/agent-chat-persistence-unavailable")
+    async def get_agent_chat_persistence_unavailable() -> None:
+        """模拟 AgentChat 自身 admission 拒绝新写入。"""
+        raise AgentChatPersistenceUnavailableError("agent persistence full")
 
     @app.get("/native", response_model=None)
     async def get_native_response() -> dict[str, bool]:
@@ -176,6 +221,99 @@ async def test_accept_language_localizes_success_and_http_error(api_app: FastAPI
         "data": None,
     }
     assert zh_error_response.json()["message"] == "用户名或密码错误"
+
+
+async def test_database_worker_overload_is_retryable_service_unavailable(
+        api_app: FastAPI,
+):
+    """数据库 worker 背压应返回 503，而不是伪装成未知错误。"""
+    async with make_client(api_app) as client:
+        response = await client.get("/database-busy")
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    assert response.json() == {
+        "success": False,
+        "message": "服务当前繁忙，请稍后重试",
+        "data": None,
+    }
+
+
+async def test_database_worker_closed_is_retryable_service_unavailable(
+        api_app: FastAPI,
+):
+    """数据库 worker 关闭态应返回 503，而不是落入通用 500。"""
+    async with make_client(api_app) as client:
+        response = await client.get("/database-closed")
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    assert response.json() == {
+        "success": False,
+        "message": "服务当前繁忙，请稍后重试",
+        "data": None,
+    }
+
+
+async def test_agent_chat_persistence_rejection_is_retryable_service_unavailable(
+        api_app: FastAPI,
+) -> None:
+    """AgentChat 自身 admission 拒绝也应返回可重试的 503。"""
+    async with make_client(api_app) as client:
+        response = await client.get("/agent-chat-persistence-unavailable")
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    assert response.json() == {
+        "success": False,
+        "message": "服务当前繁忙，请稍后重试",
+        "data": None,
+    }
+
+
+def test_create_app_registers_persistence_unavailable_handler() -> None:
+    """生产组合根必须为持久化暂不可用登记统一 503 处理器。"""
+    from app.factory import create_app
+
+    app = create_app()
+
+    assert app.exception_handlers[PersistenceUnavailableError] is (
+        persistence_unavailable_handler
+    )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        f"{settings.API_V1_STR}/openai/v1/chat/completions",
+        f"{settings.API_V1_STR}/anthropic/v1/messages",
+        f"{settings.API_V1_STR}/mcp",
+    ],
+)
+async def test_database_worker_overload_preserves_retry_after_for_native_protocols(
+        path: str,
+):
+    """OpenAI、Anthropic 和 MCP 的原生 503 也必须保留重试提示。"""
+    scope = {
+        "type": "http",
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "headers": [],
+        "server": ("testserver", 80),
+        "client": ("testclient", 123),
+        "root_path": "",
+    }
+    response = await persistence_unavailable_handler(
+        Request(scope),
+        DatabaseWorkerOverloadedError("worker full"),
+    )
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
 
 
 async def test_validation_error_uses_unified_model(api_app: FastAPI):
@@ -308,13 +446,6 @@ def test_response_rejects_fields_outside_unified_protocol():
 
 def test_v1_routes_use_response_route_except_native_protocols():
     """v1 普通接口应使用统一路由，标准协议路由保持原生实现。"""
-    from fastapi.routing import APIRoute
-
-    from app.api.apiv1 import api_router
-
-    api_routes = [
-        route for route in api_router.routes if isinstance(route, APIRoute)
-    ]
     native_paths = {
         "/openai/v1/models",
         "/openai/v1/chat/completions",
@@ -323,21 +454,15 @@ def test_v1_routes_use_response_route_except_native_protocols():
     }
 
     assert all(
-        isinstance(route, ResponseAPIRoute) or route.path in native_paths
-        for route in api_routes
+        isinstance(route, ResponseAPIRoute) or path in native_paths
+        for path, route in _v1_compat_routes()
     )
 
 
 def test_v1_json_routes_have_concrete_data_models():
     """普通 v1 JSON 路由禁止未参数化、Any 或通用 JSON 顶层输出模型。"""
-    from fastapi.routing import APIRoute
-
-    from app.api.apiv1 import api_router
-
     weak_routes = []
-    for route in api_router.routes:
-        if not isinstance(route, APIRoute):
-            continue
+    for path, route in _v1_compat_routes():
         response_model = route.response_model
         try:
             is_response_model = issubclass(response_model, Response)
@@ -347,15 +472,13 @@ def test_v1_json_routes_have_concrete_data_models():
             continue
         generic_args = response_model.__pydantic_generic_metadata__.get("args")
         if not generic_args or generic_args in ((Any,), (JsonData,)):
-            weak_routes.append((route.path, route.name, generic_args))
+            weak_routes.append((path, route.name, generic_args))
 
     assert weak_routes == []
 
 
 def test_v1_model_free_routes_match_audited_native_allowlist():
     """无响应模型仅允许固定的协议、流、文件、图片、HTML 与 204 路由。"""
-    from app.api.apiv1 import api_router
-
     expected_routes = {
         ("/message/", "incoming_verify"),
         ("/message/agent/file/{file_id}", "download_web_agent_file"),
@@ -383,8 +506,8 @@ def test_v1_model_free_routes_match_audited_native_allowlist():
         ("/mcp", "delete_mcp_session"),
     }
     actual_routes = {
-        (route.path, route.name)
-        for route in api_router.routes
+        (path, route.name)
+        for path, route in _v1_compat_routes()
         if isinstance(route, ResponseAPIRoute) and route.response_model is None
     }
 
@@ -394,7 +517,7 @@ def test_v1_model_free_routes_match_audited_native_allowlist():
 def test_native_protocol_openapi_has_explicit_response_schemas():
     """OpenAI、Anthropic 与 MCP 原生协议响应必须在 OpenAPI 中明确建模。"""
     from app.factory import create_app
-    from app.startup.routers_initializer import init_routers
+    from app.startup.initializers.routers import init_routers
 
     app = create_app()
     init_routers(app)
@@ -440,7 +563,7 @@ def test_native_protocol_openapi_has_explicit_response_schemas():
 async def test_native_protocol_validation_errors_keep_native_shapes():
     """OpenAI 与 Anthropic 的请求校验错误应保持各自协议的错误结构。"""
     from app.factory import create_app
-    from app.startup.routers_initializer import init_routers
+    from app.startup.initializers.routers import init_routers
 
     app = create_app()
     init_routers(app)
@@ -485,7 +608,7 @@ async def test_native_protocol_validation_errors_keep_native_shapes():
 async def test_mcp_root_auth_error_keeps_jsonrpc_shape():
     """MCP 根端点的依赖异常应保持 JSON-RPC，REST 子端点仍由统一协议处理。"""
     from app.factory import create_app
-    from app.startup.routers_initializer import init_routers
+    from app.startup.initializers.routers import init_routers
 
     app = create_app()
     init_routers(app)
@@ -560,7 +683,7 @@ async def test_native_ai_http_and_unhandled_errors_keep_protocol_shapes():
 def test_servarr_and_cookiecloud_openapi_has_explicit_models():
     """兼容协议成功响应必须显式建模，错误响应必须声明统一结构。"""
     from app.factory import create_app
-    from app.startup.routers_initializer import init_routers
+    from app.startup.initializers.routers import init_routers
 
     app = create_app()
     init_routers(app)
@@ -594,7 +717,7 @@ def test_servarr_and_cookiecloud_openapi_has_explicit_models():
 def test_all_openapi_error_responses_use_json_schemas():
     """所有普通与原生协议错误响应都应在文档中声明 JSON 媒体类型和结构。"""
     from app.factory import create_app
-    from app.startup.routers_initializer import init_routers
+    from app.startup.initializers.routers import init_routers
 
     app = create_app()
     init_routers(app)
@@ -621,7 +744,7 @@ def test_all_openapi_error_responses_use_json_schemas():
 def test_openapi_success_models_have_no_implicit_empty_nested_schemas():
     """2xx 响应可达模型不得包含裸 Any、裸数组或未声明值类型的开放映射。"""
     from app.factory import create_app
-    from app.startup.routers_initializer import init_routers
+    from app.startup.initializers.routers import init_routers
 
     app = create_app()
     init_routers(app)
@@ -643,6 +766,8 @@ def test_openapi_success_models_have_no_implicit_empty_nested_schemas():
         "Response_Dict_str__Any__",
         # LLM 提供商管理响应的 data 目录查询为列表、其余动作为映射。
         "Response_Union_List_Dict_str__Any____Dict_str__Any___",
+        # 通知渠道配置由各渠道模块定义，保留动态键值以承载渠道特有选项。
+        "NotificationConf",
     }
     allowed_empty_components = {"McpJsonRpcEmptyResult"}
     violations = []
@@ -742,6 +867,210 @@ def test_plugin_routes_only_register_v1(monkeypatch):
 
     plugin_routes.remove_plugin_api("DemoPlugin")
     assert fake_app.routes == []
+
+
+async def test_plugin_routes_ignore_included_router_wrappers():
+    """动态插件路由更新应跳过 FastAPI include_router 的内部包装器。"""
+    from app.application.plugin import routes as plugin_routes
+
+    app = FastAPI()
+    included_router = APIRouter(prefix="/included")
+
+    @included_router.get("/health")
+    def included_health() -> dict[str, bool]:
+        """返回被聚合路由的健康状态。"""
+        return {"ok": True}
+
+    app.include_router(included_router)
+
+    async def plugin_dependency() -> None:
+        """提供用于验证动态路由依赖隔离的测试依赖。"""
+
+    source_dependencies = [Depends(plugin_dependency)]
+    plugin_api = {
+        "path": "/DemoPlugin/health",
+        "endpoint": lambda: {"plugin": True},
+        "methods": ["GET"],
+        "allow_anonymous": True,
+        "dependencies": source_dependencies,
+    }
+    plugin_routes.configure_plugin_routes(FastAPIDynamicRouteRegistry(
+        app=app,
+        plugin_ids=lambda: ["DemoPlugin"],
+        plugin_apis=lambda _plugin_id: [plugin_api],
+        verify_token=lambda: None,
+        verify_apikey=lambda: None,
+        prefix="/api/v1/plugin",
+        protected_routes=set(),
+        log=SimpleNamespace(debug=lambda *_args: None, error=lambda *_args: None),
+    ))
+
+    plugin_routes.register_plugin_api("DemoPlugin")
+    plugin_routes.register_plugin_api("DemoPlugin")
+
+    registered_path = "/api/v1/plugin/DemoPlugin/health"
+    registered_routes = [
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == registered_path
+    ]
+    assert len(registered_routes) == 1
+    assert registered_routes[0].dependencies == plugin_api["dependencies"]
+    assert registered_routes[0].dependencies is not plugin_api["dependencies"]
+    assert plugin_api["path"] == "/DemoPlugin/health"
+    assert plugin_api["allow_anonymous"] is True
+    assert plugin_api["dependencies"] is source_dependencies
+
+    async with make_client(app) as client:
+        response = await client.get(registered_path)
+        assert response.status_code == 200
+        assert response.json() == {"plugin": True}
+
+        plugin_routes.remove_plugin_api("DemoPlugin")
+        assert not any(
+            getattr(route, "path", None) == registered_path for route in app.routes
+        )
+        removed_response = await client.get(registered_path)
+
+    assert removed_response.status_code == 404
+
+
+async def test_plugin_route_updates_run_on_application_event_loop() -> None:
+    """线程侧插件变更必须回投主 loop 后再修改 FastAPI 路由表。"""
+    app = FastAPI()
+    main_thread = threading.get_ident()
+    mutation_threads: list[int] = []
+    original_add_api_route = app.router.add_api_route
+    original_setup = app.setup
+
+    def record_add_api_route(*args, **kwargs):
+        mutation_threads.append(threading.get_ident())
+        return original_add_api_route(*args, **kwargs)
+
+    def record_setup() -> None:
+        mutation_threads.append(threading.get_ident())
+        original_setup()
+
+    app.router.add_api_route = record_add_api_route
+    app.setup = record_setup
+    loop = asyncio.get_running_loop()
+    registry = FastAPIDynamicRouteRegistry(
+        app=app,
+        plugin_ids=lambda: ["DemoPlugin"],
+        plugin_apis=lambda _plugin_id: [{
+            "path": "/DemoPlugin/health",
+            "endpoint": lambda: {"ok": True},
+            "methods": ["GET"],
+            "allow_anonymous": True,
+        }],
+        verify_token=lambda: None,
+        verify_apikey=lambda: None,
+        prefix="/api/v1/plugin",
+        protected_routes=set(),
+        log=SimpleNamespace(debug=lambda *_args: None, error=lambda *_args: None),
+        event_loop=lambda: loop,
+    )
+
+    await asyncio.to_thread(registry.update, "DemoPlugin", "add")
+
+    assert mutation_threads
+    assert set(mutation_threads) == {main_thread}
+    assert any(
+        getattr(route, "path", None) == "/api/v1/plugin/DemoPlugin/health"
+        for route in app.routes
+    )
+
+
+def test_plugin_route_update_rejects_stopped_application_loop() -> None:
+    """生产 loop 已释放时不得退回调用线程修改路由。"""
+    registry = FastAPIDynamicRouteRegistry(
+        app=FastAPI(),
+        plugin_ids=lambda: [],
+        plugin_apis=lambda _plugin_id: [],
+        verify_token=lambda: None,
+        verify_apikey=lambda: None,
+        prefix="/api/v1/plugin",
+        protected_routes=set(),
+        log=SimpleNamespace(debug=lambda *_args: None, error=lambda *_args: None),
+        event_loop=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError, match="主事件循环未运行"):
+        registry.update("DemoPlugin", "remove")
+
+
+async def test_plugin_route_update_abandons_late_application_loop_callback() -> None:
+    """超时前未开始的回调可以迟到执行，但不得再写入路由或污染事件循环。"""
+    app = FastAPI()
+    loop = asyncio.get_running_loop()
+    plugin_apis = MagicMock(return_value=[])
+    loop_errors: list[dict] = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: loop_errors.append(context))
+    registry = FastAPIDynamicRouteRegistry(
+        app=app,
+        plugin_ids=lambda: [],
+        plugin_apis=plugin_apis,
+        verify_token=lambda: None,
+        verify_apikey=lambda: None,
+        prefix="/api/v1/plugin",
+        protected_routes=set(),
+        log=SimpleNamespace(debug=lambda *_args: None, error=lambda *_args: None),
+        event_loop=lambda: loop,
+    )
+    registry._dispatch_admission_timeout = 0.01
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            update = executor.submit(registry.update, "DemoPlugin", "add")
+            time.sleep(0.05)
+            with pytest.raises(RuntimeError, match="未及时接收"):
+                update.result()
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    plugin_apis.assert_not_called()
+    assert not any(
+        getattr(route, "path", None) == "/api/v1/plugin/DemoPlugin/health"
+        for route in app.routes
+    )
+    assert loop_errors == []
+
+
+async def test_started_plugin_route_update_waits_for_terminal_result() -> None:
+    """回调开始后即使超过 admission 预算，也不得先报失败再迟到写入。"""
+    app = FastAPI()
+    loop = asyncio.get_running_loop()
+
+    def delayed_plugin_apis(_plugin_id: str) -> list[dict]:
+        time.sleep(0.05)
+        return [{
+            "path": "/DemoPlugin/health",
+            "endpoint": lambda: {"ok": True},
+            "methods": ["GET"],
+            "allow_anonymous": True,
+        }]
+
+    registry = FastAPIDynamicRouteRegistry(
+        app=app,
+        plugin_ids=lambda: ["DemoPlugin"],
+        plugin_apis=delayed_plugin_apis,
+        verify_token=lambda: None,
+        verify_apikey=lambda: None,
+        prefix="/api/v1/plugin",
+        protected_routes=set(),
+        log=SimpleNamespace(debug=lambda *_args: None, error=lambda *_args: None),
+        event_loop=lambda: loop,
+    )
+    registry._dispatch_admission_timeout = 0.01
+
+    await asyncio.to_thread(registry.update, "DemoPlugin", "add")
+
+    assert sum(
+        getattr(route, "path", None) == "/api/v1/plugin/DemoPlugin/health"
+        for route in app.routes
+    ) == 1
 
 
 def test_response_router_uses_response_route_class():

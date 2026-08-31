@@ -1,5 +1,7 @@
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock, call
+
+import pytest
 
 from app.application.server.report import ServerReportService
 
@@ -11,6 +13,7 @@ def _service(**overrides) -> ServerReportService:
         "config_writer": Mock(),
         "installed_plugins_provider": Mock(return_value=[]),
         "subscribes_provider": Mock(return_value=[]),
+        "async_subscribes_provider": AsyncMock(return_value=[]),
         "plugin_report_sender": Mock(
             return_value=SimpleNamespace(status_code=200)
         ),
@@ -18,6 +21,8 @@ def _service(**overrides) -> ServerReportService:
         "subscribe_report_sender": Mock(
             return_value=SimpleNamespace(status_code=200)
         ),
+        "async_subscribe_report_sender": AsyncMock(),
+        "async_config_writer": AsyncMock(),
         "repo_url_sanitizer": lambda value: value,
     }
     defaults.update(overrides)
@@ -62,6 +67,44 @@ def test_initial_report_marker_is_written_only_after_success():
     writer.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_async_initial_report_marker_uses_async_writer_after_success():
+    """异步首次上报成功后只通过异步配置端口写完成标记。"""
+    sync_writer = Mock()
+    async_writer = AsyncMock()
+    reporter = AsyncMock(return_value=True)
+    service = _service(
+        config_writer=sync_writer,
+        async_config_writer=async_writer,
+    )
+
+    await service.async_init_report(
+        enabled=True,
+        state_key="report",
+        reporter=reporter,
+    )
+
+    reporter.assert_awaited_once_with()
+    async_writer.assert_awaited_once_with("report", "1")
+    sync_writer.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_async_subscribe_report_uses_async_reader():
+    """异步订阅上报通过异步读取端口获取数据，不在事件循环内查同步库。"""
+    sync_reader = Mock(side_effect=AssertionError("不应调用同步订阅读取"))
+    async_reader = AsyncMock(return_value=[])
+    service = _service(
+        subscribes_provider=sync_reader,
+        async_subscribes_provider=async_reader,
+    )
+
+    assert await service.async_report_subscribes(enabled=True) is True
+
+    sync_reader.assert_not_called()
+    async_reader.assert_awaited_once_with()
+
+
 def test_plugin_report_sanitizes_explicit_sources_before_transport():
     """插件统计载荷在进入传输适配器前完成来源脱敏。"""
     sender = Mock(return_value=SimpleNamespace(status_code=200))
@@ -78,3 +121,56 @@ def test_plugin_report_sanitizes_explicit_sources_before_transport():
         "plugin_id": "Demo",
         "repo_url": "local://Demo",
     }])
+
+
+@pytest.mark.asyncio
+async def test_plugin_report_entries_share_payload_and_response_decisions(monkeypatch):
+    """插件同步、异步入口只替换发送端口，准入和结果判定必须同源。"""
+    sync_sender = Mock(return_value=SimpleNamespace(status_code=200))
+    async_sender = AsyncMock(return_value=SimpleNamespace(status_code=200))
+    service = _service(
+        plugin_report_sender=sync_sender,
+        async_plugin_report_sender=async_sender,
+    )
+    prepare = Mock(wraps=service._prepare_plugin_report)
+    succeeded = Mock(wraps=service._report_succeeded)
+    monkeypatch.setattr(service, "_prepare_plugin_report", prepare)
+    monkeypatch.setattr(service, "_report_succeeded", succeeded)
+    items = [("Demo", "https://repo.example/Demo")]
+
+    assert service.report_plugins(enabled=True, items=items) is True
+    assert await service.async_report_plugins(enabled=True, items=items) is True
+
+    assert prepare.call_args_list == [
+        call(enabled=True, items=items),
+        call(enabled=True, items=items),
+    ]
+    assert sync_sender.call_args == async_sender.await_args
+    assert succeeded.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_subscribe_report_entries_share_payload_projection(monkeypatch):
+    """订阅读取后的过滤与终态决策必须由同步、异步入口共享。"""
+    subscribe = SimpleNamespace(to_dict=lambda: {
+        "name": "Demo",
+        "media_source": "themoviedb",
+        "media_id": "123",
+    })
+    service = _service(
+        subscribes_provider=Mock(return_value=[subscribe]),
+        async_subscribes_provider=AsyncMock(return_value=[subscribe]),
+        async_subscribe_report_sender=AsyncMock(
+            return_value=SimpleNamespace(status_code=200)
+        ),
+    )
+    prepare = Mock(wraps=service._prepare_subscribe_report)
+    monkeypatch.setattr(service, "_prepare_subscribe_report", prepare)
+
+    assert service.report_subscribes(enabled=True) is True
+    assert await service.async_report_subscribes(enabled=True) is True
+
+    assert prepare.call_args_list == [(([subscribe],), {}), (([subscribe],), {})]
+    assert service._subscribe_report_sender.call_args == (
+        service._async_subscribe_report_sender.await_args
+    )

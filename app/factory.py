@@ -7,29 +7,40 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
 
-from app.api.response import ResponseAPIRoute
+from app.adapters.observability.otel import build_observation_port
+from app.adapters.web.correlation import CorrelationIdMiddleware
+from app.adapters.web.health import install_health_routes
+from app.adapters.web.metrics import HttpMetricsMiddleware
 from app.adapters.web.plugin.routes import FastAPIDynamicRouteRegistry
-from app.application.plugin.routes import configure_plugin_routes
 from app.adapters.web.security.access import (
     configure_token_codec,
     verify_apikey,
     verify_token,
 )
+from app.api.response import ResponseAPIRoute
+from app.application.plugin.routes import configure_plugin_routes
+from app.application.plugin.runtime import get_plugin_manager
 from app.application.security.token import create_access_token, decode_access_token
-from app.runtime.extensions.plugin_manager import PluginManager
-from app.runtime.config import settings
+from app.runtime.correlation import get_correlation_id
 from app.runtime.localization import LocaleHelper
-from app.runtime.log import logger
+from app.runtime.log import configure_correlation_id_provider, logger
+from app.runtime.loop import main_loop_registry
+from app.runtime.observability import configure_observation
+from app.runtime.settings import get_runtime_setting
+from app.runtime.version import get_app_version
+from app.schemas.exception import (
+    PersistenceUnavailableError,
+)
+from app.schemas.mcp import McpJsonRpcError, McpJsonRpcErrorDetail
 from app.schemas.openai import (
     AnthropicErrorDetail,
     AnthropicErrorResponse,
     OpenAIErrorDetail,
     OpenAIErrorResponse,
 )
-from app.schemas.mcp import McpJsonRpcError, McpJsonRpcErrorDetail
-from app.schemas.response import Response as ApiResponse, ValidationIssue
+from app.schemas.response import Response as ApiResponse
+from app.schemas.response import ValidationIssue
 from app.startup.lifecycle import lifespan
-from version import APP_VERSION
 
 
 def _get_http_exception_message(detail: Any) -> str:
@@ -55,15 +66,15 @@ def _localize_exception_message(request: Request, message: str) -> str:
 def _is_mcp_jsonrpc_request(request: Request) -> bool:
     """判断请求是否指向保持原生响应的 MCP JSON-RPC 根端点。"""
     request_path = getattr(getattr(request, "url", None), "path", "")
-    return request_path.rstrip("/") == f"{settings.API_V1_STR}/mcp"
+    return request_path.rstrip("/") == f"{get_runtime_setting('API_V1_STR')}/mcp"
 
 
 def _get_native_ai_protocol(request: Request) -> str | None:
     """识别需要保持原生错误体的 OpenAI 或 Anthropic 兼容请求。"""
     request_path = getattr(getattr(request, "url", None), "path", "")
-    if request_path.startswith(f"{settings.API_V1_STR}/openai/v1/"):
+    if request_path.startswith(f"{get_runtime_setting('API_V1_STR')}/openai/v1/"):
         return "openai"
-    if request_path.startswith(f"{settings.API_V1_STR}/anthropic/v1/"):
+    if request_path.startswith(f"{get_runtime_setting('API_V1_STR')}/anthropic/v1/"):
         return "anthropic"
     return None
 
@@ -72,6 +83,7 @@ def _native_ai_error_response(
         protocol: str,
         status_code: int,
         message: str,
+        headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     """按 OpenAI 或 Anthropic 兼容协议构造原生错误响应。"""
     if protocol == "openai":
@@ -91,6 +103,7 @@ def _native_ai_error_response(
                     code=error_type,
                 )
             ).model_dump(mode="json"),
+            headers=headers,
         )
 
     error_type = (
@@ -105,6 +118,7 @@ def _native_ai_error_response(
         content=AnthropicErrorResponse(
             error=AnthropicErrorDetail(type=error_type, message=message)
         ).model_dump(mode="json"),
+        headers=headers,
     )
 
 
@@ -112,6 +126,7 @@ def _mcp_jsonrpc_error_response(
         status_code: int,
         code: int,
         message: str,
+        headers: dict[str, str] | None = None,
 ) -> JSONResponse:
     """构造带 HTTP 状态码的 MCP JSON-RPC 原生错误响应。"""
     return JSONResponse(
@@ -121,6 +136,7 @@ def _mcp_jsonrpc_error_response(
             id=None,
             error=McpJsonRpcErrorDetail(code=code, message=message),
         ).model_dump(mode="json"),
+        headers=headers,
     )
 
 
@@ -195,6 +211,7 @@ async def localized_http_exception_handler(
             protocol=native_ai_protocol,
             status_code=exc.status_code,
             message=message,
+            headers=exc.headers,
         )
     if _is_mcp_jsonrpc_request(request):
         error_codes = {
@@ -208,11 +225,27 @@ async def localized_http_exception_handler(
             status_code=exc.status_code,
             code=error_codes.get(exc.status_code, -32000),
             message=message,
+            headers=exc.headers,
         )
     return JSONResponse(
         status_code=exc.status_code,
         content=ApiResponse[None](success=False, message=message).model_dump(mode="json"),
         headers=exc.headers,
+    )
+
+
+async def persistence_unavailable_handler(
+        request: Request,
+        _exc: PersistenceUnavailableError,
+) -> JSONResponse:
+    """将持久化能力暂不可用映射为可重试的 503 响应。"""
+    return await localized_http_exception_handler(
+        request,
+        HTTPException(
+            status_code=503,
+            detail="服务当前繁忙，请稍后重试",
+            headers={"Retry-After": "1"},
+        ),
     )
 
 
@@ -290,14 +323,20 @@ def create_app() -> FastAPI:
     """
     创建并配置 FastAPI 应用实例。
     """
+    configure_correlation_id_provider(get_correlation_id)
+    configure_observation(build_observation_port())
     _app = FastAPI(
-        title=settings.PROJECT_NAME,
-        version=APP_VERSION,
-        openapi_url=f"{settings.API_V1_STR}/openapi.json",
+        title=get_runtime_setting('PROJECT_NAME'),
+        version=get_app_version(),
+        openapi_url=f"{get_runtime_setting('API_V1_STR')}/openapi.json",
         lifespan=lifespan
     )
 
     _app.add_exception_handler(HTTPException, localized_http_exception_handler)
+    _app.add_exception_handler(
+        PersistenceUnavailableError,
+        persistence_unavailable_handler,
+    )
     _app.add_exception_handler(
         RequestValidationError,
         localized_validation_exception_handler,
@@ -305,15 +344,19 @@ def create_app() -> FastAPI:
     _app.add_exception_handler(Exception, localized_unhandled_exception_handler)
     # 主程序静态路由统一使用 ResponseAPIRoute；动态插件注册时会显式覆盖为原生 APIRoute。
     _app.router.route_class = ResponseAPIRoute
+    # 编排器探针使用原生 APIRoute 和最小响应，不进入业务响应包络或版本前缀。
+    install_health_routes(_app)
 
     # 配置 CORS 中间件
     _app.add_middleware(
         CORSMiddleware,  # noqa
-        allow_origins=settings.ALLOWED_HOSTS,
+        allow_origins=get_runtime_setting('ALLOWED_HOSTS'),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    _app.add_middleware(CorrelationIdMiddleware)
+    _app.add_middleware(HttpMetricsMiddleware)
 
     @_app.middleware("http")
     async def locale_context_middleware(
@@ -338,18 +381,19 @@ def create_app() -> FastAPI:
     # 统一经服务完成，避免 api.endpoints 反向依赖本模块。
     configure_plugin_routes(FastAPIDynamicRouteRegistry(
         app=_app,
-        plugin_ids=lambda: PluginManager().get_running_plugin_ids(),
-        plugin_apis=lambda plugin_id: PluginManager().get_plugin_apis(plugin_id),
+        plugin_ids=lambda: get_plugin_manager().get_running_plugin_ids(),
+        plugin_apis=lambda plugin_id: get_plugin_manager().get_plugin_apis(plugin_id),
         verify_token=verify_token,
         verify_apikey=verify_apikey,
-        prefix=f"{settings.API_V1_STR}/plugin",
+        prefix=f"{get_runtime_setting('API_V1_STR')}/plugin",
         protected_routes={
-            f"{settings.API_V1_STR}/openapi.json",
+            f"{get_runtime_setting('API_V1_STR')}/openapi.json",
             "/docs",
             "/docs/oauth2-redirect",
             "/redoc",
         },
         log=logger,
+        event_loop=lambda: main_loop_registry.current,
     ))
 
     return _app

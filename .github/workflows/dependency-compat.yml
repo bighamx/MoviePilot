@@ -1,0 +1,228 @@
+name: Dependency Compatibility
+
+on:
+  pull_request:
+    branches:
+      - v3
+    paths:
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'app/__init__.py'
+      - 'app/doctor/dependencies.py'
+      - 'app/foundation/environment.py'
+      - 'app/runtime/dependencies/profile.py'
+      - 'scripts/verify_runtime_profile.py'
+      - 'docker/Dockerfile'
+      - 'docker/**'
+      - '.github/workflows/dependency-compat.yml'
+  push:
+    branches:
+      - v3
+    paths:
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'app/__init__.py'
+      - 'app/doctor/dependencies.py'
+      - 'app/foundation/environment.py'
+      - 'app/runtime/dependencies/profile.py'
+      - 'scripts/verify_runtime_profile.py'
+      - 'docker/Dockerfile'
+      - 'docker/**'
+      - '.github/workflows/dependency-compat.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-compat-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    name: ${{ matrix.name }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux x64
+            runner: ubuntu-24.04
+            python-version: '3.14'
+            runtime-group: runtime-standard
+            expected-profile: standard
+            expected-system: Linux
+            expected-machine: x86_64
+          - name: Linux ARM64
+            runner: ubuntu-24.04-arm
+            python-version: '3.14'
+            runtime-group: runtime-standard
+            expected-profile: standard
+            expected-system: Linux
+            expected-machine: aarch64
+          - name: macOS Intel
+            runner: macos-15-intel
+            python-version: '3.14'
+            runtime-group: runtime-standard
+            expected-profile: standard
+            expected-system: Darwin
+            expected-machine: x86_64
+          - name: macOS ARM
+            runner: macos-15
+            python-version: '3.14'
+            runtime-group: runtime-standard
+            expected-profile: standard
+            expected-system: Darwin
+            expected-machine: arm64
+          - name: Windows x64
+            runner: windows-2025
+            python-version: '3.14'
+            runtime-group: runtime-standard
+            expected-profile: standard
+            expected-system: Windows
+            expected-machine: AMD64
+          - name: Windows x64 free-threaded
+            runner: windows-2025
+            python-version: '3.14t'
+            runtime-group: runtime-free-threaded
+            expected-profile: free-threaded
+            expected-system: Windows
+            expected-machine: AMD64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Expose PostgreSQL build tools
+        if: matrix.expected-profile == 'free-threaded'
+        shell: pwsh
+        run: |
+          if (-not $env:PGBIN -or -not (Test-Path -LiteralPath $env:PGBIN -PathType Container)) {
+            throw 'Windows free-threaded profile requires a valid PGBIN directory'
+          }
+          "$env:PGBIN" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install locked runtime dependencies
+        run: >-
+          uv sync --locked --inexact --no-default-groups
+          --group ${{ matrix.runtime-group }}
+          --python ${{ matrix.python-version }}
+
+      - name: Verify runtime profile
+        env:
+          AUTO_UPDATE_RESOURCE: 'false'
+          EXPECTED_SYSTEM: ${{ matrix.expected-system }}
+          EXPECTED_MACHINE: ${{ matrix.expected-machine }}
+          EXPECTED_PROFILE: ${{ matrix.expected-profile }}
+          CONFIG_DIR: ${{ runner.temp }}/moviepilot-runtime-smoke
+          MOVIEPILOT_SAFE_MODE: 'true'
+          SUPERUSER_PASSWORD: moviepilot-ci-only
+        run: >-
+          uv run --locked --no-sync python -m scripts.verify_runtime_profile
+          --expected-profile ${{ matrix.expected-profile }}
+          --expected-system ${{ matrix.expected-system }}
+          --expected-machine ${{ matrix.expected-machine }}
+
+      - name: Verify locked project consistency
+        run: >-
+          uv sync --locked --offline --inexact --no-default-groups
+          --group ${{ matrix.runtime-group }}
+          --check --python ${{ matrix.python-version }}
+
+  docker-dependencies:
+    name: Docker dependencies / ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            python-variant: standard
+            cache-scope: linux-amd64-standard
+            image-tag: moviepilot-dependency-gate:linux-amd64-standard
+            expected-machine: x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            python-variant: standard
+            cache-scope: linux-arm64-standard
+            image-tag: moviepilot-dependency-gate:linux-arm64-standard
+            expected-machine: aarch64
+          - runner: ubuntu-24.04
+            platform: linux/amd64
+            python-variant: free-threaded
+            cache-scope: linux-amd64-free-threaded
+            image-tag: moviepilot-dependency-gate:linux-amd64-free-threaded
+            expected-machine: x86_64
+          - runner: ubuntu-24.04-arm
+            platform: linux/arm64
+            python-variant: free-threaded
+            cache-scope: linux-arm64-free-threaded
+            image-tag: moviepilot-dependency-gate:linux-arm64-free-threaded
+            expected-machine: aarch64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build locked dependency stage
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: prepare_venv
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            MOVIEPILOT_PYTHON_VARIANT=${{ matrix.python-variant }}
+          load: true
+          push: false
+          tags: ${{ matrix.image-tag }}
+          cache-from: type=gha,scope=dependency-compat-${{ matrix.cache-scope }}
+          cache-to: type=gha,scope=dependency-compat-${{ matrix.cache-scope }},mode=max
+
+      - name: Verify dependency image
+        env:
+          IMAGE_TAG: ${{ matrix.image-tag }}
+          EXPECTED_MACHINE: ${{ matrix.expected-machine }}
+          EXPECTED_VARIANT: ${{ matrix.python-variant }}
+        run: >-
+          docker run --rm
+          -e EXPECTED_MACHINE
+          -e EXPECTED_VARIANT
+          "${IMAGE_TAG}"
+          /opt/venv/bin/python -c
+          "import os, platform, sys, sysconfig;
+          assert platform.machine() == os.environ['EXPECTED_MACHINE'], (platform.machine(), os.environ['EXPECTED_MACHINE']);
+          expected_free_threaded = os.environ['EXPECTED_VARIANT'] == 'free-threaded';
+          assert (sysconfig.get_config_var('Py_GIL_DISABLED') == 1) is expected_free_threaded;
+          assert sys._is_gil_enabled() == (not expected_free_threaded);
+          import alembic, fastapi, moviepilot_rust, pydantic, pydantic_settings, sqlalchemy, starlette, uvicorn;
+          assert moviepilot_rust.is_available();
+          assert moviepilot_rust.jieba_cut('中文分词');
+          assert not expected_free_threaded or callable(moviepilot_rust.zhconv_fast);
+          assert sys._is_gil_enabled() == (not expected_free_threaded)"
+
+      - name: Verify minimum uv version
+        env:
+          IMAGE_TAG: ${{ matrix.image-tag }}
+        run: >-
+          docker run --rm "${IMAGE_TAG}" /opt/venv/bin/python -c
+          "from packaging.version import Version;
+          import subprocess;
+          version = subprocess.check_output(['uv', '--version'], text=True).split()[1];
+          assert Version(version) >= Version('0.12.5'), version;
+          print(version)"

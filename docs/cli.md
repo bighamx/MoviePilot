@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/jxxghp/MoviePilot/v3/scripts/bootst
 脚本会自动：
 
 - 检测操作系统
-- 自动检查并尽量安装 `git`、`curl`、`Python 3.11+`
+- 自动检查并尽量安装 `git`、`curl`、`uv 0.12.5+` 和 `Python 3.14+`
 - 克隆 `MoviePilot`
 - 安装后端依赖
 - 按当前仓库 `version.py` 中的 `FRONTEND_VERSION` 下载对应前端 release 的 `dist.zip`
@@ -24,8 +24,8 @@ curl -fsSL https://raw.githubusercontent.com/jxxghp/MoviePilot/v3/scripts/bootst
 
 说明：
 
-- 如果系统里已经有可用的 `Python 3.11+`，脚本会优先直接复用本地解释器
-- 如果系统里没有可用的 `Python 3.11+`，脚本会再尝试自动补齐运行环境
+- 如果系统里已经有可用的 `Python 3.14+`，脚本会优先直接复用本地解释器
+- 如果系统里没有可用解释器，脚本会通过最新稳定版 uv 安装 Python 3.14
 - Linux 下安装系统依赖时通常需要 `sudo`
 - 复用已有仓库时，脚本现在只会因为已跟踪源码改动而阻止自动更新，不会再被 `.DS_Store` 之类未跟踪文件卡住
 
@@ -88,6 +88,7 @@ moviepilot help update
 moviepilot help agent
 moviepilot help config
 moviepilot help config set
+moviepilot help database
 moviepilot help tool
 moviepilot help scheduler
 ```
@@ -136,6 +137,10 @@ moviepilot config get
 moviepilot config set
 moviepilot config keys
 moviepilot config describe
+moviepilot database backup
+moviepilot database list
+moviepilot database verify <filename>
+moviepilot database restore <filename> --confirm
 moviepilot tool list
 moviepilot tool show
 moviepilot tool run
@@ -151,7 +156,7 @@ moviepilot commands
 
 ```shell
 moviepilot install deps
-moviepilot install deps --python python3.11
+moviepilot install deps --python python3.14
 moviepilot install deps --venv /path/to/venv
 moviepilot install deps --recreate
 moviepilot install deps --config-dir /path/to/moviepilot-config
@@ -159,7 +164,8 @@ moviepilot install deps --config-dir /path/to/moviepilot-config
 
 说明：
 
-- 默认会自动选择本地已安装的 `Python 3.11+` 解释器
+- 默认会自动选择本地已安装的 `Python 3.14+` 解释器
+- 安装器要求 `uv 0.12.5+`，并按仓库提交的 `uv.lock` 同步依赖；不会在本地重新解析一套未锁定结果
 - `moviepilot_rust` 加速扩展通过 `moviepilot-rust` PyPI 依赖安装，主项目本地安装不需要 Rust toolchain
 - 安装完成后可在前端“高级设置 - 实验室”中关闭或重新开启 Rust 加速；如果后端未加载扩展，该开关会保持关闭且不可操作
 
@@ -374,7 +380,9 @@ moviepilot version
 
 - `start` 会先启动后端，再启动前端
 - `start --safe` 会以安全模式启动后端，本次启动跳过插件、调度器、监控、命令和工作流等后台扩展能力，不修改用户配置
-- 如果开启了 `MOVIEPILOT_AUTO_UPDATE=release|true|dev`，`start/restart` 会在启动前尽力执行一次本地自动更新；更新失败只告警，不阻断当前启动
+- `MOVIEPILOT_AUTO_UPDATE` 默认关闭；仅 `dev` 保留启动前跟踪当前 v3 开发分支的行为，更新失败只告警，不阻断当前启动
+- Release 更新由后台每 6 小时检查 GitHub Release；管理员确认后先静默下载安装包并显示进度，下载完成后再次确认重启，启动阶段只安装已下载且通过 SHA-256 校验的包
+- 页面中的“稍后”会在当前浏览器暂停提醒 24 小时，“忽略此版本”只屏蔽当前版本；出现更高版本时会重新提示
 - 通过系统内置的重启入口触发重启时，本地 CLI 安装模式也会复用同一套前后端进程管理完成重启
 - 前端默认监听 `NGINX_PORT`，默认值 `3000`
 - 后端默认监听 `PORT`，默认值 `3001`
@@ -442,6 +450,10 @@ moviepilot config set PORT 3001
 moviepilot config set NGINX_PORT 3000
 moviepilot config set API_TOKEN your-token-here
 moviepilot config set ACOUSTID_API_KEY your-acoustid-client-key
+moviepilot config set LRCLIB_BASE_URL https://lrclib.net
+moviepilot config set LYRICS_BATCH_TIMEOUT 120
+moviepilot config set LYRICS_PROVIDER_RETRY_MAX_WAIT 5
+moviepilot config set MUSIXMATCH_API_KEY your-authorized-api-key
 moviepilot config set MUSIC_METADATA_TO_SIMPLIFIED true
 ```
 
@@ -461,8 +473,49 @@ moviepilot config describe API_TOKEN --show-secrets
 - `config list` 显示当前配置值
 - `config keys` 显示配置项名称、类型和默认值
 - `ACOUSTID_API_KEY` 内置可用默认值，也可在前端“高级设置 - 媒体”或配置命令中覆盖；本地安装需要系统可执行路径中存在 Chromaprint `fpcalc`，官方 Docker 镜像已内置
+- `LRCLIB_BASE_URL` 默认使用官方实例，也可指向兼容 LRCLIB API 的自建实例；`LYRICS_BATCH_TIMEOUT` 限制单次专辑刮削的在线歌词总预算，`LYRICS_PROVIDER_RETRY_MAX_WAIT` 决定长 `Retry-After` 进入来源冷却而非阻塞批次
+- `THEAUDIODB_API_KEY` 用于音乐元数据及纯文本歌词兜底，默认 `123` 为官方公开 V1 Key；`MUSIXMATCH_API_KEY` 留空时不加载 Musixmatch，配置后只调用官方或 `MUSIXMATCH_BASE_URL` 指定的授权代理，使用者必须遵守对应账户的歌词存储和展示授权
 - `MUSIC_METADATA_TO_SIMPLIFIED` 默认开启；开启后会将识别结果中的曲名、艺术家、专辑和分类等标准音乐元数据转换为简体中文，不转换歌词与来源原始响应
 - `config describe` 显示单个配置项的类型、默认值和当前值
+
+## 数据库备份命令
+
+创建一次在线一致备份：
+
+```shell
+moviepilot database backup
+```
+
+列出本地备份，并按文件名重新校验：
+
+```shell
+moviepilot database list
+moviepilot database verify <filename>
+```
+
+MoviePilot 停止运行后，可通过明确确认执行离线还原：
+
+```shell
+moviepilot database restore <filename> --confirm
+```
+
+Docker Compose 部署应复用原服务的环境变量和 `/config` 挂载，在服务停止后运行一次性 CLI：
+
+```shell
+docker compose stop <service>
+docker compose run --rm --no-deps --entrypoint moviepilot <service> database restore <filename> --confirm
+docker compose start <service>
+```
+
+`<service>` 是 Compose 文件中的 MoviePilot 服务名，不是容器名。
+
+说明：
+
+- SQLite 使用在线备份 API，PostgreSQL 使用镜像内置的 `pg_dump` custom format
+- 源码部署使用 PostgreSQL 时，宿主机需安装 `pg_dump` 和 `pg_restore` 并加入 `PATH`；Docker 镜像已内置
+- 默认目录为配置目录下的 `database_backup/`，可通过 `DB_BACKUP_PATH` 调整
+- 备份、列举和校验可独立通过 CLI 执行
+- 还原会覆盖当前数据库，执行前必须停止 MoviePilot；运行中的 Web API 和插件 SDK 不提供还原入口
 
 ## Tool 命令
 

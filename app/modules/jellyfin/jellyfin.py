@@ -1,18 +1,17 @@
 import json
 import posixpath
-from datetime import datetime
 from typing import List, Union, Optional, Dict, Generator, Tuple, Any
 
 from requests import Response
 
 from app.schemas.dashboard import Statistic as _SchemaStatistic
 from app.schemas.mediaserver import MediaServerItem as _SchemaMediaServerItem
-from app.schemas.mediaserver import MediaServerItemUserState as _SchemaMediaServerItemUserState
 from app.schemas.mediaserver import MediaServerLibrary as _SchemaMediaServerLibrary
 from app.schemas.mediaserver import MediaServerPlayItem as _SchemaMediaServerPlayItem
 from app.schemas.mediaserver import WebhookEventInfo as _SchemaWebhookEventInfo
-from app.runtime.config import settings
-from app.application.mediaserver import MediaServerIdentityHelper, MusicMediaServerHelper
+from app.runtime.settings import get_runtime_setting
+
+from app.application.mediaserver import MediaServerIdentityHelper, format_emby_family_item
 from app.runtime.log import logger
 from app.schemas.types import MediaType
 from app.schemas.types import MediaSource
@@ -40,7 +39,7 @@ class Jellyfin:
         if self._playhost:
             self._playhost = UrlUtils.standardize_base_url(self._playhost)
         self._apikey = apikey
-        self.user = self.get_user(settings.SUPERUSER)
+        self.user = self.get_user(get_runtime_setting('SUPERUSER'))
         self.serverid = self.get_server_id()
         self._sync_libraries = sync_libraries or []
 
@@ -253,9 +252,10 @@ class Jellyfin:
                     for user in users:
                         if user.get("Name") == user_name:
                             return user.get("Id")
-                if user_name == settings.SUPERUSER:
+                if user_name:
                     logger.warning(
-                        "MoviePilot 当前配置的超级管理员用户名为 {}，请确保Jellyfin中存在同名管理员账号，否则可能无法正常使用部分功能！".format(settings.SUPERUSER)
+                        f"未找到指定的 Jellyfin 用户账号 {user_name}，"
+                        "将回退选择可用的超级管理员账号！"
                     )
                 # 查询管理员，优先选择同时具备全库访问能力的账号，再回退到普通管理员。
                 # 获取总媒体库数量
@@ -281,7 +281,9 @@ class Jellyfin:
                     logger.warning("未找到可用的管理员账号，无法获取管理员用户，请检查Jellyfin用户及权限配置！")
                     return None
                 logger.warning(
-                    f"未找到具备全库访问权限的管理员账号，回退使用仅可访问{best_admin_library_count}/{total_library_count}个媒体库的管理员账号{best_admin_name}！"
+                    "未找到具备全库访问权限的管理员账号，"
+                    f"回退使用显式访问范围为 {best_admin_library_count}/{total_library_count} "
+                    f"个媒体库的管理员账号 {best_admin_name}！"
                 )
                 return best_admin_id
             else:
@@ -887,49 +889,8 @@ class Jellyfin:
 
     @staticmethod
     def __format_item_info(item) -> Optional[_SchemaMediaServerItem]:
-        """
-        格式化item
-        """
-        try:
-            user_data = item.get("UserData", {})
-            if not user_data:
-                user_state = None
-            else:
-                resume = item.get("UserData", {}).get("PlaybackPositionTicks") and item.get("UserData", {}).get(
-                    "PlaybackPositionTicks") > 0
-                last_played_date = item.get("UserData", {}).get("LastPlayedDate")
-                if last_played_date is not None and "." in last_played_date:
-                    last_played_date = last_played_date.split(".")[0]
-                user_state = _SchemaMediaServerItemUserState(
-                    played=item.get("UserData", {}).get("Played"),
-                    resume=resume,
-                    last_played_date=datetime.strptime(last_played_date, "%Y-%m-%dT%H:%M:%S").strftime(
-                        "%Y-%m-%d %H:%M:%S") if last_played_date else None,
-                    play_count=item.get("UserData", {}).get("PlayCount"),
-                    percentage=item.get("UserData", {}).get("PlayedPercentage"),
-                )
-            media_source, media_id = MediaServerIdentityHelper.from_provider_ids(
-                item.get("ProviderIds")
-            )
-            return _SchemaMediaServerItem(
-                server="jellyfin",
-                library=item.get("ParentId"),
-                item_id=item.get("Id"),
-                item_type=item.get("Type"),
-                title=item.get("Name"),
-                original_title=item.get("OriginalTitle"),
-                year=item.get("ProductionYear"),
-                media_source=media_source,
-                media_id=media_id,
-                path=item.get("Path"),
-                note=MusicMediaServerHelper.build_note(item)
-                if item.get("Type") in {"MusicAlbum", "Audio"} else None,
-                user_state=user_state
-
-            )
-        except Exception as e:
-            logger.error(e)
-        return None
+        """通过统一 Emby 系转换契约生成 Jellyfin 条目。"""
+        return format_emby_family_item(item, server="jellyfin")
 
     def get_iteminfo(self, itemid: str) -> Optional[_SchemaMediaServerItem]:
         """

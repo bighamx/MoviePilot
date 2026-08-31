@@ -1,17 +1,17 @@
 from abc import ABCMeta, abstractmethod
 from pathlib import Path, PurePosixPath
-from typing import Optional, List, Dict, Tuple, Callable, Union
+from typing import Callable, Dict, List, Optional, Tuple, Union
 
 from tqdm import tqdm
 
+from app.application.storage import StorageHelper
+from app.foundation.crypto import HashUtils
+from app.runtime.log import logger
+from app.runtime.progress import ProgressHelper
+from app.schemas.exception import StorageQueryError
 from app.schemas.file import StorageUsage as _SchemaStorageUsage
 from app.schemas.system import StorageConf as _SchemaStorageConf
 from app.schemas.workflow import FileItem as _SchemaFileItem
-from app.runtime.progress import ProgressHelper
-from app.application.storage import StorageHelper
-from app.runtime.log import logger
-from app.schemas.exception import StorageQueryError
-from app.foundation.crypto import HashUtils
 
 
 def transfer_process(path: str) -> Callable[[int | float], None]:
@@ -49,6 +49,10 @@ class StorageBase(metaclass=ABCMeta):
 
     def __init__(self):
         self.storagehelper = StorageHelper()
+
+    def close(self) -> bool | None:
+        """关闭外部资源；返回 False 表示 owner 尚未收敛且必须保留。"""
+        return None
 
     @abstractmethod
     def init_storage(self):

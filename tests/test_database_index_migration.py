@@ -5,12 +5,17 @@ import subprocess
 import sys
 import uuid
 
-import psycopg2
-from psycopg2 import sql
 import pytest
 import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
+
+try:
+    import psycopg2 as postgres_driver
+    from psycopg2 import sql
+except ModuleNotFoundError:
+    import psycopg as postgres_driver
+    from psycopg import sql
 
 
 MIGRATION_MODULE = "database.versions.93f8cb6a4d1e_2_2_4"
@@ -66,17 +71,17 @@ IDENTITY_INDEX_SIGNATURES = {
 CURRENT_SCHEMA_CHAIN_SCRIPT = """
 from app.testing.bootstrap import ensure_sites_stub
 
-# Alembic 会导入引用业务链的旧 revision；全新 CI 环境没有动态下发的 sites 模块。
+# Alembic 会导入引用业务链的旧 revision，迁移验证不应加载本机站点原生制品。
 ensure_sites_stub()
 
 from alembic.config import Config
 from alembic.script import ScriptDirectory
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, MetaData, Table, text
 from sqlalchemy.exc import IntegrityError
 
 from app.runtime.config import settings
 from app.db import get_engine
-from app.startup.database_initializer import init_db, update_db
+from app.startup.initializers.database import init_db, update_db
 
 media_tables = {media_tables!r}
 legacy_identity_columns = {legacy_identity_columns!r}
@@ -110,8 +115,8 @@ with get_engine().connect() as connection:
             )
             for index in inspector.get_indexes(table_name)
         }}
-        constraints = {{
-            constraint["name"]: constraint.get("sqltext") or ""
+        constraint_names = {{
+            constraint["name"]
             for constraint in inspector.get_check_constraints(table_name)
         }}
         assert {{"media_source", "media_id"}}.issubset(columns), (
@@ -129,57 +134,71 @@ with get_engine().connect() as connection:
                 indexes,
             )
         constraint_name = f"ck_{{table_name}}_media_identity"
-        assert constraint_name in constraints, (
+        assert constraint_name in constraint_names, (
             table_name,
-            constraints,
-        )
-        normalized_sql = "".join(
-            constraints[constraint_name].lower().replace('"', '').split()
-        )
-        for text_cast in ("::text[]", "::text", "::charactervarying"):
-            normalized_sql = normalized_sql.replace(text_cast, "")
-        for fragment in (
-            "media_sourceisnull",
-            "media_idisnull",
-            "media_sourceisnotnull",
-            "media_idisnotnull",
-            "length(media_source)",
-            "media_sourcenotlike'%:%'",
-        ):
-            assert fragment in normalized_sql, (
-                table_name,
-                constraints[constraint_name],
-            )
-        assert any(
-            trim_form in normalized_sql
-            for trim_form in (
-                "trim(media_id)",
-                "trim(bothfrommedia_id)",
-            )
-        ), (table_name, constraints[constraint_name])
-        assert "<>''" in normalized_sql, (
-            table_name,
-            constraints[constraint_name],
-        )
-        assert "<>'0'" in normalized_sql, (
-            table_name,
-            constraints[constraint_name],
+            constraint_names,
         )
 
-    constraint_name = "ck_mediaserveritem_media_identity"
-    try:
-        with connection.begin_nested():
-            connection.execute(
-                text(
-                    "INSERT INTO mediaserveritem (media_source, media_id) "
-                    "VALUES (:media_source, :media_id)"
-                ),
-                {{"media_source": "invalid:source", "media_id": "1"}},
-            )
-    except IntegrityError as error:
-        assert constraint_name in str(error.orig), str(error.orig)
-    else:
-        raise AssertionError("格式非法的媒体身份未被具名检查约束拒绝")
+    required_values = {{
+        "subscribe": {{"name": "constraint-test", "state": "N"}},
+        "subscribehistory": {{"name": "constraint-test"}},
+        "downloadhistory": {{
+            "path": "/constraint-test",
+            "type": "电影",
+            "title": "constraint-test",
+        }},
+        "transferhistory": {{"src_storage": "local"}},
+        "downloadfailure": {{"fingerprint": "constraint-test"}},
+        "mediaserveritem": {{}},
+    }}
+    invalid_identities = (
+        (None, "1"),
+        ("acme.video", None),
+        ("", "1"),
+        (" acme.video", "1"),
+        ("acme.video ", "1"),
+        ("Acme.Video", "1"),
+        ("a" * 65, "1"),
+        ("invalid:source", "1"),
+        ("invalid source", "1"),
+        ("acme.video", ""),
+        ("acme.video", "  "),
+        ("acme.video", "0"),
+    )
+    for table_name in media_tables:
+        table = Table(table_name, MetaData(), autoload_with=connection)
+        constraint_name = f"ck_{{table_name}}_media_identity"
+        for media_source, media_id in (
+            (None, None),
+            ("acme.video", "custom-1"),
+        ):
+            values = {{
+                **required_values[table_name],
+                "media_source": media_source,
+                "media_id": media_id,
+            }}
+            savepoint = connection.begin_nested()
+            try:
+                connection.execute(table.insert(), values)
+            finally:
+                savepoint.rollback()
+
+        for media_source, media_id in invalid_identities:
+            values = {{
+                **required_values[table_name],
+                "media_source": media_source,
+                "media_id": media_id,
+            }}
+            try:
+                with connection.begin_nested():
+                    connection.execute(table.insert(), values)
+            except IntegrityError as error:
+                assert constraint_name in str(error.orig), str(error.orig)
+            else:
+                raise AssertionError(
+                    "格式非法的媒体身份未被具名检查约束拒绝: "
+                    f"{{table_name}}, {{media_source!r}}, {{media_id!r}}"
+                )
 """.format(
     media_tables=MEDIA_TABLES,
     legacy_identity_columns=LEGACY_IDENTITY_COLUMNS,
@@ -356,7 +375,7 @@ def test_current_schema_reaches_current_alembic_head_on_postgresql(
     port = os.getenv(f"{prefix}PORT", "5432")
     password = os.getenv(f"{prefix}PASSWORD", "")
     schema = f"p1_db1_{uuid.uuid4().hex}"
-    with psycopg2.connect(
+    with postgres_driver.connect(
         host=host,
         port=port,
         dbname=database,
@@ -386,7 +405,7 @@ def test_current_schema_reaches_current_alembic_head_on_postgresql(
     try:
         _run_current_schema_chain(repository, environment)
     finally:
-        with psycopg2.connect(
+        with postgres_driver.connect(
             host=host,
             port=port,
             dbname=database,

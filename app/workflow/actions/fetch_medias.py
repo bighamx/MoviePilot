@@ -2,17 +2,16 @@ from typing import List, Optional
 
 from pydantic import Field
 
-from app.workflow.actions import BaseAction
+from app.adapters.network.http import RequestUtils
+from app.application.configuration import get_chain_runtime_config_snapshot
 from app.chain.recommend import RecommendChain
-from app.schemas.workflow import ActionParams
-from app.schemas.workflow import ActionContext
-from app.runtime.config import settings, global_vars
 from app.runtime.events import eventmanager
 from app.runtime.log import logger
+from app.runtime.stop import runtime_stop_state
 from app.schemas.event import RecommendSourceEventData
-from app.schemas.workflow import MediaInfo
 from app.schemas.types import ChainEventType
-from app.adapters.network.http import RequestUtils
+from app.schemas.workflow import ActionContext, ActionParams, MediaInfo
+from app.workflow.actions import BaseAction
 
 
 class FetchMediasParams(ActionParams):
@@ -115,20 +114,9 @@ class FetchMediasAction(BaseAction):
             if event_data.extra_sources:
                 self.__inner_sources.extend([s.model_dump() for s in event_data.extra_sources])
 
-    @classmethod
-    @property
-    def name(cls) -> str: # noqa
-        return "获取媒体数据"
-
-    @classmethod
-    @property
-    def description(cls) -> str: # noqa
-        return "获取榜单等媒体数据列表"
-
-    @classmethod
-    @property
-    def data(cls) -> dict: # noqa
-        return FetchMediasParams().model_dump()
+    name = "获取媒体数据"
+    description = "获取榜单等媒体数据列表"
+    data = FetchMediasParams().model_dump()
 
     @property
     def success(self) -> bool:
@@ -151,7 +139,7 @@ class FetchMediasAction(BaseAction):
         try:
             if params.source_type == "ranking":
                 for api_path in params.sources:
-                    if global_vars.is_workflow_stopped(workflow_id):
+                    if runtime_stop_state.is_workflow_stopped(workflow_id):
                         break
                     source = self.__get_source(api_path)
                     if not source:
@@ -163,7 +151,11 @@ class FetchMediasAction(BaseAction):
                         results = source['func']()
                     else:
                         # 调用内部API获取数据
-                        api_url = f"http://127.0.0.1:{settings.PORT}/api/v1/{source['api_path']}?token={settings.API_TOKEN}"
+                        runtime_config = get_chain_runtime_config_snapshot()
+                        api_url = (
+                            f"http://127.0.0.1:{runtime_config.api_port}"
+                            f"/api/v1/{source['api_path']}?token={runtime_config.api_token}"
+                        )
                         res = RequestUtils(timeout=15).post_res(api_url)
                         if res:
                             results = res.json()
@@ -174,7 +166,11 @@ class FetchMediasAction(BaseAction):
                         logger.error(f"{name} 获取数据失败")
             else:
                 # 调用内部API获取数据
-                api_url = f"http://127.0.0.1:{settings.PORT}{params.api_path}?token={settings.API_TOKEN}"
+                runtime_config = get_chain_runtime_config_snapshot()
+                api_url = (
+                    f"http://127.0.0.1:{runtime_config.api_port}{params.api_path}"
+                    f"?token={runtime_config.api_token}"
+                )
                 res = RequestUtils(timeout=15).post_res(api_url)
                 if res:
                     results = res.json()

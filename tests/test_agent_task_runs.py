@@ -1,18 +1,24 @@
 import json
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Thread, current_thread
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
-from app.agent import AgentManager
+from app.agent.orchestrator import AgentManager
 from app.agent.tools.impl.query_agent_tasks import QueryAgentTasksTool
-from app.db import Engine, SessionFactory
-from app.db.oper.agenttask import AgentTaskOper
+from app.db import base as db_base
+from app.db.adapters.agent import TransactionalAgentTaskRepository
+from app.db.engine import get_engine
 from app.db.models.agenttask import AgentTask
 from app.db.models.agenttaskrun import AgentTaskRun
+from app.db.oper.agenttask import AgentTaskOper
+from app.db.session import SessionFactory
+
+Engine = get_engine()
 
 
 def _add_task(prefix: str, *, trigger_type: str = "cron") -> AgentTask:
@@ -35,7 +41,13 @@ def _add_task(prefix: str, *, trigger_type: str = "cron") -> AgentTask:
 
 def _build_query_tool(user_id: str) -> QueryAgentTasksTool:
     """构造绑定当前 owner 的任务查询工具。"""
-    tool = QueryAgentTasksTool(session_id=f"session-{user_id}", user_id=user_id)
+    tool = QueryAgentTasksTool(
+        session_id=f"session-{user_id}",
+        user_id=user_id,
+        data=SimpleNamespace(
+            tasks=TransactionalAgentTaskRepository(SessionFactory)
+        ),
+    )
     tool._message_context = {"username": "admin"}
     return tool
 
@@ -130,22 +142,47 @@ def test_begin_run_rejects_unknown_trigger_source() -> None:
     assert AgentTaskOper().list_runs(task.id) == []
 
 
+def test_agenttaskrun_oper_reuses_explicit_query_session(db, monkeypatch):
+    """AgentTaskOper 的运行记录查询必须复用调用方同步会话。"""
+    task = _add_task("run-explicit-query")
+    run = AgentTaskOper().begin_run(task.id)
+    assert run
+    monkeypatch.setattr(
+        db_base,
+        "run_sync_transaction",
+        lambda _operation: (_ for _ in ()).throw(
+            AssertionError("不应创建额外同步事务")
+        ),
+    )
+
+    oper = AgentTaskOper(db.session)
+    assert oper.get_run(run.run_id) is not None
+    assert oper.list_runs(task.id)
+
+
+@pytest.mark.anyio
+async def test_agenttask_oper_async_get_uses_async_query_boundary() -> None:
+    """异步任务查询应复用统一 AsyncSession 路径并保持 owner 过滤语义。"""
+    task = _add_task("run-async-query")
+
+    assert await AgentTaskOper().async_get(task.id, user_id=task.user_id) is not None
+    assert await AgentTaskOper().async_get(task.id, user_id="another-user") is None
+
+
 def test_begin_run_rolls_back_task_claim_when_run_insert_fails() -> None:
     """运行记录插入失败时，任务的 running 投影必须随事务回滚。"""
     first_task = _add_task("run-rollback-first")
     second_task = _add_task("run-rollback-second")
     run_id = uuid4().hex
-    assert AgentTaskRun.begin_run(
-        None,
+    assert AgentTaskOper().begin_run(
         task_id=first_task.id,
         run_id=run_id,
         trigger_source="scheduled",
         started_at="2026-08-13 20:00:00",
-    ) == run_id
+    ).run_id == run_id
 
     with pytest.raises(IntegrityError):
-        AgentTaskRun.begin_run(
-            None,
+        AgentTaskOper().begin_run(
             task_id=second_task.id,
             run_id=run_id,
             trigger_source="manual",
@@ -200,7 +237,10 @@ def test_stale_finish_cannot_overwrite_latest_run_projection() -> None:
     second = oper.begin_run(task.id, "manual")
     assert second
 
-    assert oper.finish_run(first.run_id, success=True, result="旧结果")
+    outcome = oper.finish_run_outcome(first.run_id, success=True, result="旧结果")
+    assert outcome.run_finalized is True
+    assert outcome.task_projection_updated is False
+    assert outcome.date_task_disabled is False
     current = oper.get(task.id)
     assert current.last_run_id == second.run_id
     assert current.last_status == "running"
@@ -332,7 +372,15 @@ async def test_query_task_returns_owner_scoped_ten_recent_runs(monkeypatch) -> N
 @pytest.mark.anyio
 async def test_agent_manager_records_manual_trigger_source(monkeypatch) -> None:
     """真实执行入口应把手动触发来源写入对应 run。"""
-    monkeypatch.setattr("app.agent.orchestrator.settings.AI_AGENT_ENABLE", True)
+    from app.agent import orchestrator
+    from app.runtime.config import settings
+
+    monkeypatch.setattr(settings, "AI_AGENT_ENABLE", True)
+    monkeypatch.setattr(
+        orchestrator,
+        "get_runtime_setting",
+        lambda key, default=None: getattr(settings, key, default),
+    )
     task = _add_task("run-manager")
     manager = AgentManager()
     captured = {}

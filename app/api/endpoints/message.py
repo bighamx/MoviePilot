@@ -2,11 +2,28 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Protocol, Union, Any, List, Optional
+from typing import Annotated, Any, List, Optional, Protocol, Union
 
-from fastapi import BackgroundTasks, Depends, Request
+from fastapi import Depends, Request
 from starlette.responses import PlainTextResponse
 
+from app.adapters.external.wechat import WXBizMsgCrypt
+from app.adapters.web.security.access import verify_apitoken, verify_token
+from app.api.context import get_background_task_registry, resolve_background_task_registry
+from app.api.dependencies.agent import get_message_query_service
+from app.api.dependencies.auth import get_current_active_superuser
+from app.api.principal import ApiPrincipal
+from app.api.response import ResponseAPIRouter
+from app.application.configuration import (
+    get_api_runtime_config_snapshot,
+    get_configured_system_config,
+)
+from app.application.messaging.message import MessageQueryService
+from app.application.notification import get_notification_configs
+from app.chain.message import MessageChain
+from app.runtime.log import logger
+from app.runtime.tasks import TaskRegistry
+from app.runtime.webpush import webpush_registry
 from app.schemas.message import MessageClearBefore as _SchemaMessageClearBefore
 from app.schemas.message import MessageClearData as _SchemaMessageClearData
 from app.schemas.message import MessageClearScope as _SchemaMessageClearScope
@@ -16,17 +33,6 @@ from app.schemas.message import SubscriptionMessage as _SchemaSubscriptionMessag
 from app.schemas.message import WebMessageItem as _SchemaWebMessageItem
 from app.schemas.response import Response as _SchemaResponse
 from app.schemas.token import TokenPayload as _SchemaTokenPayload
-from app.api.response import ResponseAPIRouter
-from app.chain.message import MessageChain
-from app.runtime.config import settings, global_vars
-from app.adapters.web.security.access import verify_token, verify_apitoken
-from app.api.principal import ApiPrincipal
-from app.application.configuration import get_configured_system_config
-from app.api.deps import get_current_active_superuser, get_message_query_service
-from app.application.messaging.message import MessageQueryService
-from app.runtime.extensions.service_config import ServiceConfigHelper
-from app.runtime.log import logger
-from app.adapters.external.wechat_crypt import WXBizMsgCrypt
 from app.schemas.types import NotificationChannel, SystemConfigKey
 
 router = ResponseAPIRouter()
@@ -112,7 +118,7 @@ def start_message_chain(body: Any, form: Any, args: Any):
 
 @router.post("/", summary="接收用户消息", response_model=_SchemaResponse[None])
 async def user_message(
-    background_tasks: BackgroundTasks,
+    task_registry: Annotated[TaskRegistry, Depends(get_background_task_registry)],
     request: Request,
     _: _SchemaTokenPayload = Depends(verify_apitoken),
 ):
@@ -146,7 +152,9 @@ async def user_message(
         list(form.keys()) if form else [],
         image_markers,
     )
-    background_tasks.add_task(start_message_chain, body, form, args)
+    resolve_background_task_registry(task_registry).create_sync(
+        start_message_chain, body, form, args, owner="api.message.user"
+    )
     return _SchemaResponse(success=True)
 
 
@@ -253,7 +261,7 @@ def wechat_verify(
     微信验证响应
     """
     # 获取服务配置
-    client_configs = ServiceConfigHelper.get_notification_configs()
+    client_configs = get_notification_configs(include_disabled=True)
     if not client_configs:
         return "未找到对应的消息配置"
     client_config = next(
@@ -349,7 +357,7 @@ async def subscribe(
     客户端webpush通知订阅
     """
     subinfo = subscription.model_dump()
-    global_vars.push_subscription(subinfo)
+    webpush_registry.upsert(subinfo)
     logger.debug(f"通知订阅成功: {subinfo}")
     return _SchemaResponse(success=True)
 
@@ -366,18 +374,18 @@ def send_notification(
     """
     from pywebpush import WebPushException, webpush
 
-    for sub in global_vars.get_subscriptions():
+    for sub in webpush_registry.list():
         try:
             webpush(
                 subscription_info=sub,
                 data=json.dumps(payload.model_dump()),
-                vapid_private_key=settings.VAPID.get("privateKey"),
-                vapid_claims={"sub": settings.VAPID.get("subject")},
+                vapid_private_key=get_api_runtime_config_snapshot().vapid_private_key,
+                vapid_claims={"sub": get_api_runtime_config_snapshot().vapid_subject},
                 **webpush_options_for_endpoint(sub.get("endpoint")),
             )
         except WebPushException as err:
             logger.error(f"WebPush发送失败: {str(err)}")
-            if is_webpush_subscription_gone(err) and global_vars.remove_subscription(sub):
+            if is_webpush_subscription_gone(err) and webpush_registry.remove(sub):
                 logger.info(f"已移除失效WebPush订阅: {sub.get('endpoint')}")
             continue
     return _SchemaResponse(success=True)

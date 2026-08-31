@@ -5,7 +5,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base, execute_dml, get_id_column
-from app.db.decorators import async_db_query, db_query, db_update
 
 
 class Message(Base):
@@ -40,7 +39,6 @@ class Message(Base):
         Index('ix_message_reg_time_id', 'reg_time', 'id'),
     )
 
-    @db_update
     def create_and_to_dict(self, db: Session) -> dict:
         """
         创建消息记录并返回写入后的字段字典。
@@ -50,11 +48,13 @@ class Message(Base):
         return self.to_dict()
 
     @classmethod
-    @db_query
-    def list_by_page(cls, db: Session, page: int = 1, count: int = 30) -> List["Message"]:
-        """
-        分页获取消息记录。
-        """
+    def list_by_page(
+        cls,
+        db: Session,
+        page: int = 1,
+        count: int = 30,
+    ) -> List["Message"]:
+        """在调用方同步会话中分页获取消息记录。"""
         return list(db.execute(
             select(cls)
             .order_by(cls.reg_time.desc(), cls.id.desc())
@@ -63,8 +63,11 @@ class Message(Base):
         ).scalars().all())
 
     @classmethod
-    @db_query
-    def exists_by_source(cls, db: Session, source: str) -> bool:
+    def exists_by_source(
+        cls,
+        db: Session,
+        source: str,
+    ) -> bool:
         """
         判断指定来源标识的消息记录是否存在。
 
@@ -77,7 +80,6 @@ class Message(Base):
         ).scalars().first() is not None
 
     @classmethod
-    @async_db_query
     async def async_list_by_page(
             cls, db: AsyncSession, page: int = 1, count: int = 30
     ) -> List["Message"]:
@@ -93,7 +95,6 @@ class Message(Base):
         return list(result.scalars().all())
 
     @classmethod
-    @async_db_query
     async def async_list_sent_by_page(
             cls,
             db: AsyncSession,
@@ -124,7 +125,6 @@ class Message(Base):
                     cls.reg_time > media_clear_before,
                 )
             )
-
         result = await db.execute(
             statement
             .order_by(cls.reg_time.desc(), cls.id.desc())
@@ -134,7 +134,6 @@ class Message(Base):
         return list(result.scalars().all())
 
     @classmethod
-    @db_update
     def delete_before(
         cls,
         db: Session,

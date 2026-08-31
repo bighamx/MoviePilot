@@ -9,7 +9,10 @@ import asyncio
 
 import pytest
 
+from app.db import base as db_base
 from app.db.models.mediaserver import MediaServerItem
+from app.db.oper.mediaserver import MediaServerOper
+from app.db.session import async_session_scope
 from app.schemas.types import MediaSource
 
 
@@ -36,8 +39,46 @@ def test_get_by_itemid_matches_async_twin(db):
     db.add(_item("emby", "it-1"), _item("plex", "it-2"))
 
     assert MediaServerItem.get_by_itemid(db.session, "it-1").server == "emby"
-    assert asyncio.run(MediaServerItem.async_get_by_itemid(item_id="it-1")).server == "emby"
+    assert db.run_async_session(
+        lambda session: MediaServerItem.async_get_by_itemid(session, "it-1")
+    ).server == "emby"
     assert MediaServerItem.get_by_itemid(db.session, "it-missing") is None
+
+
+def test_mediaserver_oper_reuses_explicit_query_sessions(db, monkeypatch):
+    """媒体服务器 Oper 绑定调用方会话后不得再创建兼容查询会话。"""
+    db.add(_item("emby", "explicit-ms", media_id="explicit-1001"))
+    monkeypatch.setattr(
+        db_base,
+        "run_sync_transaction",
+        lambda _operation: (_ for _ in ()).throw(
+            AssertionError("不应创建额外同步事务")
+        ),
+    )
+
+    assert MediaServerOper(db.session).exists(
+        media_source=MediaSource.TMDB,
+        media_id="explicit-1001",
+        mtype="电影",
+    ) is not None
+
+    async def check() -> None:
+        """验证异步存在性查询复用显式 AsyncSession。"""
+        async with async_session_scope() as session:
+            monkeypatch.setattr(
+                db_base,
+                "run_async_transaction",
+                lambda _operation: (_ for _ in ()).throw(
+                    AssertionError("不应创建额外异步事务")
+                ),
+            )
+            assert await MediaServerOper(session).async_exists(
+                media_source=MediaSource.TMDB,
+                media_id="explicit-1001",
+                mtype="电影",
+            ) is not None
+
+    asyncio.run(check())
 
 
 def test_get_by_server_itemid_scopes_by_server(db):
@@ -69,8 +110,14 @@ def test_exist_by_media_identity_requires_source_id_and_type(db):
     assert MediaServerItem.exist_by_media_identity(
         db.session, MediaSource.TMDB, "556", "电影") is None
 
-    assert asyncio.run(MediaServerItem.async_exist_by_media_identity(
-        media_source=MediaSource.TMDB, media_id="555", mtype="电影")) is not None
+    assert db.run_async_session(
+        lambda session: MediaServerItem.async_exist_by_media_identity(
+            session,
+            media_source=MediaSource.TMDB,
+            media_id="555",
+            mtype="电影",
+        )
+    ) is not None
 
 
 @pytest.mark.parametrize("mtype,year,expected", [
@@ -103,9 +150,38 @@ def test_exists_by_title_matches_async_twin(db):
 
     for mtype, year in ((None, None), ("电影", None), (None, "2026"), ("电影", "2026")):
         sync_found = MediaServerItem.exists_by_title(db.session, "并行标题", mtype, year)
-        async_found = asyncio.run(MediaServerItem.async_exists_by_title(
-            title="并行标题", mtype=mtype, year=year))
+        async_found = db.run_async_session(
+            lambda session: MediaServerItem.async_exists_by_title(
+                session, title="并行标题", mtype=mtype, year=year
+            )
+        )
         assert (sync_found is None) == (async_found is None)
+
+
+def test_oper_season_lookup_accepts_json_string_keys(db):
+    """跨 Session 后的 JSON 季号键为字符串，查询仍应按整数季号命中。"""
+    item = _item("emby", "season-json", item_type="电视剧", media_id="season-1")
+    item.seasoninfo = {"1": [1, 2]}
+    db.add(item)
+
+    assert MediaServerOper(db.session).get_item_id(
+        media_source=MediaSource.TMDB,
+        media_id="season-1",
+        mtype="电视剧",
+        season=1,
+    ) == "season-json"
+
+    async def check() -> None:
+        """验证异步查询与同步查询采用相同的 JSON 季号兼容规则。"""
+        async with async_session_scope() as session:
+            assert await MediaServerOper(session).async_get_item_id(
+                media_source=MediaSource.TMDB,
+                media_id="season-1",
+                mtype="电视剧",
+                season=1,
+            ) == "season-json"
+
+    asyncio.run(check())
 
 
 def test_empty_clears_only_the_given_server(db):

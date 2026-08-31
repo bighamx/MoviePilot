@@ -1,8 +1,8 @@
 from typing import Tuple, Union
 
-from app.runtime.config import settings
 from app.adapters.cache.redis import RedisHelper
 from app.modules import _ModuleBase
+from app.runtime.settings import get_runtime_setting
 from app.schemas.types import ModuleType, OtherModulesType
 
 
@@ -12,10 +12,12 @@ class RedisModule(_ModuleBase):
     """
 
     def init_module(self) -> None:
+        """Redis 客户端由缓存 adapter 惰性管理，无需模块级初始化。"""
         pass
 
     @staticmethod
     def get_name() -> str:
+        """返回模块展示名称。"""
         return "Redis缓存"
 
     @staticmethod
@@ -40,16 +42,18 @@ class RedisModule(_ModuleBase):
         return 0
 
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
+        """缓存后端由部署配置决定，不声明独立模块开关。"""
         pass
 
     def stop(self) -> None:
+        """缓存 adapter 负责连接释放，本模块无独立资源。"""
         pass
 
     def test(self):
         """
         测试模块连接性
         """
-        if settings.CACHE_BACKEND_TYPE != "redis":
+        if get_runtime_setting('CACHE_BACKEND_TYPE') != "redis":
             return None
         if RedisHelper().test():
             return True, ""

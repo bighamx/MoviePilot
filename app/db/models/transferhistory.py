@@ -1,14 +1,13 @@
 import re
 import time
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, cast
 
-from sqlalchemy import Boolean, Index, Integer, JSON, String, delete, func, or_, select, update
+from sqlalchemy import JSON, Boolean, Index, Integer, String, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base, execute_dml, get_id_column
-from app.db.decorators import async_db_query, db_query, db_update
 from app.db.models._constraints import media_identity_constraint
 from app.schemas.types import MUSIC_ENTITY_ALBUM, MUSIC_ENTITY_RECORDING, MediaSource, MediaType
 
@@ -25,6 +24,10 @@ class TransferHistory(Base):
     整理记录
     """
     id = get_id_column()
+    # 失败 pending 当前映射使用的稳定整理任务标识
+    transfer_task_id: Mapped[Optional[str]] = mapped_column(String(64))
+    # 失败 pending 当前映射对应的结算版本
+    transfer_settlement_revision: Mapped[Optional[int]] = mapped_column(Integer)
     # 源路径
     src: Mapped[Optional[str]] = mapped_column(String, index=True)
     # 源存储
@@ -91,10 +94,14 @@ class TransferHistory(Base):
         Index('ix_transferhistory_date_id', 'date', 'id'),
         Index('ix_transferhistory_media_identity', 'media_source', 'media_id'),
         Index('ux_transferhistory_src_storage', 'src', 'src_storage', unique=True),
+        Index(
+            'ux_transferhistory_transfer_task_id',
+            'transfer_task_id',
+            unique=True,
+        ),
     )
 
     @classmethod
-    @db_query
     def list_by_title(cls, db: Session, title: str, page: int = 1, count: int = 30,
                       status: Optional[bool] = None, wildcard: bool = False):
         if wildcard:
@@ -121,7 +128,6 @@ class TransferHistory(Base):
         return list(db.execute(statement).scalars().all())
 
     @classmethod
-    @async_db_query
     async def async_list_by_title(cls, db: AsyncSession, title: str, page: int = 1, count: int = 30,
                                   status: Optional[bool] = None, wildcard: bool = False):
         if wildcard:
@@ -149,7 +155,6 @@ class TransferHistory(Base):
         return list(result.scalars().all())
 
     @classmethod
-    @db_query
     def list_by_page(cls, db: Session, page: int = 1, count: int = 30, status: Optional[bool] = None):
         statement = select(cls)
         if status is not None:
@@ -163,7 +168,6 @@ class TransferHistory(Base):
         return list(db.execute(statement).scalars().all())
 
     @classmethod
-    @async_db_query
     async def async_list_by_page(cls, db: AsyncSession, page: int = 1, count: int = 30,
                                  status: Optional[bool] = None):
         if status is not None:
@@ -185,16 +189,20 @@ class TransferHistory(Base):
         return list(result.scalars().all())
 
     @classmethod
-    @db_query
-    def get_by_hash(cls, db: Session, download_hash: str):
+    def get_by_hash(
+        cls,
+        db: Session,
+        download_hash: str,
+    ):
+        """在调用方 Session 中按下载哈希查询最新记录。"""
         return db.execute(
             select(cls).where(cls.download_hash == download_hash)
         ).scalars().first()
 
     @classmethod
-    @db_query
     def get_by_src(
-            cls, db: Session, src: str, storage: Optional[str] = None
+            cls, db: Session, src: str,
+            storage: Optional[str] = None
     ) -> Optional["TransferHistory"]:
         """
         按源路径和存储查询单条整理记录。
@@ -207,14 +215,88 @@ class TransferHistory(Base):
         statement = select(cls).where(cls.src == src)
         if storage:
             statement = statement.where(cls.src_storage == storage)
-        return db.execute(
-            statement.order_by(cls.id.desc())
-        ).scalars().first()
+        return db.execute(statement.order_by(cls.id.desc())).scalars().first()
 
     @classmethod
-    @db_query
+    def get_by_transfer_task_id(
+            cls,
+            db: Session,
+            *,
+            task_id: str,
+    ) -> Optional["TransferHistory"]:
+        """按稳定整理任务标识读取终态结算历史。"""
+        if not task_id:
+            return None
+        return cast(
+            Optional["TransferHistory"],
+            db.execute(
+                select(cls).where(cls.transfer_task_id == task_id)
+            ).scalars().first(),
+        )
+
+    @classmethod
+    def upsert_by_transfer_task_id(
+            cls,
+            db: Session,
+            *,
+            task_id: str,
+            settlement_revision: int,
+            retain_task_mapping: bool,
+            payload: dict[str, Any],
+    ) -> "TransferHistory":
+        """按任务幂等写历史，并维持同源存储仅保留一条的既有约束。"""
+        if not task_id or settlement_revision <= 0:
+            raise ValueError("整理历史结算缺少稳定任务或正向版本")
+        column_names = {column.name for column in cls.__table__.columns}
+        values = {
+            key: value
+            for key, value in payload.items()
+            if key in column_names and key not in {
+                "id",
+                "transfer_task_id",
+                "transfer_settlement_revision",
+            }
+        }
+        src = values.get("src")
+        if not src:
+            raise ValueError("整理历史结算缺少源路径")
+        src_storage = values.get("src_storage") or "local"
+        values["src_storage"] = src_storage
+        history = cls.get_by_transfer_task_id(db, task_id=task_id)
+        if history is None:
+            history = db.execute(
+                select(cls).where(
+                    cls.src == src,
+                    cls.src_storage == src_storage,
+                )
+            ).scalars().first()
+        if history is None:
+            history = cls(
+                transfer_task_id=(task_id if retain_task_mapping else None),
+                transfer_settlement_revision=(
+                    settlement_revision if retain_task_mapping else None
+                ),
+                **values,
+            )
+            db.add(history)
+        else:
+            if (history.transfer_task_id == task_id
+                    and history.transfer_settlement_revision is not None
+                    and settlement_revision <= history.transfer_settlement_revision):
+                raise ValueError("整理历史结算版本必须单调递增")
+            history.transfer_task_id = task_id if retain_task_mapping else None
+            history.transfer_settlement_revision = (
+                settlement_revision if retain_task_mapping else None
+            )
+            for key, value in values.items():
+                setattr(history, key, value)
+        db.flush()
+        return history
+
+    @classmethod
     def get_success_by_src(
-            cls, db: Session, src: str, storage: Optional[str] = None
+            cls, db: Session, src: str,
+            storage: Optional[str] = None
     ) -> Optional["TransferHistory"]:
         """
         按源路径和存储查询成功的整理记录，源路径原样精确匹配。
@@ -229,14 +311,12 @@ class TransferHistory(Base):
         statement = select(cls).where(cls.src == src, cls.status.is_(True))
         if storage:
             statement = statement.where(cls.src_storage == storage)
-        return db.execute(
-            statement.order_by(cls.id.desc())
-        ).scalars().first()
+        return db.execute(statement.order_by(cls.id.desc())).scalars().first()
 
     @classmethod
-    @db_query
     def get_by_dest(
-            cls, db: Session, dest: str, storage: Optional[str] = None
+            cls, db: Session, dest: str,
+            storage: Optional[str] = None
     ) -> Optional["TransferHistory"]:
         """
         按目标路径和存储查询单条整理记录。
@@ -249,12 +329,9 @@ class TransferHistory(Base):
         statement = select(cls).where(cls.dest == dest)
         if storage:
             statement = statement.where(cls.dest_storage == storage)
-        return db.execute(
-            statement.order_by(cls.id.desc())
-        ).scalars().first()
+        return db.execute(statement.order_by(cls.id.desc())).scalars().first()
 
     @classmethod
-    @db_query
     def list_success_by_src(
             cls,
             db: Session,
@@ -294,7 +371,6 @@ class TransferHistory(Base):
         return list(db.execute(statement).scalars().all())
 
     @classmethod
-    @db_query
     def list_success_move_by_dest(
             cls,
             db: Session,
@@ -337,14 +413,12 @@ class TransferHistory(Base):
         return list(db.execute(statement).scalars().all())
 
     @classmethod
-    @db_query
     def list_by_hash(cls, db: Session, download_hash: str):
         return list(db.execute(
             select(cls).where(cls.download_hash == download_hash)
         ).scalars().all())
 
     @classmethod
-    @db_query
     def statistic(cls, db: Session, days: int = 7):
         """
         统计最近days天的下载历史数量，按日期分组返回每日数量
@@ -361,7 +435,6 @@ class TransferHistory(Base):
         ).all())
 
     @classmethod
-    @db_query
     def monthly_media_statistics(cls, db: Session):
         """
         统计当月成功整理的电影、电视剧、剧集和音乐数量。
@@ -427,7 +500,6 @@ class TransferHistory(Base):
         return 1
 
     @classmethod
-    @async_db_query
     async def async_statistic(cls, db: AsyncSession, days: int = 7):
         """
         统计最近days天的下载历史数量，按日期分组返回每日数量
@@ -442,7 +514,6 @@ class TransferHistory(Base):
         return result.all()
 
     @classmethod
-    @db_query
     def count(cls, db: Session, status: Optional[bool] = None):
         statement = select(func.count(cls.id))
         if status is not None:
@@ -450,7 +521,6 @@ class TransferHistory(Base):
         return db.execute(statement).scalar()
 
     @classmethod
-    @async_db_query
     async def async_count(cls, db: AsyncSession, status: Optional[bool] = None):
         if status is not None:
             result = await db.execute(
@@ -463,7 +533,6 @@ class TransferHistory(Base):
         return result.scalar()
 
     @classmethod
-    @db_query
     def count_by_title(cls, db: Session, title: str, status: Optional[bool] = None, wildcard: bool = False):
         if wildcard:
             text_filter = or_(
@@ -483,7 +552,6 @@ class TransferHistory(Base):
         return db.execute(statement).scalar()
 
     @classmethod
-    @async_db_query
     async def async_count_by_title(cls, db: AsyncSession, title: str, status: Optional[bool] = None, wildcard: bool = False):
         if wildcard:
             text_filter = or_(
@@ -504,7 +572,6 @@ class TransferHistory(Base):
         return result.scalar()
 
     @classmethod
-    @db_query
     def list_by(cls, db: Session, mtype: Optional[str] = None, title: Optional[str] = None, year: Optional[str] = None,
                 season: Optional[str] = None,
                 episode: Optional[str] = None,
@@ -542,7 +609,6 @@ class TransferHistory(Base):
         return list(db.execute(statement).scalars().all())
 
     @classmethod
-    @db_query
     def get_by_media_identity(
             cls, db: Session, media_source: MediaSource, media_id: str,
             mtype: Optional[str] = None,
@@ -555,14 +621,13 @@ class TransferHistory(Base):
         )).scalars().first()
 
     @classmethod
-    @db_update
     def update_download_hash(cls, db: Session, historyid: Optional[int] = None, download_hash: Optional[str] = None):
+        """在调用方事务中暂存下载任务哈希更新。"""
         db.execute(
             update(cls).where(cls.id == historyid).values(download_hash=download_hash)
         )
 
     @classmethod
-    @db_update
     def replace_by_src(cls, db: Session, **kwargs) -> "TransferHistory":
         """
         用同源存储的新记录原子替换旧整理历史。
@@ -577,10 +642,20 @@ class TransferHistory(Base):
         src_storage = kwargs.get("src_storage") or "local"
         kwargs["src_storage"] = src_storage
         if src:
+            durable = db.execute(
+                select(cls.id).where(
+                    cls.src == src,
+                    cls.src_storage == src_storage,
+                    cls.transfer_task_id.is_not(None),
+                )
+            ).scalar_one_or_none()
+            if durable is not None:
+                raise ValueError("持久整理回执不能由旧历史写入口覆盖")
             db.execute(
                 delete(cls).where(
                     cls.src == src,
                     cls.src_storage == src_storage,
+                    cls.transfer_task_id.is_(None),
                 ),
                 execution_options={"synchronize_session": False},
             )
@@ -590,7 +665,6 @@ class TransferHistory(Base):
         return history
 
     @classmethod
-    @db_query
     def list_by_date(cls, db: Session, date: str):
         """
         查询某时间之后的转移历史
@@ -600,7 +674,6 @@ class TransferHistory(Base):
         ).scalars().all())
 
     @classmethod
-    @db_update
     def delete_before(
         cls,
         db: Session,
@@ -612,7 +685,10 @@ class TransferHistory(Base):
         """
         ids = db.execute(
             select(cls.id)
-            .where(cls.date < before_time)
+            .where(
+                cls.date < before_time,
+                cls.transfer_task_id.is_(None),
+            )
             .order_by(cls.id.asc())
             .limit(limit)
         ).scalars().all()

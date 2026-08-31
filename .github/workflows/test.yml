@@ -19,52 +19,148 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  architecture:
+    runs-on: ubuntu-latest
+    name: Architecture Contract Gate
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: '3.14'
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Check event semantic policy
+        run: |
+          uv run --locked --no-sync pytest \
+            tests/test_architecture_dependencies.py \
+            tests/test_architecture_adapter_imports.py \
+            tests/test_architecture_egress.py \
+            tests/test_architecture_event_facts.py \
+            tests/test_architecture_event_policy.py -q
+          uv run --locked --no-sync python \
+            scripts/architecture/event_policy.py
+
+      - name: Check host architecture snapshot
+        run: |
+          uv run --locked --no-sync pytest \
+            tests/test_architecture_contract_baseline.py \
+            tests/test_architecture_baseline_cli.py -q
+          uv run --locked --no-sync python \
+            scripts/architecture/baseline.py --check-host
+
+      - name: Check governed Python types
+        run: uv run --locked --no-sync mypy --config-file mypy.ini
+
+      - name: Check complexity ratchet
+        run: |
+          uv run --locked --no-sync python scripts/architecture/complexity.py
+          uv run --locked --no-sync python scripts/architecture/complexity.py --v2
+
+      - name: Check native concurrency ownership
+        run: uv run --locked --no-sync python scripts/architecture/concurrency.py
+
+      - name: Check async blocking ratchet
+        run: uv run --locked --no-sync python scripts/architecture/async_blocking.py
+
+      - name: Check background task ownership
+        run: uv run --locked --no-sync python scripts/architecture/task_ownership.py
+
+      - name: Check process runtime service locators
+        run: uv run --locked --no-sync python scripts/architecture/service_locator.py
+
+      - name: Check Ruff diagnostic ratchet
+        run: uv run --locked --no-sync python scripts/architecture/ruff_ratchet.py
+
+      - name: Check mypy error ratchet
+        run: uv run --locked --no-sync python scripts/architecture/mypy_ratchet.py
+
+      - name: Check startup performance contract
+        run: >-
+          uv run --locked --no-sync python
+          scripts/startup/performance.py --check --repeat 3
+
   pytest:
     runs-on: ubuntu-latest
-    name: Unit Tests
+    name: Unit Tests (${{ matrix.shard }})
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: '1/4'
+          - shard: '2/4'
+          - shard: '3/4'
+          - shard: '4/4'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: '3.14'
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Run tests
+        timeout-minutes: 10
+        run: uv run --locked --no-sync python tests/run.py --shard "${{ matrix.shard }}"
+
+  coverage:
+    runs-on: ubuntu-latest
+    name: Coverage Report
     timeout-minutes: 20
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v7
 
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10.0.1
         with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Cache pip dependencies
-        uses: actions/cache@v5
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.in', '**/requirements-dev.in', '**/requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          python-version: '3.14'
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
 
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-          # 单测需要开发/测试依赖；运行时入口 requirements.in 不携带测试与构建辅助工具。
-          pip install -r requirements-dev.in
+        run: uv sync --locked
 
-      - name: Run tests
-        timeout-minutes: 10
+      - name: Generate coverage reports
+        timeout-minutes: 15
         run: |
-          # tests/run.py 以 pytest 跑 tests 全量；tests/conftest.py 在收集前把 CONFIG_DIR
-          # 指向临时库并建表；CI 额外生成覆盖率报告，便于后续补测和回归分析。
-          python -m coverage erase
-          python -m coverage run tests/run.py
-          python -m coverage report
-          python -m coverage json
-          python -m coverage xml
+          uv run --locked --no-sync python -m coverage erase
+          uv run --locked --no-sync python -m coverage run tests/run.py --serial
+          uv run --locked --no-sync python -m coverage report
+          uv run --locked --no-sync python -m coverage json
+          uv run --locked --no-sync python -m coverage xml
 
       - name: Upload coverage report
-        if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-report
           path: |
             coverage.xml
             coverage.json
           retention-days: 7
+
+      - name: Check coverage ratchet
+        run: uv run --locked --no-sync python scripts/architecture/coverage_ratchet.py

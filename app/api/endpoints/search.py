@@ -4,25 +4,25 @@ import time
 from typing import Any, AsyncIterator, Iterator, List, Optional
 from uuid import uuid4
 
-from fastapi import Depends, Body, Request
+from fastapi import Body, Depends, Request
 from fastapi.responses import StreamingResponse
 
+from app.adapters.web.security.access import verify_resource_token, verify_token
+from app.api.response import ResponseAPIRouter
+from app.application.security.url import SecurityUtils
+from app.chain.search.facade import SearchChain
+from app.domain.context import Context
+from app.domain.media import normalize_music_type
+from app.runtime.localization import LocaleHelper
+from app.runtime.log import logger
+from app.schemas.media import resolve_media_identity
 from app.schemas.response import Response as _SchemaResponse
 from app.schemas.search import SearchLastContextData as _SchemaSearchLastContextData
 from app.schemas.search import SearchRecommendStatusData as _SchemaSearchRecommendStatusData
 from app.schemas.search import SubtitleInfo as _SchemaSubtitleInfo
-from app.schemas.system import TorrentInfo as _SchemaTorrentInfo
 from app.schemas.token import TokenPayload as _SchemaTokenPayload
-from app.schemas.workflow import Context as _SchemaContext
-from app.api.response import ResponseAPIRouter
-from app.chain.search import SearchChain
-from app.adapters.web.security.access import verify_resource_token, verify_token
-from app.runtime.localization import LocaleHelper
-from app.runtime.log import logger
 from app.schemas.types import MediaSource, MediaType
-from app.domain.media import normalize_music_type
-from app.schemas.media import resolve_media_identity
-from app.application.security.url import SecurityUtils
+from app.schemas.workflow import Context as _SchemaContext
 
 router = ResponseAPIRouter()
 
@@ -127,6 +127,11 @@ def _serialize_signed_subtitle_results(subtitles: List[Any]) -> List[dict]:
     批量序列化字幕结果，确保返回给客户端的下载链接均已签名。
     """
     return [_serialize_signed_subtitle_result(subtitle) for subtitle in subtitles]
+
+
+def _serialize_context_results(contexts: list[Context]) -> list[dict[str, Any]]:
+    """序列化 canonical 搜索上下文，集中保持传输层投影合同。"""
+    return [context.to_dict() for context in contexts]
 
 
 def _sign_subtitle_search_event(event: dict) -> dict:
@@ -256,6 +261,9 @@ async def _iter_batched_search_events(
         if next_event_task and not next_event_task.done():
             next_event_task.cancel()
             await asyncio.gather(next_event_task, return_exceptions=True)
+        close_iterator = getattr(iterator, "aclose", None)
+        if close_iterator is not None:
+            await close_iterator()
 
     if pending_append_event:
         yield pending_append_event
@@ -274,10 +282,11 @@ async def _stream_search_events(request: Request, event_source: AsyncIterator[di
     last_event_type = "none"
     last_stage = "none"
     termination_reason = "source_exhausted"
+    batched_events = _iter_batched_search_events(event_source)
     logger.info(f"渐进式搜索流已建立，搜索ID：{search_id}，路径：{request_path}")
     try:
         has_sent_final_replace = False
-        async for event in _iter_batched_search_events(event_source):
+        async for event in batched_events:
             last_event_type = event.get("type") or "unknown"
             last_stage = event.get("stage") or last_stage
             if await request.is_disconnected():
@@ -321,6 +330,7 @@ async def _stream_search_events(request: Request, event_source: AsyncIterator[di
         transmitted_bytes += len(payload.encode("utf-8"))
         yield payload
     finally:
+        await batched_events.aclose()
         elapsed = time.monotonic() - started_at
         logger.info(
             f"渐进式搜索流结束，搜索ID：{search_id}，路径：{request_path}，"
@@ -335,7 +345,7 @@ async def search_latest(_: _SchemaTokenPayload = Depends(verify_token)) -> Any:
     查询搜索结果
     """
     torrents = await SearchChain().async_last_search_results() or []
-    return [torrent.to_dict() for torrent in torrents]
+    return _serialize_context_results(torrents)
 
 
 @router.get(
@@ -350,16 +360,18 @@ async def search_latest_context(_: _SchemaTokenPayload = Depends(verify_token)) 
     search_chain = SearchChain()
     params = await search_chain.async_last_search_params() or {}
     if params.get("result_type") == "subtitle":
-        results = await search_chain.async_last_subtitle_search_results() or []
+        subtitle_results = (
+            await search_chain.async_last_subtitle_search_results() or []
+        )
+        serialized_results = _serialize_signed_subtitle_results(subtitle_results)
     else:
-        results = await search_chain.async_last_search_results() or []
+        context_results = await search_chain.async_last_search_results() or []
+        serialized_results = _serialize_context_results(context_results)
     return _SchemaResponse(
         success=True,
         data={
             "params": params,
-            "results": _serialize_signed_subtitle_results(results)
-            if params.get("result_type") == "subtitle"
-            else [result.to_dict() for result in results],
+            "results": serialized_results,
         },
     )
 
@@ -427,7 +439,7 @@ async def search_by_id_stream(
 @router.get(
     "/media/{media_id}",
     summary="精确搜索资源",
-    response_model=_SchemaResponse[list[_SchemaTorrentInfo]],
+    response_model=List[_SchemaContext],
 )
 async def search_by_id(
     media_id: str,
@@ -463,7 +475,7 @@ async def search_by_id(
     if not torrents:
         return _SchemaResponse(success=False, message="未搜索到任何资源")
     return _SchemaResponse(
-        success=True, data=[torrent.to_dict() for torrent in torrents]
+        success=True, data=_serialize_context_results(torrents)
     )
 
 
@@ -492,7 +504,7 @@ async def search_by_title_stream(
     """
 
     event_source = SearchChain().async_search_by_title_stream(
-        title=keyword,
+        title=keyword or "",
         page=page,
         sites=_parse_site_list(sites),
         cache_local=True,
@@ -508,7 +520,7 @@ async def search_by_title_stream(
 @router.get(
     "/title",
     summary="模糊搜索资源",
-    response_model=_SchemaResponse[list[_SchemaTorrentInfo]],
+    response_model=List[_SchemaContext],
 )
 async def search_by_title(
     keyword: Optional[str] = None,
@@ -521,7 +533,7 @@ async def search_by_title(
     根据名称模糊搜索站点资源，支持分页，关键词为空是返回首页资源
     """
     torrents = await SearchChain().async_search_by_title(
-        title=keyword,
+        title=keyword or "",
         page=page,
         sites=_parse_site_list(sites),
         cache_local=True,
@@ -530,7 +542,7 @@ async def search_by_title(
     if not torrents:
         return _SchemaResponse(success=False, message="未搜索到任何资源")
     return _SchemaResponse(
-        success=True, data=[torrent.to_dict() for torrent in torrents]
+        success=True, data=_serialize_context_results(torrents)
     )
 
 
@@ -558,7 +570,10 @@ async def search_subtitle_by_title_stream(
     """
 
     event_source = SearchChain().async_search_subtitles_by_title_stream(
-        title=keyword, page=page, sites=_parse_site_list(sites), cache_local=True
+        title=keyword or "",
+        page=page,
+        sites=_parse_site_list(sites),
+        cache_local=True,
     )
     return StreamingResponse(
         _stream_search_events(
@@ -585,7 +600,10 @@ async def search_subtitle_by_title(
     根据名称模糊搜索站点字幕资源，支持分页。
     """
     subtitles = await SearchChain().async_search_subtitles_by_title(
-        title=keyword, page=page, sites=_parse_site_list(sites), cache_local=True
+        title=keyword or "",
+        page=page,
+        sites=_parse_site_list(sites),
+        cache_local=True,
     )
     if not subtitles:
         return _SchemaResponse(success=False, message="未搜索到任何字幕")

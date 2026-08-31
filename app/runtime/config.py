@@ -1,4 +1,3 @@
-import asyncio
 import copy
 import json
 import os
@@ -10,30 +9,32 @@ import sys
 import threading
 from asyncio import AbstractEventLoop
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Type, Union, get_origin, get_args
+from typing import Any, Dict, List, Optional, Tuple, Type, Union, get_args, get_origin
 from urllib.parse import quote, urlencode, urlparse
 
 from dotenv import set_key, unset_key
-from pydantic import BaseModel, Field, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.runtime.log import (
-    LogConfigModel,
-    configure_log_settings,
-    configure_log_writer,
-    logger,
-    log_settings,
-    NonBlockingFileHandler,
-)
-from app.schemas.types import MediaType
 from app.foundation.environment import (
     cpu_arch,
     get_env_path,
     is_docker,
+    is_free_threaded_runtime,
     is_frozen,
 )
 from app.foundation.url import UrlUtils
-from version import APP_VERSION
+from app.runtime.log import (
+    LogConfigModel,
+    configure_log_settings,
+    log_settings,
+    logger,
+)
+from app.runtime.loop import MainLoopRegistry, main_loop_registry
+from app.runtime.stop import runtime_stop_state
+from app.runtime.version import get_app_version
+from app.runtime.webpush import WebPushRegistry, webpush_registry
+from app.schemas.types import MediaType
 
 
 class SystemConfModel(BaseModel):
@@ -53,6 +54,8 @@ class SystemConfModel(BaseModel):
     bangumi: int = 0
     # AniList请求缓存数量
     anilist: int = 0
+    # IMDb请求缓存数量
+    imdb: int = 0
     # Fanart请求缓存数量
     fanart: int = 0
     # MusicBrainz请求缓存数量
@@ -103,9 +106,6 @@ class ConfigModel(BaseModel):
     DEBUG: bool = False
     # 是否开发模式
     DEV: bool = False
-    # 高级设置模式
-    ADVANCED_MODE: bool = True
-
     # ==================== 安全认证配置 ====================
     # 密钥
     SECRET_KEY: str = secrets.token_urlsafe(32)
@@ -117,10 +117,10 @@ class ConfigModel(BaseModel):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 8
     # RESOURCE_TOKEN过期时间
     RESOURCE_ACCESS_TOKEN_EXPIRE_SECONDS: int = 60 * 30
-    # 超级管理员初始用户名
-    SUPERUSER: str = "admin"
-    # 超级管理员初始密码
-    SUPERUSER_PASSWORD: Optional[str] = None
+    # 超级管理员用户名；V3 首次启动时为空，由初始化页面设置
+    SUPERUSER: str = ""
+    # 超级管理员密码不再通过部署配置初始化，始终由数据库存储哈希
+    SUPERUSER_PASSWORD: str = ""
     # 辅助认证，允许通过外部服务进行认证、单点登录以及自动创建用户
     AUXILIARY_AUTH_ENABLE: bool = False
     # API密钥，需要更换
@@ -134,7 +134,7 @@ class ConfigModel(BaseModel):
     # 数据库连接额度校验按它换算总用量。注意：当前主程序以单进程方式启动
     # （uvicorn.Config 的 workers 仅在多进程 supervisor 路径下生效），
     # 调大此项前需先解决调度器会在每个 worker 内重复执行的问题
-    API_WORKERS: int = 1
+    API_WORKERS: int = Field(default=1, ge=1)
     DB_TYPE: str = "sqlite"
     # 是否在控制台输出 SQL 语句，默认关闭
     DB_ECHO: bool = False
@@ -189,6 +189,19 @@ class ConfigModel(BaseModel):
     # 例如经 PgBouncer 事务模式接入时 asyncpg 需要 {"statement_cache_size": 0}
     DB_CONNECT_ARGS: dict = Field(default_factory=dict)
 
+    # ==================== 数据库备份配置 ====================
+    # 是否启用主程序数据库自动备份
+    DB_BACKUP_ENABLE: bool = False
+    # 定时备份的 Cron 表达式，留空时不注册定时任务
+    DB_BACKUP_CRON: str = "0 3 * * *"
+    # 检测到现有数据库需要迁移时，在结构变更前创建恢复点
+    DB_BACKUP_ON_UPGRADE: bool = True
+    # 备份根目录；未配置时使用 CONFIG_PATH/database_backup
+    DB_BACKUP_PATH: Optional[str] = None
+    # 本地备份的保留天数，0 表示不按时间清理
+    DB_BACKUP_RETENTION_DAYS: int = 30
+    # 本地备份的最大保留份数，0 表示不按数量清理
+    DB_BACKUP_MAX_COUNT: int = 30
     # ==================== 数据清理配置 ====================
     # 是否启用数据表定时清理
     DATA_CLEANUP_ENABLE: bool = False
@@ -202,6 +215,16 @@ class ConfigModel(BaseModel):
     DATA_CLEANUP_TRANSFER_HISTORY_DAYS: int = 365 * 3
     # 下载失败冷却记录保留天数，0为不清理
     DATA_CLEANUP_DOWNLOAD_FAILURE_DAYS: int = 7
+    # 订阅完成历史保留天数，0为不清理
+    DATA_CLEANUP_SUBSCRIBE_HISTORY_DAYS: int = 365 * 3
+    # Agent 会话历史保留天数，0为不清理
+    DATA_CLEANUP_AGENT_CHAT_DAYS: int = 180
+    # Agent 定时任务运行历史保留天数，0为不清理
+    DATA_CLEANUP_AGENT_TASK_RUN_DAYS: int = 180
+    # Outbox 已完成记录保留天数，0为不清理
+    DATA_CLEANUP_OUTBOX_COMPLETED_DAYS: int = 30
+    # Outbox 死信记录保留天数，0为不清理
+    DATA_CLEANUP_OUTBOX_DEAD_DAYS: int = 90
 
     # ==================== 缓存配置 ====================
     # 缓存类型，支持 cachetools 和 redis，默认使用 cachetools
@@ -247,11 +270,11 @@ class ConfigModel(BaseModel):
     DOH_RESOLVERS: str = "1.0.0.1,1.1.1.1,9.9.9.9,149.112.112.112"
 
     # ==================== 媒体元数据配置 ====================
-    # 媒体搜索来源 themoviedb/douban/bangumi/anilist/musicbrainz/theaudiodb/doubanmusic，多个用,分隔
+    # 媒体搜索来源 themoviedb/douban/bangumi/anilist/imdb/musicbrainz/theaudiodb/doubanmusic，多个用,分隔
     SEARCH_SOURCE: str = "themoviedb"
-    # 媒体识别来源 themoviedb/douban/bangumi/anilist/musicbrainz/theaudiodb/doubanmusic
+    # 媒体识别来源 themoviedb/douban/bangumi/anilist/imdb/musicbrainz/theaudiodb/doubanmusic
     RECOGNIZE_SOURCE: str = "themoviedb"
-    # 刮削来源 themoviedb/douban/bangumi/anilist/musicbrainz/theaudiodb/doubanmusic
+    # 刮削来源 themoviedb/douban/bangumi/anilist/imdb/musicbrainz/theaudiodb/doubanmusic
     SCRAP_SOURCE: str = "themoviedb"
     # 电视剧动漫的分类genre_ids
     ANIME_GENREIDS: List[int] = Field(default=[16])
@@ -279,6 +302,16 @@ class ConfigModel(BaseModel):
     MUSIC_METADATA_TO_SIMPLIFIED: bool = True
     # TheAudioDB API Key，默认使用官方公开的免费 V1 Key，可通过环境变量覆盖
     THEAUDIODB_API_KEY: str = "123"
+    # LRCLIB 服务地址，可指向兼容官方 API 的自建实例
+    LRCLIB_BASE_URL: str = "https://lrclib.net"
+    # Musixmatch 官方 API Key；留空时不加载该歌词来源
+    MUSIXMATCH_API_KEY: str = ""
+    # Musixmatch 官方或授权代理 API 根地址
+    MUSIXMATCH_BASE_URL: str = "https://api.musixmatch.com/ws/1.1"
+    # 单次音乐刮削批次用于在线歌词查询的总预算（秒）
+    LYRICS_BATCH_TIMEOUT: int = 120
+    # 供应商要求的重试等待超过该值时进入冷却，不阻塞整个批次
+    LYRICS_PROVIDER_RETRY_MAX_WAIT: int = 5
 
     # ==================== TVDB配置 ====================
     # TVDB API Key
@@ -302,8 +335,8 @@ class ConfigModel(BaseModel):
     ALIPAN_APP_ID: str = "ac1bf04dc9fd4d9aaabb65b4a668d403"
 
     # ==================== 系统升级配置 ====================
-    # 重启自动升级
-    MOVIEPILOT_AUTO_UPDATE: str = "release"
+    # 开发版仍可在启动时跟踪 v3 分支；Release 更新由后台更新服务管理。
+    MOVIEPILOT_AUTO_UPDATE: str = "false"
     # 自动检查和更新站点资源包（站点索引、认证等）
     AUTO_UPDATE_RESOURCE: bool = True
 
@@ -523,8 +556,12 @@ class ConfigModel(BaseModel):
     MEDIA_RECOGNIZE_SHARE_API: Optional[str] = None
 
     # ==================== 个性化 ====================
-    # 登录页面电影海报,tmdb/bing/mediaserver
+    # 登录页面壁纸来源：tmdb/bing/mediaserver/customize/static
     WALLPAPER: str = "tmdb"
+    # 壁纸轮换间隔（秒），0 表示不轮换
+    WALLPAPER_ROTATION_INTERVAL: int = 15
+    # 静态壁纸地址，可使用前端可访问的本地路径或 URL
+    WALLPAPER_IMAGE_URL: Optional[str] = None
     # 自定义壁纸api地址
     CUSTOMIZE_WALLPAPER_API_URL: Optional[str] = None
 
@@ -539,6 +576,8 @@ class ConfigModel(BaseModel):
     USAGE_STATISTIC_SHARE: bool = True
     # 是否开启插件热加载
     PLUGIN_AUTO_RELOAD: bool = False
+    # 临时放行的废弃标识，多个用,分隔；仅对已进入停用阶段的接口有效，用于观察真实依赖方
+    DEPRECATION_ENABLED: Optional[str] = None
     # 本地插件仓库目录，多个地址使用,分隔
     PLUGIN_LOCAL_REPO_PATHS: Optional[str] = None
 
@@ -580,7 +619,7 @@ class ConfigModel(BaseModel):
     # ==================== 性能配置 ====================
     # 大内存模式
     BIG_MEMORY_MODE: bool = False
-    # Rust 加速总开关，关闭时所有 Rust 快路径回退到 Python 实现
+    # Rust 加速总开关，free-threaded 运行时固定启用
     RUST_ACCEL: bool = True
     # 是否启用编码探测的性能模式
     ENCODING_DETECTION_PERFORMANCE_MODE: bool = True
@@ -703,6 +742,8 @@ class ConfigModel(BaseModel):
     AI_AGENT_VERBOSE: bool = False
     # AI智能体自动重试整理失败记录开关
     AI_AGENT_RETRY_TRANSFER: bool = False
+    # 是否按媒体聚合整理失败通知，关闭时保持逐条发送
+    TRANSFER_FAILURE_NOTIFICATION_AGGREGATION: bool = True
 
     # 音频输入提供商：openai/openai_chat_audio/mimo/minimax
     AUDIO_INPUT_PROVIDER: str = "openai"
@@ -760,16 +801,13 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
         if isinstance(value, (list, dict, set)):
             value = copy.deepcopy(value)
         value = value.strip() if isinstance(value, str) else None
-        if not value or len(value) < 16:
+        if not value:
+            return None, str(original_value) not in {"", "None"}
+        if len(value) < 16:
             new_token = secrets.token_urlsafe(16)
-            if not value:
-                logger.info(
-                    f"'API_TOKEN' 未设置，已随机生成新的【API_TOKEN】{new_token}"
-                )
-            else:
-                logger.warning(
-                    f"'API_TOKEN' 长度不足 16 个字符，存在安全隐患，已随机生成新的【API_TOKEN】{new_token}"
-                )
+            logger.warning(
+                f"'API_TOKEN' 长度不足 16 个字符，存在安全隐患，已随机生成新的【API_TOKEN】{new_token}"
+            )
             return new_token, True
         return value, str(value) != str(original_value)
 
@@ -880,6 +918,22 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
         if not isinstance(data, dict):
             return data
 
+        # Release 已迁移到后台状态机，历史 release/true 不能继续启用启动时更新。
+        if "MOVIEPILOT_AUTO_UPDATE" in data:
+            original_update_mode = data["MOVIEPILOT_AUTO_UPDATE"]
+            normalized_update_mode = (
+                "dev"
+                if str(original_update_mode or "").strip().lower() == "dev"
+                else "false"
+            )
+            if normalized_update_mode != str(original_update_mode):
+                cls.update_env_config(
+                    "MOVIEPILOT_AUTO_UPDATE",
+                    original_update_mode,
+                    normalized_update_mode,
+                )
+                data["MOVIEPILOT_AUTO_UPDATE"] = normalized_update_mode
+
         # 处理 API_TOKEN 特殊验证
         if "API_TOKEN" in data:
             converted_value, needs_update = cls.validate_api_token(
@@ -978,6 +1032,12 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
                 converted_value, needs_update = self.generic_type_converter(
                     value, original_value, field.annotation, field.default, key
                 )
+            if (
+                key == "RUST_ACCEL"
+                and is_free_threaded_runtime()
+                and converted_value is not True
+            ):
+                return False, "free-threaded 运行时必须启用 Rust 加速"
             # 如果没有抛出异常，则统一使用 converted_value 进行更新
             if needs_update or str(value) != str(converted_value):
                 success, message = self.update_env_config(key, value, converted_value)
@@ -1020,7 +1080,7 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
         全局用户代理字符串
         """
         return (
-            f"{self.PROJECT_NAME}/{APP_VERSION[1:]} "
+            f"{self.PROJECT_NAME}/{get_app_version()[1:]} "
             f"({platform.system()} {platform.release()}; {cpu_arch()})"
         )
 
@@ -1075,6 +1135,15 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
         return self.CONFIG_PATH / "plugins"
 
     @property
+    def DATABASE_BACKUP_PATH(self) -> Path:
+        """返回数据库备份根目录，允许相对当前配置目录进行配置。"""
+        configured = str(self.DB_BACKUP_PATH or "").strip()
+        if not configured:
+            return self.CONFIG_PATH / "database_backup"
+        path = Path(configured).expanduser()
+        return path if path.is_absolute() else self.CONFIG_PATH / path
+
+    @property
     def LOG_PATH(self):
         """返回应用日志目录。"""
         return self.CONFIG_PATH / "logs"
@@ -1096,6 +1165,7 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
                 tmdb=1024,
                 douban=512,
                 bangumi=512,
+                imdb=512,
                 fanart=512,
                 musicbrainz=512,
                 theaudiodb=512,
@@ -1110,6 +1180,7 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
             tmdb=256,
             douban=256,
             bangumi=256,
+            imdb=256,
             fanart=128,
             musicbrainz=256,
             theaudiodb=256,
@@ -1266,7 +1337,7 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
     def VAPID(self):
         """返回 Web Push 使用的 VAPID 配置。"""
         return {
-            "subject": f"mailto:{self.SUPERUSER}@movie-pilot.org",
+            "subject": f"mailto:{self.SUPERUSER or 'moviepilot'}@movie-pilot.org",
             "publicKey": "BH3w49sZA6jXUnE-yt4jO6VKh73lsdsvwoJ6Hx7fmPIDKoqGiUl2GEoZzy-iJfn4SfQQcx7yQdHf9RknwrL_lSM",
             "privateKey": "JTixnYY0vEw97t9uukfO3UWKfHKJdT5kCQDiv3gu894",
         }
@@ -1313,7 +1384,6 @@ class Settings(BaseSettings, ConfigModel, LogConfigModel):
 # 实例化配置
 settings = Settings()
 configure_log_settings(settings)
-configure_log_writer(NonBlockingFileHandler(), settings.LOG_PATH)
 
 
 class GlobalVar(object):
@@ -1321,131 +1391,133 @@ class GlobalVar(object):
     全局标识
     """
 
-    # 系统停止事件
-    STOP_EVENT: threading.Event = threading.Event()
-    # webpush订阅
-    SUBSCRIPTIONS: List[dict] = []
-    # webpush订阅读写锁
-    SUBSCRIPTIONS_LOCK: threading.Lock = threading.Lock()
     # 需应急停止的工作流
     EMERGENCY_STOP_WORKFLOWS: List[int] = []
     # 需应急停止文件整理
     EMERGENCY_STOP_TRANSFER: List[str] = []
-    # 当前事件循环
-    CURRENT_EVENT_LOOP: AbstractEventLoop = None
 
-    @classmethod
-    def _get_event_loop(cls) -> AbstractEventLoop:
-        """返回当前线程事件循环，缺失时创建并绑定新循环。"""
-        try:
-            return asyncio.get_event_loop()
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            return loop
+    def __init__(
+        self,
+        *,
+        loop_registry: Optional[MainLoopRegistry] = None,
+        push_registry: Optional[WebPushRegistry] = None,
+    ) -> None:
+        """绑定兼容门面背后的显式 owner；普通实例保持循环状态隔离。"""
+        self._loop_registry = loop_registry or MainLoopRegistry()
+        self._push_registry = push_registry or webpush_registry
+
+    @property
+    def CURRENT_EVENT_LOOP(self) -> Optional[AbstractEventLoop]:
+        """兼容旧代码读取未经可用性校验的主循环。"""
+        return self._loop_registry.current
+
+    @CURRENT_EVENT_LOOP.setter
+    def CURRENT_EVENT_LOOP(self, loop: Optional[AbstractEventLoop]) -> None:
+        """兼容旧测试和插件直接替换主循环投递目标。"""
+        self._loop_registry.replace_compat(loop)
+
+    @CURRENT_EVENT_LOOP.deleter
+    def CURRENT_EVENT_LOOP(self) -> None:
+        """兼容属性 patch 清理，删除时仅清空当前投递目标。"""
+        self._loop_registry.replace_compat(None)
+
+    @property
+    def SUBSCRIPTIONS(self) -> List[dict]:
+        """兼容旧代码在持锁后直接访问订阅列表。"""
+        return self._push_registry.compat_items
+
+    @property
+    def SUBSCRIPTIONS_LOCK(self) -> threading.Lock:
+        """兼容旧代码保护原始订阅列表的互斥锁。"""
+        return self._push_registry.compat_lock
+
+    @property
+    def STOP_EVENT(self) -> threading.Event:
+        """兼容旧代码读取进程停止事件。"""
+        return runtime_stop_state.system_event
+
+    @STOP_EVENT.setter
+    def STOP_EVENT(self, event: threading.Event) -> None:
+        """兼容旧测试替换事件，同时保持新 StopState 为唯一状态源。"""
+        runtime_stop_state.replace_system_event(event)
 
     def stop_system(self):
         """
         停止系统
         """
-        self.STOP_EVENT.set()
+        runtime_stop_state.stop_system()
 
     @property
     def is_system_stopped(self):
         """
         是否停止
         """
-        return self.STOP_EVENT.is_set()
+        return runtime_stop_state.is_system_stopped
 
     def get_subscriptions(self):
         """
         获取webpush订阅
         """
-        with self.SUBSCRIPTIONS_LOCK:
-            return list(self.SUBSCRIPTIONS)
+        return self._push_registry.list()
 
     def push_subscription(self, subscription: dict):
         """
         添加或更新webpush订阅。
         """
-        endpoint = subscription.get("endpoint") if subscription else None
-        if not endpoint:
-            return
-        with self.SUBSCRIPTIONS_LOCK:
-            for index, current in enumerate(self.SUBSCRIPTIONS):
-                if current.get("endpoint") == endpoint:
-                    self.SUBSCRIPTIONS[index] = subscription
-                    return
-            self.SUBSCRIPTIONS.append(subscription)
+        self._push_registry.upsert(subscription)
 
     def remove_subscription(self, subscription: dict) -> bool:
         """
         根据 endpoint 移除webpush订阅，返回是否实际删除。
         """
-        endpoint = subscription.get("endpoint") if subscription else None
-        if not endpoint:
-            return False
-        with self.SUBSCRIPTIONS_LOCK:
-            before_count = len(self.SUBSCRIPTIONS)
-            self.SUBSCRIPTIONS[:] = [
-                current for current in self.SUBSCRIPTIONS
-                if current.get("endpoint") != endpoint
-            ]
-            return len(self.SUBSCRIPTIONS) != before_count
+        return self._push_registry.remove(subscription)
 
     def stop_workflow(self, workflow_id: int):
         """
         停止工作流
         """
-        if workflow_id not in self.EMERGENCY_STOP_WORKFLOWS:
-            self.EMERGENCY_STOP_WORKFLOWS.append(workflow_id)
+        runtime_stop_state.stop_workflow(workflow_id)
 
     def workflow_resume(self, workflow_id: int):
         """
         恢复工作流
         """
-        if workflow_id in self.EMERGENCY_STOP_WORKFLOWS:
-            self.EMERGENCY_STOP_WORKFLOWS.remove(workflow_id)
+        runtime_stop_state.resume_workflow(workflow_id)
 
     def is_workflow_stopped(self, workflow_id: int) -> bool:
         """
         是否停止工作流
         """
-        return self.is_system_stopped or workflow_id in self.EMERGENCY_STOP_WORKFLOWS
+        return runtime_stop_state.is_workflow_stopped(workflow_id)
 
     def stop_transfer(self, path: str):
         """
         停止文件整理
         """
-        if path not in self.EMERGENCY_STOP_TRANSFER:
-            self.EMERGENCY_STOP_TRANSFER.append(path)
+        runtime_stop_state.stop_transfer(path)
 
     def is_transfer_stopped(self, path: str) -> bool:
         """
         是否停止文件整理
         """
-        if self.is_system_stopped:
-            return True
-        if path in self.EMERGENCY_STOP_TRANSFER:
-            self.EMERGENCY_STOP_TRANSFER.remove(path)
-            return True
-        return False
+        return runtime_stop_state.consume_transfer_stop(path)
 
     @property
     def loop(self) -> AbstractEventLoop:
-        """
-        当前循环
-        """
-        if self.CURRENT_EVENT_LOOP is None:
-            self.CURRENT_EVENT_LOOP = self._get_event_loop()
-        return self.CURRENT_EVENT_LOOP
+        """返回由应用生命周期登记的主事件循环。"""
+        return self._loop_registry.require()
 
-    def set_loop(self, loop: AbstractEventLoop):
-        """
-        设置循环
-        """
-        self.CURRENT_EVENT_LOOP = loop
+    def set_loop(self, loop: AbstractEventLoop) -> object:
+        """登记主事件循环，并返回仅供当前生命周期释放的 owner。"""
+        return self._loop_registry.register(loop)
+
+    def clear_loop(self, owner: object) -> None:
+        """释放指定 owner，保留仍然有效的其他生命周期登记。"""
+        self._loop_registry.release(owner)
 
 
 # 全局标识
-global_vars = GlobalVar()
+global_vars = GlobalVar(
+    loop_registry=main_loop_registry,
+    push_registry=webpush_registry,
+)

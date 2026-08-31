@@ -1,17 +1,30 @@
+import shutil
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
+
+import pytest
 
 from app.adapters.system.plugin.package import PluginPackageManager
+from app.runtime.dependencies.native import LoadedNativeDependencySnapshot
 
 
 def _manager(monkeypatch, tmp_path: Path) -> PluginPackageManager:
     """构造使用隔离运行目录和事务目录的插件包管理器。"""
-    monkeypatch.setattr(
-        "app.adapters.system.plugin.package.settings",
-        SimpleNamespace(ROOT_PATH=tmp_path, TEMP_PATH=tmp_path / "temp"),
+    settings = SimpleNamespace(
+        ROOT_PATH=tmp_path,
+        TEMP_PATH=tmp_path / "temp",
+        CONFIG_PATH=tmp_path / "config",
     )
-    return PluginPackageManager(helper=Mock())
+    monkeypatch.setattr(
+        "app.adapters.system.plugin.package.get_runtime_setting",
+        lambda key: getattr(settings, key),
+    )
+    monkeypatch.setattr(
+        "app.adapters.system.plugin.package.capture_loaded_native_dependencies",
+        LoadedNativeDependencySnapshot,
+    )
+    return PluginPackageManager(source=Mock())
 
 
 def test_checkpoint_rollback_restores_existing_package(monkeypatch, tmp_path):
@@ -32,6 +45,193 @@ def test_checkpoint_rollback_restores_existing_package(monkeypatch, tmp_path):
     assert not checkpoint.transaction_dir.exists()
 
 
+def test_checkpoint_uses_injected_plugin_root(monkeypatch, tmp_path):
+    """显式装配的插件根目录必须覆盖全局运行目录设置。"""
+    _manager(monkeypatch, tmp_path)
+    plugin_root = tmp_path / "custom-plugins"
+    plugin_dir = plugin_root / "demoplugin"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "__init__.py").write_text("custom", encoding="utf-8")
+    manager = PluginPackageManager(source=Mock(), plugin_root=plugin_root)
+
+    checkpoint = manager.checkpoint("DemoPlugin")
+
+    assert checkpoint.plugin_dir == plugin_dir.resolve()
+    assert (checkpoint.transaction_dir / "package" / "__init__.py").read_text(
+        encoding="utf-8"
+    ) == "custom"
+    manager.commit(checkpoint)
+
+
+def test_remove_plugin_uses_package_owner_path_boundary(tmp_path):
+    """物理卸载只删除注入根目录内的目标插件。"""
+    plugin_root = tmp_path / "plugins"
+    plugin_dir = plugin_root / "demoplugin"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "__init__.py").write_text("plugin", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    manager = PluginPackageManager(source=Mock(), plugin_root=plugin_root)
+
+    assert manager.remove_plugin("DemoPlugin") is True
+    assert not plugin_dir.exists()
+    assert outside.exists()
+    assert manager.remove_plugin("DemoPlugin") is False
+    with pytest.raises(ValueError, match="非法插件ID"):
+        manager.remove_plugin("../outside")
+
+
+@pytest.mark.parametrize(
+    ("remote_path", "package_version"),
+    [
+        ("../escaped.py", None),
+        ("/tmp/escaped.py", None),
+        ("C:\\escaped.py", None),
+        ("plugins/other/file.py", None),
+        ("plugins.v2/demoplugin/../escaped.py", "v2"),
+    ],
+)
+def test_file_list_download_rejects_paths_outside_plugin_root(
+    monkeypatch,
+    tmp_path,
+    remote_path,
+    package_version,
+):
+    """同步文件列表安装不得把远端路径写到当前插件目录之外。"""
+    plugin_root = tmp_path / "plugins"
+    manager = PluginPackageManager(source=Mock(), plugin_root=plugin_root)
+    request = Mock()
+    monkeypatch.setattr(
+        manager,
+        "_PluginPackageManager__request_with_fallback",
+        request,
+    )
+
+    result = manager._PluginPackageManager__download_files(
+        "DemoPlugin",
+        [{"path": remote_path, "download_url": "https://example.invalid/file"}],
+        "owner/repo",
+        package_version,
+    )
+
+    assert result == (False, "插件文件路径无效")
+    request.assert_not_called()
+    assert not (tmp_path / "escaped.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_async_file_list_download_rejects_path_outside_plugin_root(
+    monkeypatch,
+    tmp_path,
+):
+    """异步文件列表安装复用同一受控路径边界。"""
+    manager = PluginPackageManager(source=Mock(), plugin_root=tmp_path / "plugins")
+    request = AsyncMock()
+    monkeypatch.setattr(
+        manager,
+        "_PluginPackageManager__async_request_with_fallback",
+        request,
+    )
+
+    result = await manager._PluginPackageManager__async_download_files(
+        "DemoPlugin",
+        [
+            {
+                "path": "plugins.v2/demoplugin/../../escaped.py",
+                "download_url": "https://example.invalid/file",
+            }
+        ],
+        "owner/repo",
+        "v2",
+    )
+
+    assert result == (False, "插件文件路径无效")
+    request.assert_not_awaited()
+    assert not (tmp_path / "escaped.py").exists()
+
+
+@pytest.mark.asyncio
+async def test_file_list_download_rejects_traversal_directory_names(
+    monkeypatch,
+    tmp_path,
+):
+    """目录项名称不得扩大后续市场查询到当前插件树之外。"""
+    manager = PluginPackageManager(source=Mock(), plugin_root=tmp_path / "plugins")
+    sync_query = Mock()
+    async_query = AsyncMock()
+    monkeypatch.setattr(
+        manager,
+        "_PluginPackageManager__get_file_list",
+        sync_query,
+    )
+    monkeypatch.setattr(
+        manager,
+        "_PluginPackageManager__async_get_file_list",
+        async_query,
+    )
+    item = {"name": "..", "download_url": None}
+
+    assert manager._PluginPackageManager__download_files(
+        "DemoPlugin", [item], "owner/repo"
+    ) == (False, "插件目录路径无效")
+    assert await manager._PluginPackageManager__async_download_files(
+        "DemoPlugin", [item], "owner/repo"
+    ) == (False, "插件目录路径无效")
+    sync_query.assert_not_called()
+    async_query.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_file_list_download_maps_valid_paths_into_injected_plugin_root(
+    monkeypatch,
+    tmp_path,
+):
+    """同步与异步文件列表都只写入显式装配的插件根目录。"""
+    plugin_root = tmp_path / "plugins"
+    response = SimpleNamespace(status_code=200, text="payload")
+    manager = PluginPackageManager(source=Mock(), plugin_root=plugin_root)
+    monkeypatch.setattr(
+        manager,
+        "_PluginPackageManager__request_with_fallback",
+        Mock(return_value=response),
+    )
+    monkeypatch.setattr(
+        manager,
+        "_PluginPackageManager__async_request_with_fallback",
+        AsyncMock(return_value=response),
+    )
+    item = {
+        "path": "plugins.v2/demoplugin/nested/file.py",
+        "download_url": "https://example.invalid/file",
+    }
+
+    assert manager._PluginPackageManager__download_files(
+        "DemoPlugin", [item], "owner/repo", "v2"
+    ) == (True, "")
+    assert await manager._PluginPackageManager__async_download_files(
+        "DemoPlugin", [item], "owner/repo", "v2"
+    ) == (True, "")
+    assert (plugin_root / "demoplugin" / "nested" / "file.py").read_text(
+        encoding="utf-8"
+    ) == "payload"
+
+
+def test_checkpoint_does_not_scan_native_dependencies(monkeypatch, tmp_path):
+    """普通插件文件快照不应枚举宿主全部原生发行包。"""
+    manager = _manager(monkeypatch, tmp_path)
+    capture = Mock()
+    monkeypatch.setattr(
+        "app.adapters.system.plugin.package.capture_loaded_native_dependencies",
+        capture,
+    )
+
+    checkpoint = manager.checkpoint("DemoPlugin")
+
+    assert checkpoint.native_dependencies is None
+    capture.assert_not_called()
+    assert manager.native_dependency_changes(checkpoint) == ()
+
+
 def test_checkpoint_rollback_removes_new_package(monkeypatch, tmp_path):
     """首次安装失败时应删除安装过程创建的不完整目录。"""
     manager = _manager(monkeypatch, tmp_path)
@@ -44,6 +244,162 @@ def test_checkpoint_rollback_removes_new_package(monkeypatch, tmp_path):
 
     assert not plugin_dir.exists()
     assert not checkpoint.transaction_dir.exists()
+
+
+def test_rollback_does_not_delete_package_when_snapshot_is_missing(monkeypatch, tmp_path):
+    """补偿快照损坏时先失败，不能先删除当前可用插件。"""
+    manager = _manager(monkeypatch, tmp_path)
+    plugin_dir = tmp_path / "app" / "plugins" / "demoplugin"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "__init__.py").write_text("old", encoding="utf-8")
+
+    checkpoint = manager.checkpoint("DemoPlugin")
+    shutil.rmtree(checkpoint.transaction_dir / "package")
+    (plugin_dir / "__init__.py").write_text("new", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError):
+        manager.rollback(checkpoint)
+
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "new"
+
+
+def test_durable_checkpoint_stages_backup_without_overwriting_current_backup(
+    monkeypatch,
+    tmp_path,
+):
+    """数据库提交前只准备新备份，现有容器恢复材料保持可用。"""
+    manager = _manager(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "app.adapters.system.plugin.package.SystemUtils.is_docker",
+        lambda: True,
+    )
+    plugin_dir = tmp_path / "app" / "plugins" / "demoplugin"
+    backup_dir = tmp_path / "config" / "plugins_backup" / "demoplugin"
+    plugin_dir.mkdir(parents=True)
+    backup_dir.mkdir(parents=True)
+    (plugin_dir / "__init__.py").write_text("new", encoding="utf-8")
+    (backup_dir / "__init__.py").write_text("old", encoding="utf-8")
+
+    checkpoint = manager.checkpoint("DemoPlugin", "txn-1")
+    manager.stage_persistent_backup(checkpoint)
+
+    assert checkpoint.transaction_dir.parent == tmp_path / "config" / "plugin_transactions"
+    assert (backup_dir / "__init__.py").read_text(encoding="utf-8") == "old"
+    assert checkpoint.backup_staging_dir is not None
+    assert (checkpoint.backup_staging_dir / "__init__.py").read_text(
+        encoding="utf-8"
+    ) == "new"
+
+
+def test_activate_and_finalize_persistent_backup_are_retryable(monkeypatch, tmp_path):
+    """备份激活保留旧载荷，数据库提交后的清理可以重复执行。"""
+    manager = _manager(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "app.adapters.system.plugin.package.SystemUtils.is_docker",
+        lambda: True,
+    )
+    plugin_dir = tmp_path / "app" / "plugins" / "demoplugin"
+    backup_dir = tmp_path / "config" / "plugins_backup" / "demoplugin"
+    plugin_dir.mkdir(parents=True)
+    backup_dir.mkdir(parents=True)
+    (plugin_dir / "__init__.py").write_text("new", encoding="utf-8")
+    (backup_dir / "__init__.py").write_text("old", encoding="utf-8")
+    checkpoint = manager.checkpoint("DemoPlugin", "txn-2")
+    manager.stage_persistent_backup(checkpoint)
+
+    manager.activate_persistent_backup(checkpoint)
+    manager.activate_persistent_backup(checkpoint)
+
+    assert (backup_dir / "__init__.py").read_text(encoding="utf-8") == "new"
+    assert checkpoint.backup_staging_dir is not None
+    assert not checkpoint.backup_staging_dir.exists()
+    assert checkpoint.backup_previous_dir is not None
+    assert (checkpoint.backup_previous_dir / "__init__.py").read_text(
+        encoding="utf-8"
+    ) == "old"
+
+    manager.finalize_persistent_backup(checkpoint)
+    manager.finalize_persistent_backup(checkpoint)
+
+    assert not checkpoint.backup_previous_dir.exists()
+
+
+def test_rollback_removes_staging_but_preserves_current_backup(monkeypatch, tmp_path):
+    """提交前失败只恢复运行目录，不修改上一份容器恢复备份。"""
+    manager = _manager(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "app.adapters.system.plugin.package.SystemUtils.is_docker",
+        lambda: True,
+    )
+    plugin_dir = tmp_path / "app" / "plugins" / "demoplugin"
+    backup_dir = tmp_path / "config" / "plugins_backup" / "demoplugin"
+    plugin_dir.mkdir(parents=True)
+    backup_dir.mkdir(parents=True)
+    (plugin_dir / "__init__.py").write_text("old-runtime", encoding="utf-8")
+    (backup_dir / "__init__.py").write_text("old-backup", encoding="utf-8")
+    checkpoint = manager.checkpoint("DemoPlugin", "txn-3")
+    (plugin_dir / "__init__.py").write_text("new-runtime", encoding="utf-8")
+    manager.stage_persistent_backup(checkpoint)
+
+    manager.rollback(checkpoint)
+
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old-runtime"
+    assert (backup_dir / "__init__.py").read_text(encoding="utf-8") == "old-backup"
+    assert checkpoint.backup_staging_dir is not None
+    assert not checkpoint.backup_staging_dir.exists()
+
+
+def test_rollback_after_backup_activation_restores_previous_backup(
+    monkeypatch,
+    tmp_path,
+):
+    """数据库提交前失败时，已激活的新备份必须回退到上一份载荷。"""
+    manager = _manager(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "app.adapters.system.plugin.package.SystemUtils.is_docker",
+        lambda: True,
+    )
+    plugin_dir = tmp_path / "app" / "plugins" / "demoplugin"
+    backup_dir = tmp_path / "config" / "plugins_backup" / "demoplugin"
+    plugin_dir.mkdir(parents=True)
+    backup_dir.mkdir(parents=True)
+    (plugin_dir / "__init__.py").write_text("old-runtime", encoding="utf-8")
+    (backup_dir / "__init__.py").write_text("old-backup", encoding="utf-8")
+    checkpoint = manager.checkpoint("DemoPlugin", "txn-4")
+    (plugin_dir / "__init__.py").write_text("new-runtime", encoding="utf-8")
+    manager.stage_persistent_backup(checkpoint)
+    manager.activate_persistent_backup(checkpoint)
+
+    manager.rollback(checkpoint)
+
+    assert (plugin_dir / "__init__.py").read_text(encoding="utf-8") == "old-runtime"
+    assert (backup_dir / "__init__.py").read_text(encoding="utf-8") == "old-backup"
+
+
+def test_restore_checkpoint_derives_only_controlled_paths(monkeypatch, tmp_path):
+    """崩溃回放只按事务 ID 在受控根目录内重建文件引用。"""
+    manager = _manager(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "app.adapters.system.plugin.package.SystemUtils.is_docker",
+        lambda: True,
+    )
+
+    checkpoint = manager.restore_checkpoint(
+        plugin_id="DemoPlugin",
+        transaction_id="txn-5",
+        plugin_existed=True,
+        persistent_backup_existed=False,
+    )
+
+    assert checkpoint.transaction_dir == (
+        tmp_path / "config" / "plugin_transactions" / "txn-5"
+    )
+    assert checkpoint.backup_staging_dir == (
+        tmp_path / "config" / "plugins_backup" / ".demoplugin.staging-txn-5"
+    )
+    assert checkpoint.backup_previous_dir == (
+        tmp_path / "config" / "plugins_backup" / ".demoplugin.previous-txn-5"
+    )
 
 
 def test_local_sync_failure_restores_previous_runtime_copy(monkeypatch, tmp_path):

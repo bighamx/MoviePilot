@@ -1,11 +1,15 @@
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-from app.chain.transfer import JobManager, TransferChain
+from app.chain.transfer import TransferChain
 from app.domain.meta.metabase import MetaBase
-from app.runtime.config import settings
-from app.schemas import EpisodeFormat, FileItem
+from app.schemas.file import FileItem
+from app.schemas.transfer import EpisodeFormat
 from app.schemas.types import MediaType
+from tests.test_transfer_job_manager import (
+    make_transfer_chain as make_base_transfer_chain,
+)
 
 
 class FakeMeta(MetaBase):
@@ -45,17 +49,22 @@ def make_transfer_chain() -> TransferChain:
     """
     构造不启动后台线程的整理链实例。
     """
-    chain = object.__new__(TransferChain)
-    chain.jobview = JobManager()
-    chain._media_exts = settings.RMT_MEDIAEXT
-    chain._subtitle_exts = settings.RMT_SUBEXT
-    chain._audio_exts = settings.RMT_AUDIOEXT
-    chain._allowed_exts = (
-        chain._media_exts + chain._audio_exts + chain._subtitle_exts
-    )
-    chain._success_target_files = {}
-    chain._scrape_batches = {}
+    chain = make_base_transfer_chain()
+    chain._TransferChain__ensure_recovery_scheduler = MagicMock()
     return chain
+
+
+def bind_empty_history_repositories(chain: TransferChain) -> None:
+    """为整理链绑定不命中任何记录的测试历史仓储。"""
+    chain.transfer_history_repository = SimpleNamespace(
+        get_by_src=lambda src, storage=None: None
+    )
+    chain.download_history_repository = SimpleNamespace(
+        get_by_hash=lambda download_hash: None,
+        get_file_by_fullpath=lambda fullpath: None,
+        get_files_by_savepath=lambda savepath: [],
+        get_by_path=lambda path: None,
+    )
 
 
 def make_fileitem(path: str) -> FileItem:
@@ -138,32 +147,13 @@ def test_sync_extra_subtitle_inherits_matching_video_episode(monkeypatch):
         return FakeMeta(1)
 
     monkeypatch.setattr(chain, "_TransferChain__handle_transfer", fake_handle_transfer)
+    bind_empty_history_repositories(chain)
     monkeypatch.setattr(
-        "app.chain.transfer.TransferHistoryOper",
-        lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None),
-    )
-    monkeypatch.setattr("app.chain._transfer.TransferHistoryOper", lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None))
-    monkeypatch.setattr(
-        "app.chain.transfer.DownloadHistoryOper",
-        lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ),
-    )
-    monkeypatch.setattr("app.chain._transfer.DownloadHistoryOper", lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ))
-    monkeypatch.setattr(
-        "app.chain.transfer.get_configured_system_config",
+        "app.chain.transfer.workflow.get_configured_system_config",
         lambda: SimpleNamespace(get=lambda key: None),
     )
-    monkeypatch.setattr("app.chain._transfer.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
-    monkeypatch.setattr("app.chain.transfer.MetaInfoPath", fake_meta_info_path)
+    monkeypatch.setattr("app.chain.transfer.format.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
+    monkeypatch.setattr("app.chain.transfer.request.MetaInfoPath", fake_meta_info_path)
 
     state, errmsg = TransferChain.do_transfer(
         chain,
@@ -235,33 +225,14 @@ def test_single_subtitle_transfer_reuses_same_name_video_episode(monkeypatch):
         return FakeMeta(1)
 
     monkeypatch.setattr(chain, "_TransferChain__handle_transfer", fake_handle_transfer)
+    bind_empty_history_repositories(chain)
     monkeypatch.setattr(
-        "app.chain.transfer.TransferHistoryOper",
-        lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None),
-    )
-    monkeypatch.setattr("app.chain._transfer.TransferHistoryOper", lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None))
-    monkeypatch.setattr(
-        "app.chain.transfer.DownloadHistoryOper",
-        lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ),
-    )
-    monkeypatch.setattr("app.chain._transfer.DownloadHistoryOper", lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ))
-    monkeypatch.setattr(
-        "app.chain.transfer.get_configured_system_config",
+        "app.chain.transfer.workflow.get_configured_system_config",
         lambda: SimpleNamespace(get=lambda key: None),
     )
-    monkeypatch.setattr("app.chain._transfer.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
+    monkeypatch.setattr("app.chain.transfer.format.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
     monkeypatch.setattr(
-        "app.chain.transfer.StorageChain",
+        "app.chain.transfer.request.StorageChain",
         lambda: SimpleNamespace(
             get_parent_item=lambda fileitem: parent_fileitem,
             list_files=lambda fileitem, recursion=False: [
@@ -270,14 +241,14 @@ def test_single_subtitle_transfer_reuses_same_name_video_episode(monkeypatch):
             ],
         ),
     )
-    monkeypatch.setattr("app.chain._transfer.StorageChain", lambda: SimpleNamespace(
+    monkeypatch.setattr("app.chain.transfer.records.StorageChain", lambda: SimpleNamespace(
             get_parent_item=lambda fileitem: parent_fileitem,
             list_files=lambda fileitem, recursion=False: [
                 main_fileitem,
                 subtitle_fileitem,
             ],
         ))
-    monkeypatch.setattr("app.chain.transfer.MetaInfoPath", fake_meta_info_path)
+    monkeypatch.setattr("app.chain.transfer.request.MetaInfoPath", fake_meta_info_path)
 
     state, errmsg = TransferChain.do_transfer(
         chain,
@@ -350,43 +321,24 @@ def test_single_video_transfer_lists_parent_once_for_same_name_extra(monkeypatch
         ]
 
     monkeypatch.setattr(chain, "_TransferChain__handle_transfer", fake_handle_transfer)
+    bind_empty_history_repositories(chain)
     monkeypatch.setattr(
-        "app.chain.transfer.TransferHistoryOper",
-        lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None),
-    )
-    monkeypatch.setattr("app.chain._transfer.TransferHistoryOper", lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None))
-    monkeypatch.setattr(
-        "app.chain.transfer.DownloadHistoryOper",
-        lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ),
-    )
-    monkeypatch.setattr("app.chain._transfer.DownloadHistoryOper", lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ))
-    monkeypatch.setattr(
-        "app.chain.transfer.get_configured_system_config",
+        "app.chain.transfer.workflow.get_configured_system_config",
         lambda: SimpleNamespace(get=lambda key: None),
     )
-    monkeypatch.setattr("app.chain._transfer.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
+    monkeypatch.setattr("app.chain.transfer.format.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
     monkeypatch.setattr(
-        "app.chain.transfer.StorageChain",
+        "app.chain.transfer.request.StorageChain",
         lambda: SimpleNamespace(
             get_parent_item=lambda fileitem: parent_fileitem,
             list_files=fake_list_files,
         ),
     )
-    monkeypatch.setattr("app.chain._transfer.StorageChain", lambda: SimpleNamespace(
+    monkeypatch.setattr("app.chain.transfer.records.StorageChain", lambda: SimpleNamespace(
             get_parent_item=lambda fileitem: parent_fileitem,
             list_files=fake_list_files,
         ))
-    monkeypatch.setattr("app.chain.transfer.MetaInfoPath", lambda path, custom_words=None, **kwargs: FakeMeta(2))
+    monkeypatch.setattr("app.chain.transfer.request.MetaInfoPath", lambda path, custom_words=None, **kwargs: FakeMeta(2))
 
     state, errmsg = TransferChain.do_transfer(
         chain,
@@ -448,32 +400,13 @@ def test_episode_format_filters_extra_files_before_sync_planning(monkeypatch):
         return True, ""
 
     monkeypatch.setattr(chain, "_TransferChain__handle_transfer", fake_handle_transfer)
+    bind_empty_history_repositories(chain)
     monkeypatch.setattr(
-        "app.chain.transfer.TransferHistoryOper",
-        lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None),
-    )
-    monkeypatch.setattr("app.chain._transfer.TransferHistoryOper", lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None))
-    monkeypatch.setattr(
-        "app.chain.transfer.DownloadHistoryOper",
-        lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ),
-    )
-    monkeypatch.setattr("app.chain._transfer.DownloadHistoryOper", lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ))
-    monkeypatch.setattr(
-        "app.chain.transfer.get_configured_system_config",
+        "app.chain.transfer.workflow.get_configured_system_config",
         lambda: SimpleNamespace(get=lambda key: None),
     )
-    monkeypatch.setattr("app.chain._transfer.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
-    monkeypatch.setattr("app.chain.transfer.MetaInfoPath", lambda path, custom_words=None, **kwargs: FakeMeta(1))
+    monkeypatch.setattr("app.chain.transfer.format.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
+    monkeypatch.setattr("app.chain.transfer.request.MetaInfoPath", lambda path, custom_words=None, **kwargs: FakeMeta(1))
 
     state, errmsg = TransferChain.do_transfer(
         chain,
@@ -535,32 +468,13 @@ def test_episode_format_keeps_matching_extra_files_following_main(monkeypatch):
         return True, ""
 
     monkeypatch.setattr(chain, "_TransferChain__handle_transfer", fake_handle_transfer)
+    bind_empty_history_repositories(chain)
     monkeypatch.setattr(
-        "app.chain.transfer.TransferHistoryOper",
-        lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None),
-    )
-    monkeypatch.setattr("app.chain._transfer.TransferHistoryOper", lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None))
-    monkeypatch.setattr(
-        "app.chain.transfer.DownloadHistoryOper",
-        lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ),
-    )
-    monkeypatch.setattr("app.chain._transfer.DownloadHistoryOper", lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ))
-    monkeypatch.setattr(
-        "app.chain.transfer.get_configured_system_config",
+        "app.chain.transfer.workflow.get_configured_system_config",
         lambda: SimpleNamespace(get=lambda key: None),
     )
-    monkeypatch.setattr("app.chain._transfer.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
-    monkeypatch.setattr("app.chain.transfer.MetaInfoPath", lambda path, custom_words=None, **kwargs: FakeMeta(1))
+    monkeypatch.setattr("app.chain.transfer.format.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
+    monkeypatch.setattr("app.chain.transfer.request.MetaInfoPath", lambda path, custom_words=None, **kwargs: FakeMeta(1))
 
     state, errmsg = TransferChain.do_transfer(
         chain,
@@ -631,33 +545,14 @@ def test_single_matching_subtitle_uses_unmatched_video_only_as_context(monkeypat
         return FakeMeta(1)
 
     monkeypatch.setattr(chain, "_TransferChain__handle_transfer", fake_handle_transfer)
+    bind_empty_history_repositories(chain)
     monkeypatch.setattr(
-        "app.chain.transfer.TransferHistoryOper",
-        lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None),
-    )
-    monkeypatch.setattr("app.chain._transfer.TransferHistoryOper", lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None))
-    monkeypatch.setattr(
-        "app.chain.transfer.DownloadHistoryOper",
-        lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ),
-    )
-    monkeypatch.setattr("app.chain._transfer.DownloadHistoryOper", lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ))
-    monkeypatch.setattr(
-        "app.chain.transfer.get_configured_system_config",
+        "app.chain.transfer.workflow.get_configured_system_config",
         lambda: SimpleNamespace(get=lambda key: None),
     )
-    monkeypatch.setattr("app.chain._transfer.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
+    monkeypatch.setattr("app.chain.transfer.format.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
     monkeypatch.setattr(
-        "app.chain.transfer.StorageChain",
+        "app.chain.transfer.request.StorageChain",
         lambda: SimpleNamespace(
             get_parent_item=lambda fileitem: parent_fileitem,
             list_files=lambda fileitem, recursion=False: [
@@ -666,14 +561,14 @@ def test_single_matching_subtitle_uses_unmatched_video_only_as_context(monkeypat
             ],
         ),
     )
-    monkeypatch.setattr("app.chain._transfer.StorageChain", lambda: SimpleNamespace(
+    monkeypatch.setattr("app.chain.transfer.records.StorageChain", lambda: SimpleNamespace(
             get_parent_item=lambda fileitem: parent_fileitem,
             list_files=lambda fileitem, recursion=False: [
                 main_fileitem,
                 subtitle_fileitem,
             ],
         ))
-    monkeypatch.setattr("app.chain.transfer.MetaInfoPath", fake_meta_info_path)
+    monkeypatch.setattr("app.chain.transfer.request.MetaInfoPath", fake_meta_info_path)
 
     state, errmsg = TransferChain.do_transfer(
         chain,
@@ -688,12 +583,11 @@ def test_single_matching_subtitle_uses_unmatched_video_only_as_context(monkeypat
     assert planned == [(subtitle_fileitem.path, 2)]
 
 
-def test_cleanup_dest_fileitem_is_deleted_only_after_allowed_items_exist(monkeypatch):
+def test_cleanup_dest_fileitem_is_checkpointed_only_after_allowed_items_exist(monkeypatch):
     """
-    旧目标文件只应在模板筛选后确实存在待整理任务时清理。
+    旧目标清理意图只应在模板筛选后确实存在待整理任务时进入规划输入。
     """
     chain = make_transfer_chain()
-    delete_calls = []
     planned = []
     main_fileitem = make_fileitem(
         "/downloads/Test Show (2026)/Show - 01.mkv"
@@ -721,47 +615,24 @@ def test_cleanup_dest_fileitem_is_deleted_only_after_allowed_items_exist(monkeyp
 
     def fake_handle_transfer(task, callback=None):
         """
-        记录旧目标清理后的整理任务。
+        记录实际任务携带的冻结 cleanup intent。
         """
-        planned.append(task.fileitem.path)
+        planned.append(
+            (
+                task.fileitem.path,
+                task.planning_input.options.get("cleanup_dest_fileitem"),
+            )
+        )
         return True, ""
 
     monkeypatch.setattr(chain, "_TransferChain__handle_transfer", fake_handle_transfer)
+    bind_empty_history_repositories(chain)
     monkeypatch.setattr(
-        "app.chain.transfer.TransferHistoryOper",
-        lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None),
-    )
-    monkeypatch.setattr("app.chain._transfer.TransferHistoryOper", lambda: SimpleNamespace(get_by_src=lambda src, storage=None: None))
-    monkeypatch.setattr(
-        "app.chain.transfer.DownloadHistoryOper",
-        lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ),
-    )
-    monkeypatch.setattr("app.chain._transfer.DownloadHistoryOper", lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ))
-    monkeypatch.setattr(
-        "app.chain.transfer.get_configured_system_config",
+        "app.chain.transfer.workflow.get_configured_system_config",
         lambda: SimpleNamespace(get=lambda key: None),
     )
-    monkeypatch.setattr("app.chain._transfer.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
-    monkeypatch.setattr(
-        "app.chain.transfer.StorageChain",
-        lambda: SimpleNamespace(
-            delete_media_file=lambda fileitem: delete_calls.append(fileitem.path) or True,
-        ),
-    )
-    monkeypatch.setattr("app.chain._transfer.StorageChain", lambda: SimpleNamespace(
-            delete_media_file=lambda fileitem: delete_calls.append(fileitem.path) or True,
-        ))
-    monkeypatch.setattr("app.chain.transfer.MetaInfoPath", lambda path, custom_words=None, **kwargs: FakeMeta(1))
+    monkeypatch.setattr("app.chain.transfer.format.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
+    monkeypatch.setattr("app.chain.transfer.request.MetaInfoPath", lambda path, custom_words=None, **kwargs: FakeMeta(1))
 
     state, errmsg = TransferChain.do_transfer(
         chain,
@@ -773,8 +644,12 @@ def test_cleanup_dest_fileitem_is_deleted_only_after_allowed_items_exist(monkeyp
 
     assert state is True
     assert errmsg == ""
-    assert delete_calls == [old_dest_fileitem.path]
-    assert planned == [main_fileitem.path]
+    assert planned == [
+        (
+            main_fileitem.path,
+            old_dest_fileitem.model_dump(mode="json"),
+        )
+    ]
 
 
 def test_cleanup_dest_fileitem_is_kept_when_episode_format_matches_nothing(monkeypatch):
@@ -796,17 +671,17 @@ def test_cleanup_dest_fileitem_is_kept_when_episode_format_matches_nothing(monke
         lambda fileitem, predicate: [(source_fileitem, False)],
     )
     monkeypatch.setattr(
-        "app.chain.transfer.get_configured_system_config",
+        "app.chain.transfer.workflow.get_configured_system_config",
         lambda: SimpleNamespace(get=lambda key: None),
     )
-    monkeypatch.setattr("app.chain._transfer.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
+    monkeypatch.setattr("app.chain.transfer.format.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
     monkeypatch.setattr(
-        "app.chain.transfer.StorageChain",
+        "app.chain.transfer.request.StorageChain",
         lambda: SimpleNamespace(
             delete_media_file=lambda fileitem: delete_calls.append(fileitem.path) or True,
         ),
     )
-    monkeypatch.setattr("app.chain._transfer.StorageChain", lambda: SimpleNamespace(
+    monkeypatch.setattr("app.chain.transfer.records.StorageChain", lambda: SimpleNamespace(
             delete_media_file=lambda fileitem: delete_calls.append(fileitem.path) or True,
         ))
 
@@ -838,10 +713,10 @@ def test_episode_format_matched_but_filtered_by_size_returns_failure(monkeypatch
         lambda fileitem, predicate: [(source_fileitem, False)],
     )
     monkeypatch.setattr(
-        "app.chain.transfer.get_configured_system_config",
+        "app.chain.transfer.workflow.get_configured_system_config",
         lambda: SimpleNamespace(get=lambda key: None),
     )
-    monkeypatch.setattr("app.chain._transfer.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
+    monkeypatch.setattr("app.chain.transfer.format.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
 
     state, errmsg = TransferChain.do_transfer(
         chain,
@@ -879,10 +754,10 @@ def test_candidate_collection_checks_continue_callback(monkeypatch):
         fake_get_trans_fileitems,
     )
     monkeypatch.setattr(
-        "app.chain.transfer.get_configured_system_config",
+        "app.chain.transfer.workflow.get_configured_system_config",
         lambda: SimpleNamespace(get=lambda key: None),
     )
-    monkeypatch.setattr("app.chain._transfer.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
+    monkeypatch.setattr("app.chain.transfer.format.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
 
     state, errmsg = TransferChain.do_transfer(
         chain,

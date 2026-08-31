@@ -2,15 +2,15 @@ from typing import Optional
 
 from pydantic import Field
 
-from app.workflow.actions import BaseAction
+from app.application.configuration import get_chain_runtime_config_snapshot
+from app.application.rss import RssHelper
 from app.chain.media import MediaChain
-from app.runtime.config import settings, global_vars
 from app.domain.context import Context, TorrentInfo
 from app.domain.metainfo import MetaInfo
-from app.application.rss import RssHelper
 from app.runtime.log import logger
-from app.schemas.workflow import ActionParams
-from app.schemas.workflow import ActionContext
+from app.runtime.stop import runtime_stop_state
+from app.schemas.workflow import ActionContext, ActionParams
+from app.workflow.actions import BaseAction
 
 
 class FetchRssParams(ActionParams):
@@ -40,20 +40,9 @@ class FetchRssAction(BaseAction):
         self._rss_torrents = []
         self._has_error = False
 
-    @classmethod
-    @property
-    def name(cls) -> str:  # noqa
-        return "获取RSS资源"
-
-    @classmethod
-    @property
-    def description(cls) -> str:  # noqa
-        return "订阅RSS地址获取资源"
-
-    @classmethod
-    @property
-    def data(cls) -> dict:  # noqa
-        return FetchRssParams().model_dump()
+    name = "获取RSS资源"
+    description = "订阅RSS地址获取资源"
+    data = FetchRssParams().model_dump()
 
     @property
     def success(self) -> bool:
@@ -76,7 +65,11 @@ class FetchRssAction(BaseAction):
             headers["User-Agent"] = params.ua
 
         rss_items = RssHelper().parse(url=params.url,
-                                      proxy=settings.PROXY if params.proxy else None,
+                                      proxy=(
+                                          get_chain_runtime_config_snapshot().proxy
+                                          if params.proxy
+                                          else None
+                                      ),
                                       timeout=params.timeout,
                                       headers=headers)
         if rss_items is None or rss_items is False:
@@ -90,7 +83,7 @@ class FetchRssAction(BaseAction):
 
         # 组装种子
         for item in rss_items:
-            if global_vars.is_workflow_stopped(workflow_id):
+            if runtime_stop_state.is_workflow_stopped(workflow_id):
                 break
             if not item.get("title"):
                 continue

@@ -1,7 +1,9 @@
 import asyncio
 import hashlib
+import inspect
 import json
 import re
+import time
 import traceback
 import uuid
 import warnings
@@ -9,132 +11,105 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
-from fastapi.concurrency import run_in_threadpool
 from langchain.agents import create_agent
 from langchain_core.messages import (  # noqa: F401
-    HumanMessage,
     BaseMessage,
+    HumanMessage,
     SystemMessage,
 )
-
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.callback import StreamingHandler
 from app.agent.contracts import ReplyMode, build_display_message
-from app.agent.llm import LLMHelper
-from app.agent.llm.server_tools import ServerToolRegistry
-from app.agent.memory import memory_manager
-from app.agent.middleware.activity_log import (
-    ActivityLogMiddleware,
+from app.agent.llm.helper import LLMHelper
+from app.agent.llm.tools import ServerToolRegistry
+from app.agent.mcp import agent_mcp_manager
+from app.agent.memory import MemoryManager, memory_manager
+from app.agent.middleware.activity import (
     QUERY_ACTIVITY_LOG_TOOL_NAME,
+    ActivityLogMiddleware,
 )
+from app.agent.middleware.config import RuntimeConfigMiddleware
 from app.agent.middleware.jobs import (
     JobsMiddleware,
-    filter_active_jobs,
-    load_jobs_metadata,
 )
 from app.agent.middleware.memory import MemoryMiddleware
-from app.agent.middleware.patch_tool_calls import PatchToolCallsMiddleware
+from app.agent.middleware.patching import PatchToolCallsMiddleware
 from app.agent.middleware.policy import AgentPolicyMiddleware
-from app.agent.middleware.runtime_config import RuntimeConfigMiddleware
+from app.agent.middleware.selection import ToolSelectorMiddleware
 from app.agent.middleware.skills import SKILL_TOOL_NAME, SkillsMiddleware
-from app.agent.middleware.summarization import (
-    ContextPreservingSummarizationMiddleware as SummarizationMiddleware,
-    FinalRequestCompactionMiddleware,
-)
 from app.agent.middleware.subagents import (
     SUBAGENT_CONTROL_TOOL_NAME,
     SUBAGENT_TASK_TOOL_NAME,
     create_subagent_middlewares,
     is_subagent_stream_metadata,
 )
-from app.agent.middleware.tool_selection import ToolSelectorMiddleware
+from app.agent.middleware.summarization import (
+    ContextPreservingSummarizationMiddleware as SummarizationMiddleware,
+)
+from app.agent.middleware.summarization import (
+    FinalRequestCompactionMiddleware,
+)
 from app.agent.middleware.usage import UsageMiddleware
-from app.agent.prompt import prompt_manager
-from app.agent.policy import (
+from app.agent.policy.contracts import (
     AuthSource,
     PrincipalType,
     ToolOrigin,
     ToolPolicyContext,
 )
+from app.agent.prompt import prompt_manager
 from app.agent.runtime import agent_runtime_manager
-from app.agent.mcp import agent_mcp_manager
 from app.agent.tools.catalog import ToolCatalogSnapshot
 from app.agent.tools.impl.mcp import (
     create_external_mcp_tools,
     select_legacy_mcp_tools,
 )
 from app.agent.tools.impl.query_system_settings import QuerySystemSettingsTool
-from app.chain.agent import AgentChain
-from app.runtime.config import settings
-from app.runtime.events import eventmanager
+from app.application.agent import AgentDataContext
+from app.application.messaging.chat import (
+    get_configured_agent_chat_persistence,
+    get_configured_agent_chat_service,
+    has_custom_agent_chat_title,
+)
 from app.application.plugin.runtime import get_plugin_manager
+from app.chain.agent import AgentChain
+from app.runtime.events import eventmanager
+from app.runtime.execution import run_in_threadpool
+from app.runtime.log import logger
+from app.runtime.observability import record_metric
+from app.runtime.settings import get_runtime_setting
+from app.schemas.event import AgentLLMProviderEventData, AgentTokensUsageEventData
+from app.schemas.message import Message, MessageType
+from app.schemas.notification import ChannelCapability, ChannelCapabilityManager
+from app.schemas.types import ChainEventType, EventType, NotificationChannel
 
 
 def _get_plugin_tools_revision() -> int:
     """读取插件工具目录修订号，避免 Agent 编排依赖具体管理器类型。"""
     return get_plugin_manager().get_plugin_agent_tools_revision()
-from app.application.agentdata import AgentChatPort as AgentChatOper
-from app.application.agentdata import AgentTaskPort as AgentTaskOper
-from app.application.agentdata import UserPort as UserOper
-from app.runtime.log import logger
-from app.schemas.event import AgentLLMProviderEventData
-from app.schemas.event import AgentTokensUsageEventData
-from app.schemas.message import Message
-from app.schemas.message import MessageType
-from app.schemas.notification import ChannelCapabilityManager, ChannelCapability
-from app.schemas.types import ChainEventType, EventType, NotificationChannel
-from app.foundation.identity import SYSTEM_INTERNAL_USER_ID
 
 warnings.filterwarnings("ignore", message=".*allowed_objects.*")
 
 
-def _finish_processing_status(status: Optional[dict], user_id: Optional[str] = None) -> None:
-    """结束入站消息的渠道处理状态。"""
-    if not status:
-        return
-    AgentChain().finish_message_processing_status(
-        status=status,
-        userid=user_id,
-    )
+_KNOWN_AGENT_PROVIDER_TYPES = (
+    "anthropic",
+    "azure",
+    "deepseek",
+    "gemini",
+    "ollama",
+    "openai",
+)
 
 
-async def _async_start_processing_status(task: "_MessageTask") -> Optional[dict]:
-    """
-    在 Agent worker 中启动渠道处理状态。
-    渠道启动可能触发外部 API，同步实现需切到线程池避免阻塞事件循环。
-    """
-    if not task.channel:
-        return None
-
-    def _start() -> Optional[dict]:
-        """在线程池中通过统一 Chain 接口启动处理状态。"""
-        try:
-            return AgentChain().start_message_processing_status(
-                channel=NotificationChannel(task.channel),
-                source=task.source,
-                userid=task.user_id,
-                message_id=task.original_message_id,
-                chat_id=task.original_chat_id,
-                text=task.message,
-            )
-        except Exception as err:
-            logger.debug(f"启动Agent消息处理状态失败: {err}")
-            return None
-
-    return await run_in_threadpool(_start)
-
-
-async def _async_finish_processing_status(
-        status: Optional[dict], user_id: Optional[str] = None
-) -> None:
-    """
-    在 Agent worker 中结束渠道处理状态。
-    渠道收口可能触发外部 API，同步实现需切到线程池避免阻塞事件循环。
-    """
-    if not status:
-        return
-    await run_in_threadpool(_finish_processing_status, status, user_id)
+def _agent_provider_metric_type(provider: object) -> str:
+    """把可配置 provider 名称收敛为有限指标类别，避免泄露自定义名称。"""
+    normalized = str(provider or "").strip().lower()
+    if not normalized:
+        return "unknown"
+    for provider_type in _KNOWN_AGENT_PROVIDER_TYPES:
+        if provider_type in normalized:
+            return provider_type
+    return "custom"
 
 
 @dataclass
@@ -362,10 +337,10 @@ class MoviePilotAgent:
     def __init__(
             self,
             session_id: str,
-            user_id: str = None,
-            channel: str = None,
-            source: str = None,
-            username: str = None,
+            user_id: Optional[str] = None,
+            channel: Optional[str] = None,
+            source: Optional[str] = None,
+            username: Optional[str] = None,
             is_channel_admin: Optional[bool] = None,
             original_message_id: Optional[str] = None,
             original_chat_id: Optional[str] = None,
@@ -373,7 +348,10 @@ class MoviePilotAgent:
             allow_message_tools: bool = True,
             output_callback: Optional[Callable[[str], None]] = None,
             protected_output_callback: Optional[Callable[[str], Optional[bool]]] = None,
+            data: Optional[AgentDataContext] = None,
+            memory: Optional[MemoryManager] = None,
     ):
+        """创建会话 Agent，并保存组合根注入的数据与记忆能力。"""
         self.session_id = session_id
         self.user_id = user_id
         self.channel = channel
@@ -386,6 +364,8 @@ class MoviePilotAgent:
         self.allow_message_tools = allow_message_tools
         self.output_callback = output_callback
         self.protected_output_callback = protected_output_callback
+        self._data = data
+        self._memory = memory or memory_manager
         self._tool_context: Dict[str, object] = {}
         self._pending_secret_confirmation: Optional[_PendingSecretConfirmation] = None
         self._streamed_output = ""
@@ -395,6 +375,8 @@ class MoviePilotAgent:
         self._llm_provider_selection: Dict[str, Any] = {}
         self._agent_started_at: Optional[datetime] = None
         self._compiled_agent_bundle: Optional[_CompiledAgentBundle] = None
+        self._subagent_middlewares: tuple[Any, ...] = ()
+        self._shutdown_started = False
         self._last_agent_cache_hit = False
 
         # 流式token管理
@@ -434,14 +416,14 @@ class MoviePilotAgent:
         """
         return bool(self.channel and self.source)
 
-    def _save_display_history_messages(self, messages: List[dict]) -> None:
+    async def _save_display_history_messages(self, messages: List[dict]) -> None:
         """
         将一组可见消息追加到 Agent 会话历史表。
         """
         if not messages or not self._should_save_display_history():
             return
         try:
-            AgentChatOper().append_display_messages(
+            await get_configured_agent_chat_persistence().async_append_display_messages(
                 session_id=self.session_id,
                 user_id=self.user_id,
                 username=self.username,
@@ -453,13 +435,13 @@ class MoviePilotAgent:
         except Exception as e:
             logger.debug(f"写入Agent展示历史失败: {e}")
 
-    def _save_assistant_display_message_once(self, message: str) -> None:
+    async def _save_assistant_display_message_once(self, message: str) -> None:
         """
         保存一条助手回复展示记录，并标记本轮已写入。
         """
         if not message or self._tool_context.get("assistant_display_saved"):
             return
-        self._save_display_history_messages(
+        await self._save_display_history_messages(
             [self.build_display_message(role="assistant", content=message)]
         )
         self._tool_context["assistant_display_saved"] = True
@@ -539,18 +521,16 @@ class MoviePilotAgent:
             return
         self._tool_context["chat_title_prepared"] = True
         try:
-            chat = await run_in_threadpool(
-                AgentChatOper().get,
+            chat = await get_configured_agent_chat_service().get(
                 session_id=self.session_id,
                 user_id=self.user_id,
             )
-            if chat and AgentChatOper.has_custom_title(chat.title):
+            if chat and has_custom_agent_chat_title(chat.title):
                 return
             title = await self._generate_chat_title(message)
             if not title:
                 return
-            await run_in_threadpool(
-                AgentChatOper().update_title_if_empty,
+            await get_configured_agent_chat_persistence().async_update_title_if_empty(
                 session_id=self.session_id,
                 user_id=self.user_id,
                 title=title,
@@ -582,7 +562,7 @@ class MoviePilotAgent:
     def _get_recursion_limit() -> int:
         """读取 LangGraph 递归上限，防止模型持续循环调用工具。"""
         try:
-            limit = int(settings.LLM_MAX_ITERATIONS or 0)
+            limit = int(get_runtime_setting('LLM_MAX_ITERATIONS') or 0)
         except (TypeError, ValueError):
             limit = 0
         return limit if limit > 0 else 128
@@ -705,6 +685,24 @@ class MoviePilotAgent:
         self._session_usage.total_cache_write_input_tokens += cache_write_input_tokens
         self._session_usage.total_uncached_input_tokens += uncached_input_tokens
         self._session_usage.cache_usage_available |= cache_usage_available
+        provider_type = _agent_provider_metric_type(
+            (self._llm_provider_selection or {}).get("provider")
+            or get_runtime_setting('LLM_PROVIDER')
+        )
+        if input_tokens:
+            record_metric(
+                "agent.token_usage",
+                input_tokens,
+                provider_type=provider_type,
+                direction="input",
+            )
+        if output_tokens:
+            record_metric(
+                "agent.token_usage",
+                output_tokens,
+                provider_type=provider_type,
+                direction="output",
+            )
 
         if not is_current_request:
             return
@@ -814,14 +812,14 @@ class MoviePilotAgent:
             not self._session_usage.model
             and self._session_usage.last_request_sequence == 0
         ):
-            self._session_usage.model = settings.LLM_MODEL
+            self._session_usage.model = get_runtime_setting('LLM_MODEL')
         if (
             not self._session_usage.context_window_tokens
             and self._session_usage.last_request_sequence == 0
         ):
             self._session_usage.context_window_tokens = (
-                settings.LLM_MAX_CONTEXT_TOKENS * 1000
-                if settings.LLM_MAX_CONTEXT_TOKENS
+                get_runtime_setting('LLM_MAX_CONTEXT_TOKENS') * 1000
+                if get_runtime_setting('LLM_MAX_CONTEXT_TOKENS')
                 else None
             )
         return self._session_usage.to_dict(self.session_id)
@@ -841,9 +839,9 @@ class MoviePilotAgent:
                 session_id=self.session_id,
                 selected_provider_id=selection.get("selected_provider_id"),
                 selected_provider_name=selection.get("selected_provider_name"),
-                provider=selection.get("provider") or settings.LLM_PROVIDER,
-                base_url=selection.get("base_url") or settings.LLM_BASE_URL,
-                model=self._session_usage.model or selection.get("model") or settings.LLM_MODEL,
+                provider=selection.get("provider") or get_runtime_setting('LLM_PROVIDER'),
+                base_url=selection.get("base_url") or get_runtime_setting('LLM_BASE_URL'),
+                model=self._session_usage.model or selection.get("model") or get_runtime_setting('LLM_MODEL'),
                 input_tokens=self._session_usage.total_input_tokens,
                 output_tokens=self._session_usage.total_output_tokens,
                 total_tokens=self._session_usage.total_tokens,
@@ -919,7 +917,9 @@ class MoviePilotAgent:
         if not self.username:
             return False
         try:
-            user = await UserOper().async_get_by_name(self.username)
+            if self._data is None:
+                return False
+            user = await self._data.users.async_get_by_name(self.username)
         except Exception as e:
             logger.error(f"检查 Agent 用户管理员身份失败: {e}")
             return False
@@ -1214,7 +1214,7 @@ class MoviePilotAgent:
         if self.is_background:
             return False
         # 啰嗦模式下始终需要流式输出来捕获工具调用前的 Agent 文字
-        if settings.AI_AGENT_VERBOSE:
+        if get_runtime_setting('AI_AGENT_VERBOSE'):
             return True
         try:
             channel_enum = NotificationChannel(self.channel)
@@ -1263,16 +1263,16 @@ class MoviePilotAgent:
             return self._llm_runtime_config
 
         event_data = AgentLLMProviderEventData(
-            provider=settings.LLM_PROVIDER,
-            model=settings.LLM_MODEL,
-            api_key=settings.LLM_API_KEY,
-            base_url=settings.LLM_BASE_URL,
-            base_url_preset=settings.LLM_BASE_URL_PRESET,
-            user_agent=settings.LLM_USER_AGENT,
-            use_proxy=settings.LLM_USE_PROXY,
-            thinking_level=settings.LLM_THINKING_LEVEL,
-            api_protocol=settings.LLM_API_PROTOCOL,
-            web_search_mode=settings.LLM_WEB_SEARCH_MODE,
+            provider=get_runtime_setting('LLM_PROVIDER'),
+            model=get_runtime_setting('LLM_MODEL'),
+            api_key=get_runtime_setting('LLM_API_KEY'),
+            base_url=get_runtime_setting('LLM_BASE_URL'),
+            base_url_preset=get_runtime_setting('LLM_BASE_URL_PRESET'),
+            user_agent=get_runtime_setting('LLM_USER_AGENT'),
+            use_proxy=get_runtime_setting('LLM_USE_PROXY'),
+            thinking_level=get_runtime_setting('LLM_THINKING_LEVEL'),
+            api_protocol=get_runtime_setting('LLM_API_PROTOCOL'),
+            web_search_mode=get_runtime_setting('LLM_WEB_SEARCH_MODE'),
         )
         selected_event = await eventmanager.async_send_event(
             ChainEventType.AgentLLMProvider,
@@ -1282,43 +1282,43 @@ class MoviePilotAgent:
 
         provider = (
                 self._clean_optional_text(self._get_event_value(resolved_data, "provider"))
-                or settings.LLM_PROVIDER
+                or get_runtime_setting('LLM_PROVIDER')
         )
         model = (
                 self._clean_optional_text(self._get_event_value(resolved_data, "model"))
-                or settings.LLM_MODEL
+                or get_runtime_setting('LLM_MODEL')
         )
         api_key = (
                 self._clean_optional_text(self._get_event_value(resolved_data, "api_key"))
-                or settings.LLM_API_KEY
+                or get_runtime_setting('LLM_API_KEY')
         )
         base_url = (
                 self._clean_optional_text(self._get_event_value(resolved_data, "base_url"))
-                or settings.LLM_BASE_URL
+                or get_runtime_setting('LLM_BASE_URL')
         )
         base_url_preset = (
                 self._clean_optional_text(self._get_event_value(resolved_data, "base_url_preset"))
-                or settings.LLM_BASE_URL_PRESET
+                or get_runtime_setting('LLM_BASE_URL_PRESET')
         )
         user_agent = (
                 self._clean_optional_text(self._get_event_value(resolved_data, "user_agent"))
-                or settings.LLM_USER_AGENT
+                or get_runtime_setting('LLM_USER_AGENT')
         )
         use_proxy = self._get_event_value(resolved_data, "use_proxy")
         if use_proxy is None:
-            use_proxy = settings.LLM_USE_PROXY
+            use_proxy = get_runtime_setting('LLM_USE_PROXY')
         thinking_level = (
                 self._clean_optional_text(
                     self._get_event_value(resolved_data, "thinking_level")
                 )
-                or settings.LLM_THINKING_LEVEL
+                or get_runtime_setting('LLM_THINKING_LEVEL')
         )
         api_protocol = self._clean_optional_text(
             self._get_event_value(resolved_data, "api_protocol")
-        ) or settings.LLM_API_PROTOCOL
+        ) or get_runtime_setting('LLM_API_PROTOCOL')
         web_search_mode = self._clean_optional_text(
             self._get_event_value(resolved_data, "web_search_mode")
-        ) or settings.LLM_WEB_SEARCH_MODE
+        ) or get_runtime_setting('LLM_WEB_SEARCH_MODE')
         selected_provider_id = self._clean_optional_text(
             self._get_event_value(resolved_data, "selected_provider_id")
         )
@@ -1461,8 +1461,8 @@ class MoviePilotAgent:
         清理执行错误中的密钥和尾部长说明，避免把敏感字段或 SDK 调参文档直接发给用户。
         """
         sanitized = re.sub(r"\s+", " ", str(message or "")).strip()
-        if settings.LLM_API_KEY:
-            sanitized = sanitized.replace(settings.LLM_API_KEY, "***")
+        if get_runtime_setting('LLM_API_KEY'):
+            sanitized = sanitized.replace(get_runtime_setting('LLM_API_KEY'), "***")
         sanitized = re.sub(
             r"(?i)(api[_-]?key\s*[:=]\s*)([^\s,;]+)",
             r"\1***",
@@ -1552,7 +1552,7 @@ class MoviePilotAgent:
         """
         初始化主 Agent 本地工具实例。
         """
-        from app.agent.runtime_loader import get_tool_factory
+        from app.agent.loader import get_tool_factory
 
         return get_tool_factory().create_tools(
             session_id=self.session_id,
@@ -1563,13 +1563,14 @@ class MoviePilotAgent:
             stream_handler=self.stream_handler,
             agent_context=self._tool_context,
             allow_message_tools=self.allow_message_tools,
+            data=self._data,
         )
 
     def _initialize_local_tool_catalogs(
         self,
     ) -> tuple[ToolCatalogSnapshot, ToolCatalogSnapshot]:
         """在同一插件 revision 窗口内建立主图和子图工具目录。"""
-        from app.agent.runtime_loader import get_tool_factory
+        from app.agent.loader import get_tool_factory
 
         tool_factory = get_tool_factory()
         plugin_manager = get_plugin_manager()
@@ -1655,11 +1656,11 @@ class MoviePilotAgent:
             bool(self._tool_context.get("is_admin")),
             self.has_message_context,
             self.is_background,
-            settings.AI_AGENT_VERBOSE,
-            settings.LLM_TEMPERATURE,
-            settings.LLM_MAX_CONTEXT_TOKENS,
-            settings.LLM_MAX_TOOLS,
-            settings.LLM_MAX_ITERATIONS,
+            get_runtime_setting('AI_AGENT_VERBOSE'),
+            get_runtime_setting('LLM_TEMPERATURE'),
+            get_runtime_setting('LLM_MAX_CONTEXT_TOKENS'),
+            get_runtime_setting('LLM_MAX_TOOLS'),
+            get_runtime_setting('LLM_MAX_ITERATIONS'),
             self._public_runtime_config_signature(runtime_config),
             agent_runtime_manager.current_signature(),
             agent_mcp_manager.config_signature(),
@@ -1676,7 +1677,7 @@ class MoviePilotAgent:
     @staticmethod
     def _tool_factory_revision() -> str:
         """在目录签名确实需要时解析工具工厂版本。"""
-        from app.agent.runtime_loader import get_tool_factory
+        from app.agent.loader import get_tool_factory
 
         return get_tool_factory().catalog_factory_revision()
 
@@ -1693,7 +1694,59 @@ class MoviePilotAgent:
             return bundle.agent
         return None
 
-    def _cache_agent(
+    @staticmethod
+    def _seal_subagent_middleware_instances(
+        middlewares: tuple[Any, ...],
+    ) -> None:
+        """同步封住子代理控制器的新任务入口，不等待既有任务退出。"""
+        for middleware in middlewares:
+            seal = getattr(middleware, "seal", None)
+            if not callable(seal):
+                continue
+            try:
+                seal()
+            except Exception as error:
+                logger.debug(f"封住子代理中间件失败: {error}")
+
+    @staticmethod
+    async def _close_subagent_middleware_instances(
+        middlewares: tuple[Any, ...],
+    ) -> tuple[Any, ...]:
+        """关闭子代理控制器，并返回仍持有未收敛任务的实例。"""
+        pending_middlewares = []
+        for middleware in middlewares:
+            close = getattr(middleware, "close", None)
+            if not callable(close):
+                continue
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    result = await result
+                if result is False:
+                    pending_middlewares.append(middleware)
+            except Exception as error:
+                logger.debug(f"关闭子代理中间件失败: {error}")
+                pending_middlewares.append(middleware)
+        return tuple(pending_middlewares)
+
+    @staticmethod
+    def _merge_subagent_middleware_owners(
+        *groups: tuple[Any, ...],
+    ) -> tuple[Any, ...]:
+        """按对象身份合并当前图与延迟收敛控制器的 owner 集合。"""
+        merged = []
+        for group in groups:
+            for middleware in group:
+                if not any(middleware is existing for existing in merged):
+                    merged.append(middleware)
+        return tuple(merged)
+
+    def begin_shutdown(self) -> None:
+        """在任何异步等待前封住当前 Agent 的 detached 子代理提交。"""
+        self._shutdown_started = True
+        self._seal_subagent_middleware_instances(self._subagent_middlewares)
+
+    async def _cache_agent(
         self,
         *,
         signature: tuple[Any, ...],
@@ -1702,8 +1755,22 @@ class MoviePilotAgent:
         tool_catalog: ToolCatalogSnapshot,
         subagent_catalog: ToolCatalogSnapshot,
         mcp_config_signature: str,
+        subagent_middlewares: tuple[Any, ...] = (),
     ) -> Any:
         """保存当前会话可复用的 Agent 图。"""
+        previous_middlewares = tuple(
+            middleware
+            for middleware in self._subagent_middlewares
+            if not any(
+                middleware is replacement
+                for replacement in subagent_middlewares
+            )
+        )
+        if self._shutdown_started:
+            self._seal_subagent_middleware_instances(subagent_middlewares)
+        pending_middlewares = await self._close_subagent_middleware_instances(
+            previous_middlewares
+        )
         self._compiled_agent_bundle = _CompiledAgentBundle(
             signature=signature,
             agent=agent,
@@ -1715,7 +1782,21 @@ class MoviePilotAgent:
             mcp_config_signature=mcp_config_signature,
             catalog_checked_at=datetime.now(),
         )
+        self._subagent_middlewares = self._merge_subagent_middleware_owners(
+            pending_middlewares,
+            subagent_middlewares,
+        )
         return agent
+
+    async def _invalidate_cached_agent(self) -> bool:
+        """使当前图失效，未收敛的子代理控制器继续由 Agent 持有。"""
+        subagent_middlewares = self._subagent_middlewares
+        self._compiled_agent_bundle = None
+        pending_middlewares = await self._close_subagent_middleware_instances(
+            subagent_middlewares
+        )
+        self._subagent_middlewares = pending_middlewares
+        return not pending_middlewares
 
     @staticmethod
     def _latest_turn_messages(messages: List[BaseMessage]) -> List[BaseMessage]:
@@ -1726,7 +1807,7 @@ class MoviePilotAgent:
         """
         初始化子代理专用静默工具列表。
         """
-        from app.agent.runtime_loader import get_tool_factory
+        from app.agent.loader import get_tool_factory
 
         return get_tool_factory().create_tools(
             session_id=self.session_id,
@@ -1743,6 +1824,7 @@ class MoviePilotAgent:
                 "require_secret_confirmation": True,
             },
             allow_message_tools=False,
+            data=self._data,
         )
 
     async def _initialize_mcp_tools(self, specs=None) -> List:
@@ -1785,6 +1867,7 @@ class MoviePilotAgent:
         创建 LangGraph Agent（使用 create_agent + SummarizationMiddleware）
         :param streaming: 是否启用流式输出
         """
+        temporary_subagent_middlewares: tuple[Any, ...] = ()
         try:
             runtime_config = await self._resolve_llm_runtime_config()
             plugin_revision = _get_plugin_tools_revision()
@@ -1865,7 +1948,7 @@ class MoviePilotAgent:
             )
             skills_middleware = SkillsMiddleware(
                 sources=[str(agent_runtime_manager.skills_dir)],
-                bundled_skills_dir=str(settings.ROOT_PATH / "skills"),
+                bundled_skills_dir=str(get_runtime_setting('ROOT_PATH') / "skills"),
                 stream_handler=self.stream_handler,
             )
             skill_tools = list(getattr(skills_middleware, "tools", []) or [])
@@ -1888,6 +1971,7 @@ class MoviePilotAgent:
                 policy_context=policy_context.for_subagent(),
                 catalog=subagent_catalog,
             )
+            temporary_subagent_middlewares = tuple(subagent_middlewares)
             # 严格目录必须覆盖 LangGraph ToolNode 可执行的全部 client-side 工具。
             tool_catalog = ToolCatalogSnapshot.from_tools(
                 [
@@ -1910,10 +1994,18 @@ class MoviePilotAgent:
             if cached_agent:
                 # 签名相同表示已编译图中的精确工具实例仍有效；新建快照仅用于复核。
                 cached_bundle.catalog_checked_at = datetime.now()
+                pending_middlewares = await self._close_subagent_middleware_instances(
+                    temporary_subagent_middlewares
+                )
+                self._subagent_middlewares = self._merge_subagent_middleware_owners(
+                    self._subagent_middlewares,
+                    pending_middlewares,
+                )
+                temporary_subagent_middlewares = ()
                 logger.debug(f"复用会话内 Agent 图: session_id={self.session_id}")
                 return cached_agent
-            max_tools = settings.LLM_MAX_TOOLS
-            from app.agent.runtime_loader import get_tool_factory
+            max_tools = get_runtime_setting('LLM_MAX_TOOLS')
+            from app.agent.loader import get_tool_factory
 
             always_include_tools = (
                 get_tool_factory().get_tool_selector_always_include_names(tools)
@@ -2014,23 +2106,42 @@ class MoviePilotAgent:
                 middleware=middlewares,
                 checkpointer=InMemorySaver(),
             )
-            return self._cache_agent(
+            cached_agent = await self._cache_agent(
                 signature=bundle_signature,
                 agent=agent,
                 streaming=streaming,
                 tool_catalog=tool_catalog,
                 subagent_catalog=subagent_catalog,
                 mcp_config_signature=mcp_config_signature,
+                subagent_middlewares=tuple(subagent_middlewares),
             )
+            temporary_subagent_middlewares = ()
+            return cached_agent
+        except asyncio.CancelledError:
+            pending_middlewares = await self._close_subagent_middleware_instances(
+                temporary_subagent_middlewares
+            )
+            self._subagent_middlewares = self._merge_subagent_middleware_owners(
+                self._subagent_middlewares,
+                pending_middlewares,
+            )
+            raise
         except Exception as e:
+            pending_middlewares = await self._close_subagent_middleware_instances(
+                temporary_subagent_middlewares
+            )
+            self._subagent_middlewares = self._merge_subagent_middleware_owners(
+                self._subagent_middlewares,
+                pending_middlewares,
+            )
             logger.error(f"创建 Agent 失败: {e}")
-            raise e
+            raise
 
     async def process(
             self,
             message: str,
-            images: List[str] = None,
-            files: Optional[List[dict]] = None,
+            images: Optional[List[str]] = None,
+            files: Optional[List[dict[str, Any]]] = None,
             has_audio_input: bool = False,
     ) -> str:
         """
@@ -2061,9 +2172,12 @@ class MoviePilotAgent:
                 return confirmation_result
 
             # 获取历史消息
-            messages = list(memory_manager.get_agent_messages(
-                session_id=self.session_id, user_id=self.user_id
-            ))
+            messages = list(
+                await self._memory.async_get_agent_messages(
+                    session_id=self.session_id,
+                    user_id=self.user_id,
+                )
+            )
 
             # 构建结构化用户消息内容
             request_payload = {
@@ -2088,7 +2202,7 @@ class MoviePilotAgent:
                 content.append({"type": "image_url", "image_url": {"url": img}})
             messages.append(HumanMessage(content=content))
             await self.prepare_chat_title(message)
-            self._save_display_history_messages(
+            await self._save_display_history_messages(
                 [
                     self.build_display_message(
                         role="user",
@@ -2113,7 +2227,7 @@ class MoviePilotAgent:
             error_message = f"处理消息时发生错误: {str(e)}"
             logger.error(error_message)
             if not user_display_saved:
-                self._save_display_history_messages(
+                await self._save_display_history_messages(
                     [self.build_display_message(role="user", content=message)]
                 )
             if not self.should_dispatch_reply:
@@ -2226,6 +2340,7 @@ class MoviePilotAgent:
         """
         execution_success = False
         execution_error: Optional[str] = None
+        metric_started_at = time.perf_counter()
         self._agent_started_at = datetime.now()
         self._llm_runtime_config = None
         self._llm_provider_selection = {}
@@ -2353,10 +2468,10 @@ class MoviePilotAgent:
                     if hasattr(msg, "type") and msg.type == "ai" and msg.content:
                         display_text = LLMHelper.extract_text_content(msg.content).strip()
                         break
-            self._save_assistant_display_message_once(display_text)
+            await self._save_assistant_display_message_once(display_text)
 
             if self._should_persist_agent_chat():
-                memory_manager.save_agent_messages(
+                await self._memory.async_save_agent_messages(
                     session_id=self.session_id,
                     user_id=self.user_id,
                     messages=agent.get_state(agent_config).values.get("messages", []),
@@ -2365,11 +2480,11 @@ class MoviePilotAgent:
 
         except asyncio.CancelledError:
             logger.info(f"Agent执行被取消: session_id={self.session_id}")
-            self._compiled_agent_bundle = None
+            await self._invalidate_cached_agent()
             execution_error = "任务已取消"
             raise
         except Exception as e:
-            self._compiled_agent_bundle = None
+            await self._invalidate_cached_agent()
             execution_error = str(e)
             if self._messages_have_image_input(messages) and self._is_unsupported_image_input_error(e):
                 logger.warning(
@@ -2382,6 +2497,15 @@ class MoviePilotAgent:
             await self._dispatch_execution_notice(friendly_message)
             return friendly_message, {}
         finally:
+            selection = self._llm_provider_selection or {}
+            record_metric(
+                "agent.provider.duration",
+                time.perf_counter() - metric_started_at,
+                provider_type=_agent_provider_metric_type(
+                    selection.get("provider") or get_runtime_setting('LLM_PROVIDER')
+                ),
+                outcome="success" if execution_success else "error",
+            )
             self._send_agent_tokens_usage_event(
                 success=execution_success,
                 error=execution_error,
@@ -2395,730 +2519,40 @@ class MoviePilotAgent:
         发送 Agent 消息；后台任务不绑定原渠道，交由通知链广播。
         """
         broadcast = self.is_background
-        self._save_assistant_display_message_once(message)
+        rich_message = (
+            message
+            if not broadcast
+            and self.channel == NotificationChannel.Telegram.value
+            else None
+        )
+        await self._save_assistant_display_message_once(message)
         await AgentChain().async_post_message(
             Message(
                 channel=None if broadcast else self.channel,
                 source=None if broadcast else self.source,
                 mtype=MessageType.Agent,
                 userid=None if broadcast else self.user_id,
-                username=self.username or (settings.SUPERUSER if broadcast else None),
+                username=self.username or (get_runtime_setting('SUPERUSER') if broadcast else None),
                 original_message_id=None if broadcast else self.original_message_id,
                 original_chat_id=None if broadcast else self.original_chat_id,
                 title=title,
                 text=message,
+                rich_message=rich_message,
                 save_history=False,
             )
         )
 
-    async def cleanup(self):
+    async def cleanup(self) -> bool:
         """
-        清理智能体资源
+        清理智能体资源；detached 子代理未收敛时保留 owner 并返回 False。
         """
+        self.begin_shutdown()
+        if not await self._invalidate_cached_agent():
+            logger.error(
+                f"MoviePilot智能体仍有子代理 owner 未收敛: session_id={self.session_id}"
+            )
+            return False
         self._pending_secret_confirmation = None
         self.protected_output_callback = None
-        self._compiled_agent_bundle = None
         logger.info(f"MoviePilot智能体已清理: session_id={self.session_id}")
-
-
-@dataclass
-class _MessageTask:
-    """
-    待处理的消息任务
-    """
-
-    session_id: str
-    user_id: str
-    message: str
-    images: Optional[List[str]] = None
-    files: Optional[List[dict]] = None
-    has_audio_input: bool = False
-    channel: Optional[str] = None
-    source: Optional[str] = None
-    username: Optional[str] = None
-    is_channel_admin: Optional[bool] = None
-    original_message_id: Optional[str] = None
-    original_chat_id: Optional[str] = None
-    processing_status: Optional[dict] = None
-    reply_mode: ReplyMode = ReplyMode.DISPATCH
-    allow_message_tools: bool = True
-    output_callback: Optional[Callable[[str], None]] = None
-    protected_output_callback: Optional[Callable[[str], Optional[bool]]] = None
-    message_callback: Optional[Callable[[Any], None]] = None
-    agent_factory: Optional[Callable[..., MoviePilotAgent]] = None
-    agent_setup: Optional[Callable[[MoviePilotAgent], None]] = None
-    completion_future: Optional[asyncio.Future] = None
-
-
-class AgentManagerUnavailableError(RuntimeError):
-    """AgentManager 未运行或已开始关闭，不能再接收新任务。"""
-
-    code = "agent_manager_unavailable"
-
-
-class AgentManager:
-    """
-    AI智能体管理器
-    同一会话的消息按顺序排队处理，不同会话之间互不影响。
-    """
-
-    def __init__(self):
-        self.active_agents: Dict[str, MoviePilotAgent] = {}
-        # 每个会话的消息队列
-        self._session_queues: Dict[str, asyncio.Queue] = {}
-        # 每个会话的worker任务
-        self._session_workers: Dict[str, asyncio.Task] = {}
-        # 每个会话最后活动时间，用于回收空闲 Agent 实例
-        self._session_last_used: Dict[str, tuple[str, datetime]] = {}
-        self._idle_cleanup_task: Optional[asyncio.Task] = None
-        self._idle_session_ttl = timedelta(hours=24)
-        self._idle_cleanup_interval = 60 * 60
-        # 接收门禁与队列写入共用一把锁，确保关闭开始后不会再创建 worker。
-        self._lifecycle_lock = asyncio.Lock()
-        self._accepting_tasks = False
-
-    def get_session_status(self, session_id: str) -> dict[str, Any]:
-        """获取会话当前模型与 token 使用状态。"""
-        agent = self.active_agents.get(session_id)
-        if agent:
-            status = agent.get_session_status()
-        else:
-            status = _SessionUsageSnapshot(
-                model=settings.LLM_MODEL,
-                context_window_tokens=(
-                    settings.LLM_MAX_CONTEXT_TOKENS * 1000
-                    if settings.LLM_MAX_CONTEXT_TOKENS
-                    else None
-                ),
-            ).to_dict(session_id)
-
-        queue = self._session_queues.get(session_id)
-        status["pending_messages"] = queue.qsize() if queue else 0
-        status["is_processing"] = (
-                session_id in self._session_workers
-                and not self._session_workers[session_id].done()
-        )
-        return status
-
-    def matches_secret_confirmation(
-            self,
-            session_id: str,
-            user_id: str,
-            channel: Optional[str] = None,
-            source: Optional[str] = None,
-    ) -> bool:
-        """判断指定用户是否可继续当前会话的敏感设置确认。"""
-        agent = self.active_agents.get(session_id)
-        pending = agent._pending_secret_confirmation if agent else None
-        return bool(
-            agent
-            and pending
-            and str(agent.user_id) == str(user_id)
-            and (channel is None or pending.channel == str(channel))
-            and (source is None or pending.source == str(source))
-        )
-
-    async def initialize(self):
-        """
-        初始化管理器
-        """
-        async with self._lifecycle_lock:
-            if self._accepting_tasks:
-                return
-            memory_manager.initialize()
-            if not self._idle_cleanup_task or self._idle_cleanup_task.done():
-                self._idle_cleanup_task = asyncio.create_task(
-                    self._cleanup_idle_sessions()
-                )
-            self._accepting_tasks = True
-
-    async def close(self):
-        """
-        关闭管理器
-        """
-        async with self._lifecycle_lock:
-            # 门禁必须先关闭；锁内完成清理可阻止等待中的请求在收口期间重新入队。
-            self._accepting_tasks = False
-            if self._idle_cleanup_task:
-                self._idle_cleanup_task.cancel()
-                try:
-                    await self._idle_cleanup_task
-                except asyncio.CancelledError:
-                    pass
-                self._idle_cleanup_task = None
-            # 取消所有会话worker
-            for task in list(self._session_workers.values()):
-                task.cancel()
-            # 等待所有worker结束
-            for session_id, task in list(self._session_workers.items()):
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            self._session_workers.clear()
-            for queue in list(self._session_queues.values()):
-                self._discard_queued_messages(
-                    queue,
-                    error=AgentManagerUnavailableError("AgentManager 已关闭"),
-                )
-            self._session_queues.clear()
-            self._session_last_used.clear()
-            for agent in list(self.active_agents.values()):
-                await agent.cleanup()
-            self.active_agents.clear()
-            await memory_manager.close()
-
-    def _record_session_activity(self, session_id: str, user_id: str) -> None:
-        """
-        记录会话最近活动时间，供空闲会话清理任务判断是否可释放资源。
-        """
-        self._session_last_used[session_id] = (user_id, datetime.now())
-
-    def _is_session_busy(self, session_id: str) -> bool:
-        """
-        判断会话是否仍有正在执行的 worker 或待处理消息，避免误清理活跃会话。
-        """
-        worker = self._session_workers.get(session_id)
-        if worker and not worker.done():
-            return True
-        queue = self._session_queues.get(session_id)
-        return bool(queue and not queue.empty())
-
-    def is_session_busy(self, session_id: str) -> bool:
-        """
-        查询会话是否仍有正在执行或排队的任务。
-        """
-        return self._is_session_busy(session_id)
-
-    def _expired_idle_sessions(self) -> list[tuple[str, str]]:
-        """
-        收集已经超过空闲时间且当前不忙的会话。
-        """
-        expire_before = datetime.now() - self._idle_session_ttl
-        expired = []
-        for session_id, (user_id, last_used) in list(self._session_last_used.items()):
-            if last_used < expire_before and not self._is_session_busy(session_id):
-                expired.append((session_id, user_id))
-        return expired
-
-    async def _cleanup_idle_sessions(self) -> None:
-        """
-        周期性清理长时间没有新消息的 Agent 会话，避免长期运行后实例持续累积。
-        """
-        while True:
-            try:
-                await asyncio.sleep(self._idle_cleanup_interval)
-                for session_id, user_id in self._expired_idle_sessions():
-                    await self.clear_session(session_id=session_id, user_id=user_id)
-                    logger.info(f"已清理空闲Agent会话: session_id={session_id}")
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"清理空闲Agent会话失败: {e}")
-
-    async def process_message(
-            self,
-            session_id: str,
-            user_id: str,
-            message: str,
-            images: List[str] = None,
-            files: Optional[List[dict]] = None,
-            has_audio_input: bool = False,
-            channel: str = None,
-            source: str = None,
-            username: str = None,
-            is_channel_admin: Optional[bool] = None,
-            original_message_id: Optional[str] = None,
-            original_chat_id: Optional[str] = None,
-            reply_mode: ReplyMode = ReplyMode.DISPATCH,
-            allow_message_tools: bool = True,
-            output_callback: Optional[Callable[[str], None]] = None,
-            protected_output_callback: Optional[Callable[[str], Optional[bool]]] = None,
-            message_callback: Optional[Callable[[Any], None]] = None,
-            agent_factory: Optional[Callable[..., MoviePilotAgent]] = None,
-            agent_setup: Optional[Callable[[MoviePilotAgent], None]] = None,
-            wait_for_completion: bool = False,
-    ) -> str:
-        """
-        处理用户消息：将消息放入会话队列，按顺序依次处理。
-        同一会话的消息排队等待，不同会话之间互不影响。
-        """
-        completion_future = (
-            asyncio.get_running_loop().create_future() if wait_for_completion else None
-        )
-        task = _MessageTask(
-            session_id=session_id,
-            user_id=user_id,
-            message=message,
-            images=images,
-            files=files,
-            has_audio_input=has_audio_input,
-            channel=channel,
-            source=source,
-            username=username,
-            is_channel_admin=is_channel_admin,
-            original_message_id=original_message_id,
-            original_chat_id=original_chat_id,
-            reply_mode=reply_mode,
-            allow_message_tools=allow_message_tools,
-            output_callback=output_callback,
-            protected_output_callback=protected_output_callback,
-            message_callback=message_callback,
-            agent_factory=agent_factory,
-            agent_setup=agent_setup,
-            completion_future=completion_future,
-        )
-        async with self._lifecycle_lock:
-            if not self._accepting_tasks:
-                raise AgentManagerUnavailableError("AgentManager 未运行或已关闭")
-            self._record_session_activity(session_id, user_id)
-
-            # 获取或创建会话队列
-            if session_id not in self._session_queues:
-                self._session_queues[session_id] = asyncio.Queue()
-
-            queue = self._session_queues[session_id]
-            queue_size = queue.qsize()
-
-            # 如果队列中已有等待的消息，通知用户消息已排队
-            if queue_size > 0 or (
-                    session_id in self._session_workers
-                    and not self._session_workers[session_id].done()
-            ):
-                logger.info(
-                    f"会话 {session_id} 有任务正在处理，消息已排队等待 "
-                    f"(队列中待处理: {queue_size} 条)"
-                )
-
-            # 放入队列并创建 worker 与关闭门禁保持原子关系。
-            await queue.put(task)
-            if (
-                    session_id not in self._session_workers
-                    or self._session_workers[session_id].done()
-            ):
-                self._session_workers[session_id] = asyncio.create_task(
-                    self._session_worker(session_id)
-                )
-
-        if completion_future:
-            return await completion_future
-        return ""
-
-    async def _session_worker(self, session_id: str):
-        """
-        会话消息处理worker：从队列中逐条取出消息并处理。
-        处理完当前消息后才会处理下一条，确保同一会话的消息顺序执行。
-        """
-        queue = self._session_queues.get(session_id)
-        if not queue:
-            return
-
-        try:
-            while True:
-                try:
-                    # 等待消息，超时后自动退出worker
-                    task = await asyncio.wait_for(queue.get(), timeout=60.0)
-                except asyncio.TimeoutError:
-                    # 队列空闲超时，退出worker
-                    logger.debug(f"会话 {session_id} 的消息队列空闲，worker退出")
-                    break
-
-                try:
-                    await self._start_task_processing_status(task)
-                    result = await self._process_message_internal(task)
-                    if task.completion_future and not task.completion_future.done():
-                        task.completion_future.set_result(result)
-                except asyncio.CancelledError:
-                    if task.completion_future and not task.completion_future.done():
-                        if self._accepting_tasks:
-                            task.completion_future.cancel()
-                        else:
-                            task.completion_future.set_exception(
-                                AgentManagerUnavailableError("AgentManager 已关闭")
-                            )
-                    raise
-                except Exception as e:
-                    logger.error(f"处理会话 {session_id} 的消息失败: {e}")
-                    if task.completion_future and not task.completion_future.done():
-                        task.completion_future.set_exception(e)
-                finally:
-                    await self._finish_task_processing_status(task)
-                    queue.task_done()
-
-        except asyncio.CancelledError:
-            logger.info(f"会话 {session_id} 的worker被取消")
-        finally:
-            # 清理已完成的worker记录
-            current_worker = asyncio.current_task()
-            if self._session_workers.get(session_id) is current_worker:
-                self._session_workers.pop(session_id, None)  # noqa
-            # 如果队列为空，清理队列
-            if (
-                    self._session_queues.get(session_id) is queue
-                    and queue.empty()
-            ):
-                self._session_queues.pop(session_id, None)
-
-    @staticmethod
-    def _discard_queued_messages(
-            queue: asyncio.Queue,
-            error: Optional[Exception] = None,
-    ) -> None:
-        """丢弃会话队列时同步结束等待任务完成的调用方。"""
-        while not queue.empty():
-            try:
-                task = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            if task.completion_future and not task.completion_future.done():
-                if error is None:
-                    task.completion_future.cancel()
-                else:
-                    task.completion_future.set_exception(error)
-            queue.task_done()
-
-    @staticmethod
-    async def _start_task_processing_status(task: _MessageTask) -> None:
-        """
-        在 Agent worker 真正开始处理消息时启动渠道处理状态。
-        """
-        if task.processing_status:
-            return
-        task.processing_status = await _async_start_processing_status(task)
-
-    @staticmethod
-    async def _finish_task_processing_status(task: _MessageTask) -> None:
-        """
-        在 Agent worker 完成或异常后结束本条消息的渠道处理状态。
-        """
-        await _async_finish_processing_status(task.processing_status, task.user_id)
-        task.processing_status = None
-
-    async def _process_message_internal(self, task: _MessageTask):
-        """
-        实际处理单条消息
-        """
-        session_id = task.session_id
-        existing_agent = self.active_agents.get(session_id)
-        if (
-                existing_agent
-                and task.agent_factory
-                and isinstance(task.agent_factory, type)
-                and not isinstance(existing_agent, task.agent_factory)
-        ):
-            await existing_agent.cleanup()
-            self.active_agents.pop(session_id, None)
-
-        if session_id not in self.active_agents:
-            logger.info(
-                f"创建新的AI智能体实例，session_id: {session_id}, user_id: {task.user_id}"
-            )
-            agent_factory = task.agent_factory or MoviePilotAgent
-            agent_kwargs = {
-                "session_id": session_id,
-                "user_id": task.user_id,
-                "channel": task.channel,
-                "source": task.source,
-                "username": task.username,
-                "is_channel_admin": task.is_channel_admin,
-                "original_message_id": task.original_message_id,
-                "original_chat_id": task.original_chat_id,
-                "replay_mode": task.reply_mode,
-                "allow_message_tools": task.allow_message_tools,
-                "output_callback": task.output_callback,
-                "protected_output_callback": task.protected_output_callback,
-            }
-            if task.message_callback is not None and task.agent_factory:
-                agent_kwargs["message_callback"] = task.message_callback
-            agent = agent_factory(**agent_kwargs)
-            self.active_agents[session_id] = agent
-        else:
-            agent = self.active_agents[session_id]
-            agent.user_id = task.user_id
-            # 每条队列任务都携带完整消息上下文，None 也必须覆盖，避免后台任务
-            # 复用会话 Agent 时继续沿用上一条入站消息的渠道。
-            agent.channel = task.channel
-            agent.source = task.source
-            agent.username = task.username
-            agent.is_channel_admin = task.is_channel_admin
-            agent.original_message_id = task.original_message_id
-            agent.original_chat_id = task.original_chat_id
-            agent.reply_mode = task.reply_mode
-            agent.allow_message_tools = task.allow_message_tools
-            if hasattr(agent, "set_output_callback"):
-                agent.set_output_callback(task.output_callback)
-            else:
-                agent.output_callback = task.output_callback
-            agent.set_protected_output_callback(task.protected_output_callback)
-            if task.message_callback is not None and hasattr(agent, "set_message_callback"):
-                agent.set_message_callback(task.message_callback)
-
-        if task.agent_setup is not None:
-            task.agent_setup(agent)
-
-        process_kwargs = {
-            "images": task.images,
-            "files": task.files,
-        }
-        if task.has_audio_input:
-            process_kwargs["has_audio_input"] = True
-        return await agent.process(task.message, **process_kwargs)
-
-    async def stop_current_task(self, session_id: str):
-        """
-        应急停止当前正在执行的Agent推理任务，但保留会话和记忆。
-        与 clear_session 不同，此方法不会销毁Agent实例或清除记忆，
-        用户可以在停止后继续对话。
-        """
-        async with self._lifecycle_lock:
-            return await self._stop_current_task_locked(session_id)
-
-    async def _stop_current_task_locked(self, session_id: str):
-        """在 lifecycle 互斥域内停止会话 worker。"""
-        stopped = False
-
-        worker = self._session_workers.get(session_id)
-        queue = self._session_queues.get(session_id)
-        if queue and self._session_queues.get(session_id) is queue:
-            self._session_queues.pop(session_id, None)
-
-        # 先摘下旧队列再等待 worker 退出；lifecycle 锁保证清理期间不会并发建立新队列。
-        if worker:
-            worker.cancel()
-        if queue:
-            self._discard_queued_messages(queue)
-        if worker:
-            try:
-                await worker
-            except asyncio.CancelledError:
-                pass
-            if self._session_workers.get(session_id) is worker:
-                self._session_workers.pop(session_id, None)  # noqa
-            stopped = True
-        if queue:
-            stopped = True
-
-        new_queue = self._session_queues.get(session_id)
-        current_worker = self._session_workers.get(session_id)
-        if (
-                new_queue
-                and not new_queue.empty()
-                and (not current_worker or current_worker.done())
-        ):
-            self._session_workers[session_id] = asyncio.create_task(
-                self._session_worker(session_id)
-            )
-
-        if stopped:
-            logger.info(f"会话 {session_id} 的Agent推理已应急停止")
-        else:
-            logger.debug(f"会话 {session_id} 没有正在执行的Agent任务")
-
-        return stopped
-
-    async def clear_session(self, session_id: str, user_id: str):
-        """
-        清空会话
-        """
-        async with self._lifecycle_lock:
-            await self._clear_session_locked(session_id=session_id, user_id=user_id)
-
-    async def _clear_session_locked(self, session_id: str, user_id: str) -> None:
-        """在 lifecycle 互斥域内释放会话、Agent 与记忆。"""
-        self._session_last_used.pop(session_id, None)
-        # 取消该会话的worker
-        if session_id in self._session_workers:
-            self._session_workers[session_id].cancel()
-            try:
-                await self._session_workers[session_id]
-            except asyncio.CancelledError:
-                pass
-            self._session_workers.pop(session_id, None)  # noqa
-
-        # 清理队列时同步结束未执行请求，避免 wait_for_completion 调用方永久等待。
-        queue = self._session_queues.pop(session_id, None)
-        if queue:
-            self._discard_queued_messages(queue)
-
-        # 清理agent
-        if session_id in self.active_agents:
-            agent = self.active_agents[session_id]
-            await agent.cleanup()
-            del self.active_agents[session_id]
-            memory_manager.clear_memory(session_id, user_id)
-            logger.info(f"会话 {session_id} 的记忆已清空")
-
-    async def run_background_prompt(
-            self,
-            message: str,
-            session_prefix: str = "__agent_background",
-            output_callback: Optional[Callable[[str], None]] = None,
-            reply_mode: ReplyMode = ReplyMode.CAPTURE_ONLY,
-            allow_message_tools: Optional[bool] = None,
-    ) -> None:
-        """
-        以独立后台会话执行一段 prompt。
-        """
-        session_id = f"{session_prefix}_{uuid.uuid4().hex[:8]}__"
-        user_id = SYSTEM_INTERNAL_USER_ID
-
-        if reply_mode == ReplyMode.CAPTURE_ONLY:
-            allow_message_tools = False
-        elif allow_message_tools is None:
-            allow_message_tools = True
-
-        try:
-            await self.process_message(
-                session_id=session_id,
-                user_id=user_id,
-                message=message,
-                channel=None,
-                source=None,
-                username=settings.SUPERUSER,
-                reply_mode=reply_mode,
-                output_callback=output_callback,
-                allow_message_tools=allow_message_tools,
-                wait_for_completion=True,
-            )
-        finally:
-            await self.clear_session(session_id=session_id, user_id=user_id)
-
-    async def execute_scheduled_task(
-            self,
-            task_id: int,
-            trigger_source: str = "scheduled",
-    ) -> tuple[bool, str]:
-        """
-        按持久化上下文唤醒 Agent 执行自主定时任务并向用户回传结果。
-
-        :param task_id: Agent 定时任务 ID
-        :param trigger_source: 触发入口，scheduled-自动调度，manual-显式立即执行
-        :return: 执行是否成功及结果摘要
-        """
-        if not settings.AI_AGENT_ENABLE:
-            return False, "AI Agent 未启用"
-        oper = AgentTaskOper()
-        task = oper.get(task_id)
-        if not task or not task.enabled:
-            return False, "Agent 定时任务不存在或已停用"
-        run = oper.begin_run(task_id=task_id, trigger_source=trigger_source)
-        if not run:
-            return False, "Agent 定时任务当前不可执行"
-
-        trigger_description = (
-            "已手动触发" if run.trigger_source == "manual" else "已按计划触发"
-        )
-        task_message = (
-            f"定时任务{trigger_description}。请立即完成下面的任务，不要只确认收到，"
-            f"也不要重复创建同一个定时任务。\n\n"
-            f"任务名称：{run.name}\n"
-            f"任务内容：{run.content}\n\n"
-            "完成后请直接向用户发送消息报告本次执行结果；如果无法完成，也需发送消息说明原因。"
-        )
-        success = True
-        result = ""
-        notification_username = run.username or settings.SUPERUSER
-        try:
-            result = await self.process_message(
-                session_id=run.session_id,
-                user_id=run.user_id,
-                message=task_message,
-                channel=None,
-                source=None,
-                username=notification_username,
-                original_chat_id=None,
-                reply_mode=ReplyMode.DISPATCH,
-                allow_message_tools=True,
-                wait_for_completion=True,
-            )
-            result_text = str(result or "").strip()
-            success = not result_text.startswith(
-                (AGENT_EXECUTION_ERROR_PREFIX, "处理消息时发生错误")
-            )
-        except asyncio.CancelledError:
-            success = False
-            result = "Agent 定时任务已取消"
-            raise
-        except Exception as err:
-            success = False
-            result = f"Agent 定时任务执行失败：{str(err)}"
-            logger.error(f"Agent 定时任务 {task_id} 执行失败: {str(err)}")
-            await AgentChain().async_post_message(
-                Message(
-                    mtype=MessageType.Agent,
-                    username=notification_username,
-                    title=f"定时任务执行失败：{run.name}",
-                    text=result,
-                    save_history=False,
-                )
-            )
-        finally:
-            oper.finish_run(
-                run_id=run.run_id,
-                success=success,
-                result=str(result or ""),
-                disable_date_task=run.trigger_type == "date",
-            )
-
-        return success, str(result or "任务执行完成")
-
-    @staticmethod
-    def _build_heartbeat_prompt() -> str:
-        """使用程序内置 System Tasks 定义构建心跳任务提示词。"""
-        return prompt_manager.render_system_task_message("heartbeat")
-
-    async def heartbeat_check_jobs(self):
-        """
-        心跳唤醒：检查并执行待处理的定时任务（Jobs）。
-        由定时调度器周期性调用，每次使用独立的会话避免上下文干扰。
-        """
-        try:
-            active_jobs = filter_active_jobs(
-                await load_jobs_metadata([str(agent_runtime_manager.jobs_dir)])
-            )
-            # 先在本地判断是否存在活跃任务。没有任务时直接短路，避免一次完整
-            # 的后台 Agent/LLM 空调用。
-            if not active_jobs:
-                logger.info("智能体心跳唤醒：没有活跃任务，跳过模型调用")
-                return
-
-            # 每次使用唯一的 session_id，避免共享上下文
-            session_id = f"{HEARTBEAT_SESSION_PREFIX}{uuid.uuid4().hex[:12]}__"
-            user_id = SYSTEM_INTERNAL_USER_ID
-
-            logger.info("智能体心跳唤醒：开始检查待处理任务...")
-            heartbeat_message = self._build_heartbeat_prompt()
-
-            await self.process_message(
-                session_id=session_id,
-                user_id=user_id,
-                message=heartbeat_message,
-                channel=None,
-                source=None,
-                username=settings.SUPERUSER,
-                reply_mode=ReplyMode.CAPTURE_ONLY,
-                allow_message_tools=True,
-            )
-
-            # 等待消息队列处理完成
-            if session_id in self._session_queues:
-                await self._session_queues[session_id].join()
-
-            # 等待worker结束
-            if session_id in self._session_workers:
-                try:
-                    await self._session_workers[session_id]
-                except asyncio.CancelledError:
-                    pass
-
-            logger.info("智能体心跳唤醒：任务检查完成")
-
-            # 心跳会话用完即弃，清理资源
-            await self.clear_session(session_id, user_id)
-
-        except Exception as e:
-            logger.error(f"智能体心跳唤醒失败: {e}")
-
-
-# 全局智能体管理器实例
-agent_manager = AgentManager()
+        return True

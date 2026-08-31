@@ -6,10 +6,10 @@
 
 import json
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, ContextManager, Dict, Optional, Protocol
 
-from app.runtime.config import settings
+from app.application.configuration import get_chain_runtime_config_snapshot
 from app.runtime.log import logger
 
 
@@ -26,6 +26,11 @@ class CleanupPolicy:
     site_userdata_days: int
     transfer_history_days: int
     download_failure_days: int
+    subscribe_history_days: int
+    agent_chat_days: int
+    agent_task_run_days: int
+    outbox_completed_days: int
+    outbox_dead_days: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +48,10 @@ class CleanupRepository(Protocol):
 
     def session(self) -> ContextManager[Any]:
         """返回一次维护运行共用的数据库会话上下文。"""
+        ...
+
+    def unit_of_work(self, db: Any) -> "CleanupUnitOfWork":
+        """返回绑定到当前维护会话的事务边界。"""
         ...
 
     def delete_messages(self, db: Any, cutoff: str, limit: int) -> int:
@@ -67,6 +76,38 @@ class CleanupRepository(Protocol):
 
     def delete_download_failures(self, db: Any, cutoff: str, limit: int) -> int:
         """删除已经过期的下载失败冷却记录。"""
+        ...
+
+    def delete_subscribe_history(self, db: Any, cutoff: str, limit: int) -> int:
+        """删除早于截止时间的订阅历史。"""
+        ...
+
+    def delete_agent_chats(self, db: Any, cutoff: str, limit: int) -> int:
+        """删除早于截止时间且未被任务引用的 Agent 会话。"""
+        ...
+
+    def delete_agent_task_runs(self, db: Any, cutoff: str, limit: int) -> int:
+        """删除早于截止时间且不再承担恢复语义的 Agent 运行历史。"""
+        ...
+
+    def delete_outbox_completed(self, db: Any, cutoff: str, limit: int) -> int:
+        """删除早于截止时间的 Outbox 已完成记录。"""
+        ...
+
+    def delete_outbox_dead(self, db: Any, cutoff: str, limit: int) -> int:
+        """删除早于截止时间的 Outbox 死信记录。"""
+        ...
+
+
+class CleanupUnitOfWork(Protocol):
+    """数据维护每一批删除所需的最小事务能力。"""
+
+    def commit(self) -> None:
+        """提交当前批次。"""
+        ...
+
+    def rollback(self) -> None:
+        """回滚失败批次并恢复会话可用状态。"""
         ...
 
 
@@ -175,16 +216,19 @@ class DataCleanupService:
                     value=plan_index / total_plans * 100,
                     text=f"正在清理数据表 {plan.name} ...",
                 )
+            unit_of_work = self._repository.unit_of_work(db)
             table_report = self._cleanup_in_batches(
                 db=db,
                 table_name=plan.name,
                 delete_batch=plan.delete_batch,
+                unit_of_work=unit_of_work,
             )
             table_report["cutoff"] = plan.cutoff
             table_report["retention_days"] = plan.retention_days
             report["tables"][plan.name] = table_report
             report["total_deleted"] += table_report["deleted"]
         except Exception as err:
+            self._repository.unit_of_work(db).rollback()
             errors.append(f"{plan.name}: {str(err)}")
             logger.error(f"数据表 {plan.name} 清理失败：{str(err)}")
             report["tables"][plan.name] = {
@@ -229,6 +273,29 @@ class DataCleanupService:
             started_at,
             policy.download_failure_days,
             "%Y-%m-%d %H:%M:%S",
+        )
+        subscribe_history_cutoff = self._cutoff(
+            started_at,
+            policy.subscribe_history_days,
+            "%Y-%m-%d %H:%M:%S",
+        )
+        agent_chat_cutoff = self._cutoff(
+            started_at,
+            policy.agent_chat_days,
+            "%Y-%m-%d %H:%M:%S",
+        )
+        agent_task_run_cutoff = self._cutoff(
+            started_at,
+            policy.agent_task_run_days,
+            "%Y-%m-%d %H:%M:%S",
+        )
+        outbox_completed_cutoff = self._outbox_cutoff(
+            started_at,
+            policy.outbox_completed_days,
+        )
+        outbox_dead_cutoff = self._outbox_cutoff(
+            started_at,
+            policy.outbox_dead_days,
         )
         return [
             CleanupPlan(
@@ -277,14 +344,55 @@ class DataCleanupService:
                     db, download_failure_cutoff, batch_size
                 ),
             ),
+            CleanupPlan(
+                "subscribehistory",
+                policy.subscribe_history_days,
+                subscribe_history_cutoff,
+                lambda db: self._repository.delete_subscribe_history(
+                    db, subscribe_history_cutoff, batch_size
+                ),
+            ),
+            CleanupPlan(
+                "agentchat",
+                policy.agent_chat_days,
+                agent_chat_cutoff,
+                lambda db: self._repository.delete_agent_chats(
+                    db, agent_chat_cutoff, batch_size
+                ),
+            ),
+            CleanupPlan(
+                "agenttaskrun",
+                policy.agent_task_run_days,
+                agent_task_run_cutoff,
+                lambda db: self._repository.delete_agent_task_runs(
+                    db, agent_task_run_cutoff, batch_size
+                ),
+            ),
+            CleanupPlan(
+                "outbox_completed",
+                policy.outbox_completed_days,
+                outbox_completed_cutoff,
+                lambda db: self._repository.delete_outbox_completed(
+                    db, outbox_completed_cutoff, batch_size
+                ),
+            ),
+            CleanupPlan(
+                "outbox_dead",
+                policy.outbox_dead_days,
+                outbox_dead_cutoff,
+                lambda db: self._repository.delete_outbox_dead(
+                    db, outbox_dead_cutoff, batch_size
+                ),
+            ),
         ]
 
-    @staticmethod
     def _cleanup_in_batches(
+        self,
         *,
         db: Any,
         table_name: str,
         delete_batch: Callable[[Any], int],
+        unit_of_work: CleanupUnitOfWork,
     ) -> Dict[str, int]:
         """循环执行单表分批删除，直到持久化端口返回零。"""
         total_deleted = 0
@@ -293,6 +401,7 @@ class DataCleanupService:
             deleted = delete_batch(db) or 0
             if deleted <= 0:
                 break
+            unit_of_work.commit()
             batches += 1
             total_deleted += deleted
             logger.info(
@@ -305,41 +414,36 @@ class DataCleanupService:
         """按兼容格式计算一个清理截止时间。"""
         return (started_at - timedelta(days=retention_days)).strftime(pattern)
 
+    @staticmethod
+    def _outbox_cutoff(started_at: datetime, retention_days: int) -> str:
+        """按 Outbox 的 UTC ISO 格式生成可排序截止时间。"""
+        aware_started_at = (
+            started_at.astimezone()
+            if started_at.tzinfo is None
+            else started_at
+        )
+        return (
+            aware_started_at.astimezone(timezone.utc)
+            - timedelta(days=retention_days)
+        ).isoformat()
+
 
 def read_cleanup_policy() -> CleanupPolicy:
     """读取并规范化当前数据清理配置，单次运行期间保持快照一致。"""
+    config = get_chain_runtime_config_snapshot()
     return CleanupPolicy(
-        enabled=bool(settings.DATA_CLEANUP_ENABLE),
-        message_days=_normalize_days(settings.DATA_CLEANUP_MESSAGE_DAYS),
-        download_history_days=_normalize_days(
-            settings.DATA_CLEANUP_DOWNLOAD_HISTORY_DAYS
-        ),
-        site_userdata_days=_normalize_days(settings.DATA_CLEANUP_SITE_USERDATA_DAYS),
-        transfer_history_days=_normalize_days(
-            settings.DATA_CLEANUP_TRANSFER_HISTORY_DAYS
-        ),
-        download_failure_days=_normalize_days(
-            settings.DATA_CLEANUP_DOWNLOAD_FAILURE_DAYS
-        ),
+        enabled=bool(config.data_cleanup_enable),
+        message_days=_normalize_days(config.data_cleanup_message_days),
+        download_history_days=_normalize_days(config.data_cleanup_download_history_days),
+        site_userdata_days=_normalize_days(config.data_cleanup_site_userdata_days),
+        transfer_history_days=_normalize_days(config.data_cleanup_transfer_history_days),
+        download_failure_days=_normalize_days(config.data_cleanup_download_failure_days),
+        subscribe_history_days=_normalize_days(config.data_cleanup_subscribe_history_days),
+        agent_chat_days=_normalize_days(config.data_cleanup_agent_chat_days),
+        agent_task_run_days=_normalize_days(config.data_cleanup_agent_task_run_days),
+        outbox_completed_days=_normalize_days(config.data_cleanup_outbox_completed_days),
+        outbox_dead_days=_normalize_days(config.data_cleanup_outbox_dead_days),
     )
-
-
-def build_cleanup_service() -> DataCleanupService:
-    """返回启动组合根登记的清理服务。"""
-    if _configured_cleanup_service_factory is None:
-        raise RuntimeError("数据清理服务尚未配置")
-    return _configured_cleanup_service_factory()
-
-
-_configured_cleanup_service_factory: Callable[[], DataCleanupService] | None = None
-
-
-def configure_cleanup_service_factory(
-    factory: Callable[[], DataCleanupService],
-) -> None:
-    """由启动组合根登记数据清理服务工厂。"""
-    global _configured_cleanup_service_factory
-    _configured_cleanup_service_factory = factory
 
 
 def _normalize_days(retention_days: Any) -> int:

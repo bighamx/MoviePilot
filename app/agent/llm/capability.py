@@ -12,7 +12,9 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
-from app.runtime.config import settings
+from app.application.notification import get_notification_configs
+from app.runtime.settings import get_runtime_setting
+
 from app.runtime.log import logger
 from app.adapters.network.http import RequestUtils
 
@@ -58,11 +60,11 @@ class OpenAIAudioProvider(AudioCapabilityProvider):
 
     @staticmethod
     def _input_credentials() -> tuple[Optional[str], Optional[str]]:
-        return settings.AUDIO_INPUT_API_KEY, settings.AUDIO_INPUT_BASE_URL
+        return get_runtime_setting('AUDIO_INPUT_API_KEY'), get_runtime_setting('AUDIO_INPUT_BASE_URL')
 
     @staticmethod
     def _output_credentials() -> tuple[Optional[str], Optional[str]]:
-        return settings.AUDIO_OUTPUT_API_KEY, settings.AUDIO_OUTPUT_BASE_URL
+        return get_runtime_setting('AUDIO_OUTPUT_API_KEY'), get_runtime_setting('AUDIO_OUTPUT_BASE_URL')
 
     def is_available_for_audio_input(self) -> bool:
         api_key, _ = self._input_credentials()
@@ -86,9 +88,9 @@ class OpenAIAudioProvider(AudioCapabilityProvider):
             audio_file = BytesIO(content)
             audio_file.name = filename
             response = client.audio.transcriptions.create(
-                model=settings.AUDIO_INPUT_MODEL,
+                model=get_runtime_setting('AUDIO_INPUT_MODEL'),
                 file=audio_file,
-                language=settings.AUDIO_INPUT_LANGUAGE or "zh",
+                language=get_runtime_setting('AUDIO_INPUT_LANGUAGE') or "zh",
                 response_format="verbose_json",
             )
             text = getattr(response, "text", None)
@@ -106,12 +108,12 @@ class OpenAIAudioProvider(AudioCapabilityProvider):
             if not api_key:
                 raise ValueError("音频输出 provider 未配置 API Key")
             client = self._build_client(api_key=api_key, base_url=base_url)
-            voice_dir = settings.TEMP_PATH / "voice"
+            voice_dir = get_runtime_setting('TEMP_PATH') / "voice"
             voice_dir.mkdir(parents=True, exist_ok=True)
             output_path = voice_dir / f"{uuid4().hex}.opus"
             response = client.audio.speech.create(
-                model=settings.AUDIO_OUTPUT_MODEL,
-                voice=settings.AUDIO_OUTPUT_VOICE,
+                model=get_runtime_setting('AUDIO_OUTPUT_MODEL'),
+                voice=get_runtime_setting('AUDIO_OUTPUT_VOICE'),
                 input=text,
                 response_format="opus",
             )
@@ -160,22 +162,22 @@ class OpenAIChatAudioProvider(AudioCapabilityProvider):
 
     @staticmethod
     def _input_credentials() -> tuple[Optional[str], Optional[str]]:
-        return settings.AUDIO_INPUT_API_KEY, settings.AUDIO_INPUT_BASE_URL
+        return get_runtime_setting('AUDIO_INPUT_API_KEY'), get_runtime_setting('AUDIO_INPUT_BASE_URL')
 
     @staticmethod
     def _output_credentials() -> tuple[Optional[str], Optional[str]]:
-        return settings.AUDIO_OUTPUT_API_KEY, settings.AUDIO_OUTPUT_BASE_URL
+        return get_runtime_setting('AUDIO_OUTPUT_API_KEY'), get_runtime_setting('AUDIO_OUTPUT_BASE_URL')
 
     def _normalize_stt_model(self) -> str:
         return self._normalize_model(
-            model=settings.AUDIO_INPUT_MODEL,
+            model=get_runtime_setting('AUDIO_INPUT_MODEL'),
             supported_models=self.SUPPORTED_STT_MODELS,
             default_model=self.DEFAULT_STT_MODEL,
         )
 
     def _normalize_tts_model(self) -> str:
         return self._normalize_model(
-            model=settings.AUDIO_OUTPUT_MODEL,
+            model=get_runtime_setting('AUDIO_OUTPUT_MODEL'),
             supported_models=self.SUPPORTED_TTS_MODELS,
             default_model=self.DEFAULT_TTS_MODEL,
         )
@@ -265,7 +267,7 @@ class OpenAIChatAudioProvider(AudioCapabilityProvider):
             return None
 
         suffix = Path(filename or "").suffix.lower() or ".audio"
-        voice_dir = settings.TEMP_PATH / "voice"
+        voice_dir = get_runtime_setting('TEMP_PATH') / "voice"
         voice_dir.mkdir(parents=True, exist_ok=True)
         input_path = voice_dir / f"{uuid4().hex}{suffix}"
         output_path = input_path.with_suffix(self.TRANSCODED_STT_SUFFIX)
@@ -388,7 +390,7 @@ class OpenAIChatAudioProvider(AudioCapabilityProvider):
             if not normalized_audio:
                 return None
             content, filename = normalized_audio
-            language = (settings.AUDIO_INPUT_LANGUAGE or "").strip()
+            language = (get_runtime_setting('AUDIO_INPUT_LANGUAGE') or "").strip()
             prompt = "请将这段音频完整转写为文字，只输出转写结果，不要添加解释。"
             if language:
                 prompt += f"音频主要语言是 {language}。"
@@ -423,7 +425,7 @@ class OpenAIChatAudioProvider(AudioCapabilityProvider):
             logger.error(
                 "%s TTS 当前不支持该模型或模型未配置: %s",
                 self.DISPLAY_NAME,
-                settings.AUDIO_OUTPUT_MODEL,
+                get_runtime_setting('AUDIO_OUTPUT_MODEL'),
             )
             return None
 
@@ -432,7 +434,7 @@ class OpenAIChatAudioProvider(AudioCapabilityProvider):
             if not api_key:
                 raise ValueError("音频输出 provider 未配置 API Key")
             client = self._build_client(api_key=api_key, base_url=base_url)
-            voice_dir = settings.TEMP_PATH / "voice"
+            voice_dir = get_runtime_setting('TEMP_PATH') / "voice"
             voice_dir.mkdir(parents=True, exist_ok=True)
             wav_path = voice_dir / f"{uuid4().hex}.wav"
             request = {
@@ -445,7 +447,7 @@ class OpenAIChatAudioProvider(AudioCapabilityProvider):
                 ],
                 "audio": {
                     "format": self.AUDIO_RESPONSE_FORMAT,
-                    "voice": settings.AUDIO_OUTPUT_VOICE or self.DEFAULT_VOICE,
+                    "voice": get_runtime_setting('AUDIO_OUTPUT_VOICE') or self.DEFAULT_VOICE,
                 },
             }
             if self.INCLUDE_AUDIO_MODALITIES:
@@ -484,7 +486,7 @@ class MiMoAudioProvider(OpenAIChatAudioProvider):
     )
 
     def _normalize_tts_model(self) -> str:
-        model = (settings.AUDIO_OUTPUT_MODEL or "").strip().lower()
+        model = (get_runtime_setting('AUDIO_OUTPUT_MODEL') or "").strip().lower()
         if not model or not model.startswith("mimo-"):
             return self.DEFAULT_TTS_MODEL
         return model
@@ -543,21 +545,21 @@ class MiniMaxAudioProvider(OpenAIChatAudioProvider):
 
     def _normalize_stt_model(self) -> str:
         """将非 MiniMax 的默认转写模型名兜底为 MiniMax 对话模型。"""
-        model = (settings.AUDIO_INPUT_MODEL or "").strip()
+        model = (get_runtime_setting('AUDIO_INPUT_MODEL') or "").strip()
         if not model or model.lower().startswith(("gpt-", "mimo-")):
             return self.DEFAULT_STT_MODEL
         return model
 
     def _normalize_tts_model(self) -> str:
         """将非 MiniMax 语音模型兜底为官方 T2A 模型。"""
-        model = (settings.AUDIO_OUTPUT_MODEL or "").strip().lower()
+        model = (get_runtime_setting('AUDIO_OUTPUT_MODEL') or "").strip().lower()
         if model in self.SUPPORTED_TTS_MODELS:
             return model
         return self.DEFAULT_TTS_MODEL
 
     def _normalize_voice_id(self) -> str:
         """将其他 provider 的默认音色兜底为 MiniMax 中文系统音色。"""
-        voice_id = (settings.AUDIO_OUTPUT_VOICE or "").strip()
+        voice_id = (get_runtime_setting('AUDIO_OUTPUT_VOICE') or "").strip()
         if not voice_id or voice_id in {"alloy", "mimo_default"}:
             return self.DEFAULT_VOICE
         return voice_id
@@ -596,7 +598,7 @@ class MiniMaxAudioProvider(OpenAIChatAudioProvider):
                     "Content-Type": "application/json",
                     "Accept": "application/json",
                 },
-                proxies=settings.PROXY or {},
+                proxies=get_runtime_setting('PROXY') or {},
                 timeout=60,
             ).post_res(
                 url=self._build_t2a_url(base_url),
@@ -634,7 +636,7 @@ class MiniMaxAudioProvider(OpenAIChatAudioProvider):
             if not audio_data:
                 raise ValueError("MiniMax T2A 响应中没有音频数据")
 
-            voice_dir = settings.TEMP_PATH / "voice"
+            voice_dir = get_runtime_setting('TEMP_PATH') / "voice"
             voice_dir.mkdir(parents=True, exist_ok=True)
             output_path = voice_dir / f"{uuid4().hex}.opus"
             output_path.write_bytes(self._decode_audio_payload(audio_data))
@@ -678,9 +680,9 @@ class AgentCapabilityManager:
     @classmethod
     def get_audio_provider(cls, mode: str) -> Optional[AudioCapabilityProvider]:
         provider_name = cls._normalize_provider_name(
-            settings.AUDIO_INPUT_PROVIDER
+            get_runtime_setting('AUDIO_INPUT_PROVIDER')
             if (mode or "").lower() == "input"
-            else settings.AUDIO_OUTPUT_PROVIDER
+            else get_runtime_setting('AUDIO_OUTPUT_PROVIDER')
         )
         provider = cls._audio_providers.get(provider_name)
         if provider:
@@ -698,12 +700,12 @@ class AgentCapabilityManager:
     @staticmethod
     def supports_audio_input() -> bool:
         """当前 Agent 是否启用音频输入能力。"""
-        return bool(settings.LLM_SUPPORT_AUDIO_INPUT)
+        return bool(get_runtime_setting('LLM_SUPPORT_AUDIO_INPUT'))
 
     @staticmethod
     def supports_audio_output() -> bool:
         """当前 Agent 是否启用音频输出能力。"""
-        return bool(settings.LLM_SUPPORT_AUDIO_OUTPUT)
+        return bool(get_runtime_setting('LLM_SUPPORT_AUDIO_OUTPUT'))
 
     @classmethod
     def is_audio_input_available(cls) -> bool:
@@ -799,9 +801,7 @@ class AgentCapabilityManager:
         if not source:
             return False
 
-        from app.runtime.extensions.service_config import ServiceConfigHelper
-
-        for config in ServiceConfigHelper.get_notification_configs():
+        for config in get_notification_configs(include_disabled=True):
             if config.name != source:
                 continue
             return (config.config or {}).get("WECHAT_MODE", "app") != "bot"

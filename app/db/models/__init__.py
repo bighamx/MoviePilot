@@ -15,8 +15,17 @@ _MODEL_EXPORTS = {
     "DownloadHistory": ("app.db.models.downloadhistory", "DownloadHistory"),
     "MediaServerItem": ("app.db.models.mediaserver", "MediaServerItem"),
     "Message": ("app.db.models.message", "Message"),
+    "OutboxMessage": ("app.db.models.outbox", "OutboxMessage"),
     "PassKey": ("app.db.models.passkey", "PassKey"),
     "PluginData": ("app.db.models.plugindata", "PluginData"),
+    "PluginInstallation": (
+        "app.db.models.plugininstallation",
+        "PluginInstallation",
+    ),
+    "PluginIdentity": (
+        "app.db.models.pluginidentity",
+        "PluginIdentity",
+    ),
     "Site": ("app.db.models.site", "Site"),
     "SiteIcon": ("app.db.models.siteicon", "SiteIcon"),
     "SiteStatistic": ("app.db.models.sitestatistic", "SiteStatistic"),
@@ -28,6 +37,14 @@ _MODEL_EXPORTS = {
     ),
     "SystemConfig": ("app.db.models.systemconfig", "SystemConfig"),
     "TransferHistory": ("app.db.models.transferhistory", "TransferHistory"),
+    "TransferExecutionStep": (
+        "app.db.models.transferexecutionstep",
+        "TransferExecutionStep",
+    ),
+    "TransferSettlementReceipt": (
+        "app.db.models.transfersettlementreceipt",
+        "TransferSettlementReceipt",
+    ),
     "TransferPending": ("app.db.models.transferpending", "TransferPending"),
     "User": ("app.db.models.user", "User"),
     "UserConfig": ("app.db.models.userconfig", "UserConfig"),

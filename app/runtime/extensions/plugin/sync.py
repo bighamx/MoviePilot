@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 from typing import Any, Callable, Optional
 
 from app.runtime.extensions.plugin.system import PluginSystemServices
@@ -22,8 +21,7 @@ class PluginSyncService:
         local_plugins: Callable[[], list[Any]],
         merge_plugins: Callable[[list[Any], list[Any], list[Any]], list[Any]],
         plugin_exists: Callable[[str, Optional[str]], bool],
-        install: Callable[[str, Optional[str], bool], tuple[bool, str]],
-        report: Callable[..., Any],
+        install: Callable[[str, Optional[str], bool, object | None], tuple[bool, str]],
         log: Any,
     ) -> None:
         """保存目录读取、包安装和持久化报告端口。"""
@@ -34,24 +32,46 @@ class PluginSyncService:
         self._merge_plugins = merge_plugins
         self._plugin_exists = plugin_exists
         self._install = install
-        self._report = report
         self._logger = log
 
-    def sync(self) -> list[str]:
-        """并发安装本地缺失或需要更新的已安装插件。"""
+    def sync(
+        self,
+        startup_token: object | None = None,
+        *,
+        online_restore_plugins: set[str] | None = None,
+    ) -> list[str]:
+        """并发安装本地缺失、需要更新或应恢复在线载荷的插件。"""
         if self._frozen():
             return []
 
-        installed = self._installed_plugins()
+        installed = {
+            plugin_id.lower()
+            for plugin_id in self._installed_plugins()
+        }
         online = self._online_plugins()
         local = self._local_plugins()
+        local_plugin_ids = {
+            plugin.id.lower()
+            for plugin in local
+        }
+        deferred_plugin_ids = installed & local_plugin_ids
+        restore_plugin_ids = {
+            plugin_id.lower()
+            for plugin_id in (online_restore_plugins or set())
+        } - local_plugin_ids
         candidates = self._merge_plugins(online + local, [], []) if online or local else []
         targets = [
             plugin
             for plugin in candidates
-            if plugin.id in installed
-            and plugin.system_version_compatible is not False
-            and not self._plugin_exists(plugin.id, plugin.plugin_version)
+            if plugin.id.lower() in installed
+            and (
+                plugin.id.lower() in deferred_plugin_ids
+                or plugin.id.lower() in restore_plugin_ids
+                or (
+                    plugin.system_version_compatible is not False
+                    and not self._plugin_exists(plugin.id, plugin.plugin_version)
+                )
+            )
         ]
         if not targets:
             return []
@@ -59,22 +79,28 @@ class PluginSyncService:
         self._logger.info("开始安装第三方插件...")
         synced: list[str] = []
         failed: list[str] = []
+        failed_deferred: list[str] = []
 
         def install_one(plugin: Any) -> None:
             """安装一个插件并记录结果。"""
             started = time.time()
-            state, message = self._install(plugin.id, plugin.repo_url, True)
+            state, message = self._install(
+                plugin.id,
+                None,
+                False,
+                startup_token,
+            )
             elapsed = time.time() - started
             if state:
-                self._report(plugin_id=plugin.id, repo_url=plugin.repo_url)
                 self._logger.info(
-                    f"插件 {plugin.plugin_name} 安装成功，版本：{plugin.plugin_version}，"
-                    f"耗时：{elapsed:.2f} 秒"
+                    f"插件 {plugin.plugin_name} 同步成功，耗时：{elapsed:.2f} 秒"
                 )
                 synced.append(plugin.id)
             else:
+                if plugin.id.lower() in deferred_plugin_ids:
+                    failed_deferred.append(plugin.id)
                 self._logger.error(
-                    f"插件 {plugin.plugin_name} v{plugin.plugin_version} 安装失败："
+                    f"插件 {plugin.plugin_name} 同步失败："
                     f"{message}，耗时：{elapsed:.2f} 秒"
                 )
                 failed.append(plugin.id)
@@ -86,6 +112,8 @@ class PluginSyncService:
                 try:
                     future.result()
                 except Exception as error:  # noqa: BLE001
+                    if plugin.id.lower() in deferred_plugin_ids:
+                        failed_deferred.append(plugin.id)
                     self._logger.error(
                         f"插件 {plugin.plugin_name} 安装过程中出现异常: {error}"
                     )
@@ -93,6 +121,11 @@ class PluginSyncService:
         self._logger.info(
             f"第三方插件安装完成，成功：{len(synced)} 个，失败：{len(failed)} 个"
         )
+        if failed_deferred:
+            raise RuntimeError(
+                "延后激活的插件同步未完成："
+                f"{', '.join(sorted(set(failed_deferred)))}"
+            )
         return synced
 
 
@@ -117,7 +150,12 @@ class LocalPluginSyncService:
 
     def sync(self, plugin_id: str, candidate: Optional[dict] = None) -> bool:
         """同步已安装且兼容的本地插件，成功后记录短时事件抑制标记。"""
-        if plugin_id not in self._installed_plugins():
+        normalized_plugin_id = plugin_id.lower()
+        installed = {
+            installed_id.lower()
+            for installed_id in self._installed_plugins()
+        }
+        if normalized_plugin_id not in installed:
             self._logger.info(f"本地插件 {plugin_id} 尚未安装，跳过自动同步和热重载")
             return False
         candidate = candidate or self._candidate(plugin_id)
@@ -128,12 +166,24 @@ class LocalPluginSyncService:
                     f"{candidate.get('skip_reason')}"
                 )
             return False
-        source_dir = Path(candidate.get("path"))
+        repo_url = candidate.get("repo_url")
+        if not isinstance(repo_url, str) or not repo_url.startswith("local://"):
+            self._logger.error(f"本地插件 {plugin_id} 缺少可验证的本地来源标识")
+            return False
         try:
-            if not self._system().package.sync_local(plugin_id, source_dir):
+            state, message = self._system().install_plugin(
+                plugin_id=plugin_id,
+                repo_url=repo_url,
+                package_version=candidate.get("package_version") or None,
+                force=True,
+                local_sync=True,
+                explicit_source=True,
+            )
+            if not state:
+                self._logger.error(f"同步本地插件 {plugin_id} 失败：{message}")
                 return False
-            self._recent_sync[plugin_id] = time.time()
-            self._logger.info(f"已同步本地插件 {plugin_id}：{source_dir}")
+            self._recent_sync[normalized_plugin_id] = time.time()
+            self._logger.info(f"已同步本地插件 {plugin_id}")
             return True
         except Exception as error:
             self._logger.error(f"同步本地插件 {plugin_id} 失败：{error}")

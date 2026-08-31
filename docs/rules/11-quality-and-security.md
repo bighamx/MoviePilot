@@ -6,17 +6,17 @@
 
 ```bash
 # Minimum: run tests directly related to the change
-pytest tests/test_<domain>.py
+uv run --locked --no-sync pytest tests/test_<domain>.py
 
 # If the change affects common modules, startup flow, CLI, or agent runtime
-pytest
+uv run --locked --no-sync pytest
 ```
 
 ### When to Expand Scope
 
 Run the full test suite when changing:
 - `app/runtime/`, `app/adapters/`, or `app/runtime/compat/` - config, events, managers, adapters, and compatibility boundaries
-- `app/chain/__init__.py` — chain base class
+- `app/chain/base.py` — chain base class
 - `app/modules/__init__.py` — module base class
 - `app/main.py` — application startup
 - The CLI entrypoint (`moviepilot`)
@@ -42,7 +42,7 @@ Run the full test suite when changing:
 ## Static Analysis
 
 ```bash
-pylint app/
+uv run --locked --no-sync pylint app/
 ```
 
 - After any Python code change, ensure no new **error-level** pylint issues are introduced.
@@ -54,12 +54,17 @@ pylint app/
 ## Dependency Security Scan
 
 ```bash
-safety check -r requirements.txt --policy-file=safety.policy.yml
+uv export --quiet --locked --no-dev --no-emit-project \
+  --output-file /tmp/moviepilot-audit-requirements.txt
+uvx --from pip-audit pip-audit \
+  --require-hashes --disable-pip --strict --progress-spinner off \
+  --requirement /tmp/moviepilot-audit-requirements.txt
 ```
 
-- Run after runtime dependency changes; scan the development dependency entry as well when `requirements-dev.in` changes.
-- No new high-severity vulnerabilities may be introduced.
-- If a vulnerability cannot be patched immediately, document it explicitly in the PR description.
+- Run after runtime dependency changes; the release workflow audits the same locked dependency set before publishing images.
+- Any Python vulnerability reported by this audit blocks publishing until the dependency or explicit audit policy is updated.
+- Release candidates also scan OS and language packages on amd64 and arm64. HIGH or CRITICAL findings with an available fix block publishing; unfixed upstream findings require a separate reachability and impact assessment.
+- If upstream has no fix, assess reachability and impact before changing the audit policy; PR documentation alone does not bypass the gate.
 
 ---
 
@@ -131,11 +136,11 @@ Before marking any task as complete:
 
 - [ ] Related pytest tests pass
 - [ ] No new pylint error-level issues in `pylint app/`
-- [ ] If dependencies changed: the package is in the correct runtime or dev dependency entry, and `safety check` passes for the affected entry
+- [ ] If dependencies changed: the package is in the correct `pyproject.toml` group, `uv.lock` is current, the locked project consistency check and runtime dependency audit pass
 - [ ] If CLI behavior changed: `docs/cli.md` and related tests are updated
 - [ ] If MCP/API behavior changed: `docs/mcp-api.md` and related skill files are updated
 - [ ] If database schema changed: a new Alembic migration exists under `database/versions/`
 - [ ] No secrets are included in code, logs, or committed files
 - [ ] Public or cross-module contracts and non-obvious business behavior have useful Chinese documentation
 
-*Last Updated: 2026-08-13*
+*Last Updated: 2026-08-19*

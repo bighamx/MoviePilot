@@ -11,6 +11,7 @@ flush 前的事件。因此这里断言的是「绕过 Oper 直接建模写库�
 """
 import pytest
 
+from app.application.transfer.workflow import TransferPlanningInput
 from app.db.models.transferhistory import TransferHistory
 from app.db.models.transferpending import TransferPending
 from app.schemas.types import MediaSource
@@ -145,6 +146,7 @@ def test_normalization_also_applies_on_update(db):
     row = _write(db, _history(media_source=MediaSource.TMDB, media_id="550"))
 
     row.update(db.session, {"media_source": "douban", "media_id": "  1291546  "})
+    db.session.commit()
     db.session.expire_all()
     updated = TransferHistory.get(db.session, row.id)
 
@@ -157,8 +159,27 @@ def test_tables_without_identity_columns_are_untouched(db):
     不带身份列的表不受影响——事件挂在 Mapper 上覆盖全部映射，必须靠列名检查收窄，
     否则会去动一张根本没有这两列的表。
     """
-    TransferPending.register(db.session, storage="local", src_path="/mnt/a.mkv",
-                             now_time="2026-08-14 10:00:00")
+    planning_input = TransferPlanningInput(source_fileitem={
+        "storage": "local",
+        "path": "/mnt/a.mkv",
+        "type": "file",
+        "name": "a.mkv",
+    })
+    TransferPending.stage_admit(
+        db.session,
+        task_id="identity-free-table",
+        storage="local",
+        src_path="/mnt/a.mkv",
+        state="accepted",
+        now_time="2026-08-14 10:00:00",
+        input_version=planning_input.schema_version,
+        planning_input=planning_input.to_payload(),
+        input_fingerprint=planning_input.fingerprint,
+    )
 
-    rows = [r for r in TransferPending.list_all(db.session) if r.src_path == "/mnt/a.mkv"]
-    assert len(rows) == 1
+    row = TransferPending.get_by_identity(
+        db.session,
+        storage="local",
+        src_path="/mnt/a.mkv",
+    )
+    assert row.task_id == "identity-free-table"

@@ -1,12 +1,11 @@
 import time
 from typing import Any, Optional
 
-from sqlalchemy import Integer, String, Float, JSON, Index, delete, or_, select
+from sqlalchemy import JSON, Float, Index, Integer, String, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
-from app.db.base import get_id_column, Base
-from app.db.decorators import db_query, db_update, async_db_query, async_db_update
+from app.db.base import Base, get_id_column
 from app.db.models._constraints import media_identity_constraint
 from app.schemas.types import MUSIC_ENTITY_RECORDING, MediaSource
 
@@ -15,6 +14,7 @@ class Subscribe(Base):
     """
     订阅表
     """
+
     id = get_id_column()
     # 标题
     name: Mapped[str] = mapped_column(String, nullable=False, index=True)
@@ -71,7 +71,7 @@ class Subscribe(Base):
     # 附加信息
     note: Mapped[Optional[Any]] = mapped_column(JSON)
     # 状态：N-新建 R-订阅中 P-待定 S-暂停
-    state: Mapped[str] = mapped_column(String, nullable=False, index=True, default='N')
+    state: Mapped[str] = mapped_column(String, nullable=False, index=True, default="N")
     # 最后更新时间
     last_update: Mapped[Optional[str]] = mapped_column(String)
     # 创建时间
@@ -115,24 +115,21 @@ class Subscribe(Base):
 
     __table_args__ = (
         media_identity_constraint("subscribe"),
-        Index('ix_subscribe_type_date', 'type', 'date'),
-        Index('ix_subscribe_media_identity', 'media_source', 'media_id'),
+        Index("ix_subscribe_type_date", "type", "date"),
+        Index("ix_subscribe_media_identity", "media_source", "media_id"),
     )
 
     @classmethod
     def _identity_condition(
-            cls,
-            media_source: Optional[MediaSource] = None,
-            media_id: Optional[str] = None,
-            music_type: Optional[str] = None,
+        cls,
+        media_source: Optional[MediaSource] = None,
+        media_id: Optional[str] = None,
+        music_type: Optional[str] = None,
     ):
         """按统一媒体身份优先级构造订阅查询条件。"""
         if not media_source or media_id is None or not str(media_id).strip():
             return None
-        condition = (
-            (cls.media_source == str(media_source))
-            & (cls.media_id == str(media_id).strip())
-        )
+        condition = (cls.media_source == str(media_source)) & (cls.media_id == str(media_id).strip())
         if music_type == MUSIC_ENTITY_RECORDING:
             return condition & or_(cls.music_type == music_type, cls.music_type.is_(None))
         if music_type:
@@ -140,160 +137,158 @@ class Subscribe(Base):
         return condition
 
     @classmethod
-    @db_query
     def exists(
-            cls, db: Session, media_source: MediaSource, media_id: str,
-            season: Optional[int] = None,
-            episode_group: Optional[str] = None,
-            music_type: Optional[str] = None,
+        cls,
+        db: Session,
+        media_source: MediaSource | str | None = None,
+        media_id: str | None = None,
+        season: Optional[int] = None,
+        episode_group: Optional[str] = None,
+        music_type: Optional[str] = None,
     ):
         """按媒体身份、季号与剧集组查询已有订阅。"""
-        condition = cls._identity_condition(
-            media_source, media_id, music_type
-        )
+        condition = cls._identity_condition(media_source, media_id, music_type)
         if condition is None:
             return None
         statement = select(cls).where(condition)
         if season is not None:
             statement = statement.where(cls.season == season)
-        statement = statement.where(cls.episode_group == episode_group)
-        return db.execute(statement).scalars().first()
+        return db.execute(statement.where(cls.episode_group == episode_group)).scalars().first()
 
     @classmethod
-    @async_db_query
     async def async_exists(
-            cls, db: AsyncSession, media_source: MediaSource, media_id: str,
-            season: Optional[int] = None,
-            episode_group: Optional[str] = None,
-            music_type: Optional[str] = None,
+        cls,
+        db: AsyncSession,
+        media_source: MediaSource | str | None = None,
+        media_id: str | None = None,
+        season: Optional[int] = None,
+        episode_group: Optional[str] = None,
+        music_type: Optional[str] = None,
     ):
         """异步按媒体身份、季号与剧集组查询已有订阅。"""
-        condition = cls._identity_condition(
-            media_source, media_id, music_type
-        )
+        condition = cls._identity_condition(media_source, media_id, music_type)
         if condition is None:
             return None
-        query = select(cls).filter(condition)
+        statement = select(cls).where(condition)
         if season is not None:
-            query = query.filter(cls.season == season)
-        query = query.filter(cls.episode_group == episode_group)
-        result = await db.execute(query)
+            statement = statement.where(cls.season == season)
+        result = await db.execute(statement.where(cls.episode_group == episode_group))
         return result.scalars().first()
 
     @classmethod
-    @db_query
     def exists_by_username(
-            cls, db: Session, username: str, media_source: MediaSource, media_id: str,
-            season: Optional[int] = None,
-            episode_group: Optional[str] = None,
-            music_type: Optional[str] = None,
+        cls,
+        db: Session,
+        username: str | MediaSource | None = None,
+        media_source: MediaSource | str | None = None,
+        media_id: str | None = None,
+        season: Optional[int] = None,
+        episode_group: Optional[str] = None,
+        music_type: Optional[str] = None,
     ):
         """
         按订阅 owner、媒体身份、季号与剧集组查询订阅行。
         """
         if not username:
             return None
-        condition = cls._identity_condition(
-            media_source, media_id, music_type
-        )
+        condition = cls._identity_condition(media_source, media_id, music_type)
         if condition is None:
             return None
         statement = select(cls).where(cls.username == username, condition)
         if season is not None:
             statement = statement.where(cls.season == season)
-        statement = statement.where(cls.episode_group == episode_group)
-        return db.execute(statement).scalars().first()
+        return db.execute(statement.where(cls.episode_group == episode_group)).scalars().first()
 
     @classmethod
-    @async_db_query
     async def async_exists_by_username(
-            cls, db: AsyncSession, username: str, media_source: MediaSource,
-            media_id: str, season: Optional[int] = None,
-            episode_group: Optional[str] = None,
-            music_type: Optional[str] = None,
+        cls,
+        db: AsyncSession,
+        username: str | MediaSource | None = None,
+        media_source: MediaSource | str | None = None,
+        media_id: str | None = None,
+        season: Optional[int] = None,
+        episode_group: Optional[str] = None,
+        music_type: Optional[str] = None,
     ):
         """
         异步按订阅 owner、媒体身份、季号与剧集组查询订阅行。
         """
         if not username:
             return None
-        condition = cls._identity_condition(
-            media_source, media_id, music_type
-        )
+        condition = cls._identity_condition(media_source, media_id, music_type)
         if condition is None:
             return None
-        query = select(cls).filter(cls.username == username, condition)
+        statement = select(cls).where(cls.username == username, condition)
         if season is not None:
-            query = query.filter(cls.season == season)
-        query = query.filter(cls.episode_group == episode_group)
-        result = await db.execute(query)
+            statement = statement.where(cls.season == season)
+        result = await db.execute(statement.where(cls.episode_group == episode_group))
         return result.scalars().first()
 
     @classmethod
-    @db_query
-    def get_by_state(cls, db: Session, state: str):
-        # 如果 state 为空或 None，返回所有订阅
+    def get_by_state(cls, db: Session, state: str | None = None):
+        """在调用方 Session 中按状态列表查询订阅。"""
         statement = select(cls)
         if state:
-            # 如果传入的状态不为空，拆分成多个状态
-            statement = statement.where(cls.state.in_(state.split(',')))
+            statement = statement.where(cls.state.in_(state.split(",")))
         return list(db.execute(statement).scalars().all())
 
     @classmethod
-    @async_db_query
-    async def async_get_by_state(cls, db: AsyncSession, state: str):
-        # 如果 state 为空或 None，返回所有订阅
-        if not state:
-            result = await db.execute(select(cls))
-        else:
-            # 如果传入的状态不为空，拆分成多个状态
-            result = await db.execute(
-                select(cls).filter(cls.state.in_(state.split(',')))
-            )
+    async def async_get_by_state(cls, db: AsyncSession, state: str | None = None):
+        """在调用方 AsyncSession 中按状态列表查询订阅。"""
+        statement = select(cls)
+        if state:
+            statement = statement.where(cls.state.in_(state.split(",")))
+        result = await db.execute(statement)
         return list(result.scalars().all())
 
     @classmethod
-    @db_query
-    def get_by_title(cls, db: Session, title: str, season: Optional[int] = None):
+    def get_by_title(
+        cls,
+        db: Session,
+        title: str,
+        season: Optional[int] = None,
+    ):
+        """在调用方 Session 中按标题查询订阅。"""
         statement = select(cls).where(cls.name == title)
         if season is not None:
             statement = statement.where(cls.season == season)
         return db.execute(statement).scalars().first()
 
     @classmethod
-    @async_db_query
-    async def async_get_by_title(cls, db: AsyncSession, title: str, season: Optional[int] = None):
+    async def async_get_by_title(
+        cls,
+        db: AsyncSession,
+        title: str,
+        season: Optional[int] = None,
+    ):
+        """在调用方 AsyncSession 中按标题查询订阅。"""
+        statement = select(cls).where(cls.name == title)
         if season is not None:
-            result = await db.execute(
-                select(cls).filter(cls.name == title, cls.season == season)
-            )
-        else:
-            result = await db.execute(
-                select(cls).filter(cls.name == title)
-            )
+            statement = statement.where(cls.season == season)
+        result = await db.execute(statement)
         return result.scalars().first()
 
     @classmethod
-    @async_db_query
-    async def async_list_by_title(cls, db: AsyncSession, title: str, season: Optional[int] = None):
-        """
-        异步按标题查询候选订阅列表。
-        """
+    async def async_list_by_title(
+        cls,
+        db: AsyncSession,
+        title: str,
+        season: Optional[int] = None,
+    ):
+        """在调用方 AsyncSession 中按标题查询候选订阅列表。"""
+        statement = select(cls).where(cls.name == title)
         if season is not None:
-            result = await db.execute(
-                select(cls).filter(cls.name == title, cls.season == season)
-            )
-        else:
-            result = await db.execute(
-                select(cls).filter(cls.name == title)
-            )
+            statement = statement.where(cls.season == season)
+        result = await db.execute(statement)
         return list(result.scalars().all())
 
     @classmethod
-    @db_query
     def list_by_media_identity(
-            cls, db: Session, media_source: MediaSource, media_id: str,
-            music_type: Optional[str] = None,
+        cls,
+        db: Session,
+        media_source: MediaSource | str | None = None,
+        media_id: str | None = None,
+        music_type: Optional[str] = None,
     ):
         """同步按统一媒体身份查询候选订阅列表。"""
         condition = cls._identity_condition(
@@ -306,10 +301,12 @@ class Subscribe(Base):
         return list(db.execute(select(cls).where(condition)).scalars().all())
 
     @classmethod
-    @async_db_query
     async def async_list_by_media_identity(
-            cls, db: AsyncSession, media_source: MediaSource, media_id: str,
-            music_type: Optional[str] = None,
+        cls,
+        db: AsyncSession,
+        media_source: MediaSource | str | None = None,
+        media_id: str | None = None,
+        music_type: Optional[str] = None,
     ):
         """异步按统一媒体身份查询候选订阅列表。"""
         condition = cls._identity_condition(
@@ -319,22 +316,23 @@ class Subscribe(Base):
         )
         if condition is None:
             return []
-        result = await db.execute(select(cls).filter(condition))
+        result = await db.execute(select(cls).where(condition))
         return list(result.scalars().all())
 
     @classmethod
-    @db_query
     def get_by(
-            cls, db: Session, type: str, media_source: MediaSource, media_id: str,
-            season: Optional[str] = None,
-            music_type: Optional[str] = None,
+        cls,
+        db: Session,
+        type: str | MediaSource | None = None,
+        media_source: MediaSource | str | None = None,
+        media_id: str | None = None,
+        season: Optional[int] = None,
+        music_type: Optional[str] = None,
     ):
         """
         根据条件查询订阅
         """
-        condition = cls._identity_condition(
-            media_source, media_id, music_type
-        )
+        condition = cls._identity_condition(media_source, media_id, music_type)
         if condition is None:
             return None
         statement = select(cls).where(condition, cls.type == type)
@@ -343,18 +341,19 @@ class Subscribe(Base):
         return db.execute(statement).scalars().first()
 
     @classmethod
-    @async_db_query
     async def async_get_by(
-            cls, db: AsyncSession, type: str, media_source: MediaSource, media_id: str,
-            season: Optional[str] = None,
-            music_type: Optional[str] = None,
+        cls,
+        db: AsyncSession,
+        type: str | MediaSource | None = None,
+        media_source: MediaSource | str | None = None,
+        media_id: str | None = None,
+        season: Optional[int] = None,
+        music_type: Optional[str] = None,
     ):
         """
         根据条件查询订阅
         """
-        condition = cls._identity_condition(
-            media_source, media_id, music_type
-        )
+        condition = cls._identity_condition(media_source, media_id, music_type)
         if condition is None:
             return None
         query = select(cls).filter(condition, cls.type == type)
@@ -363,39 +362,9 @@ class Subscribe(Base):
         result = await db.execute(query)
         return result.scalars().first()
 
-    @db_update
-    def delete_by_media_identity(
-            self, db: Session, media_source: MediaSource, media_id: str,
-            season: Optional[int] = None,
-    ) -> bool:
-        """按规范媒体身份删除订阅。"""
-        model = type(self)
-        statement = delete(model).where(
-            model.media_source == media_source,
-            model.media_id == str(media_id),
-        )
-        if season is not None:
-            statement = statement.where(model.season == season)
-        db.execute(statement, execution_options={"synchronize_session": False})
-        return True
-
-    @async_db_update
-    async def async_delete_by_media_identity(
-            self, db: AsyncSession, media_source: MediaSource, media_id: str,
-            season: Optional[int] = None,
-    ) -> bool:
-        """异步按规范媒体身份删除订阅。"""
-        rows = await self.async_list_by_media_identity(
-            db, media_source=media_source, media_id=media_id
-        )
-        for row in rows:
-            if season is None or row.season == season:
-                await row.async_delete(db, row.id)
-        return True
-
     @classmethod
-    @db_query
     def list_by_username(cls, db: Session, username: str, state: Optional[str] = None, mtype: Optional[str] = None):
+        """在调用方 Session 中按用户筛选订阅。"""
         statement = select(cls).where(cls.username == username)
         if state:
             statement = statement.where(cls.state == state)
@@ -404,48 +373,39 @@ class Subscribe(Base):
         return list(db.execute(statement).scalars().all())
 
     @classmethod
-    @async_db_query
-    async def async_list_by_username(cls, db: AsyncSession, username: str, state: Optional[str] = None,
-                                     mtype: Optional[str] = None):
+    async def async_list_by_username(
+        cls, db: AsyncSession, username: str, state: Optional[str] = None, mtype: Optional[str] = None
+    ):
+        """在调用方 AsyncSession 中按用户筛选订阅。"""
+        statement = select(cls).where(cls.username == username)
+        if state:
+            statement = statement.where(cls.state == state)
         if mtype:
-            if state:
-                result = await db.execute(
-                    select(cls).filter(cls.state == state, cls.username == username, cls.type == mtype)
-                )
-            else:
-                result = await db.execute(
-                    select(cls).filter(cls.username == username, cls.type == mtype)
-                )
-        else:
-            if state:
-                result = await db.execute(
-                    select(cls).filter(cls.state == state, cls.username == username)
-                )
-            else:
-                result = await db.execute(
-                    select(cls).filter(cls.username == username)
-                )
+            statement = statement.where(cls.type == mtype)
+        result = await db.execute(statement)
         return list(result.scalars().all())
 
     @classmethod
-    @db_query
-    def list_by_type(cls, db: Session, mtype: str, days: int):
-        return list(db.execute(
-            select(cls).where(
-                cls.type == mtype,
-                cls.date >= time.strftime("%Y-%m-%d %H:%M:%S",
-                                          time.localtime(time.time() - 86400 * int(days)))
+    def list_by_type(cls, db: Session, mtype: str, days: int = 7):
+        """在调用方 Session 中按类型查询最近时间窗内的订阅。"""
+        return list(
+            db.execute(
+                select(cls).where(
+                    cls.type == mtype,
+                    cls.date >= time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 86400 * int(days))),
+                )
             )
-        ).scalars().all())
+            .scalars()
+            .all()
+        )
 
     @classmethod
-    @async_db_query
-    async def async_list_by_type(cls, db: AsyncSession, mtype: str, days: int):
+    async def async_list_by_type(cls, db: AsyncSession, mtype: str, days: int = 7):
+        """在调用方 AsyncSession 中按类型查询最近时间窗内的订阅。"""
         result = await db.execute(
-            select(cls).filter(
+            select(cls).where(
                 cls.type == mtype,
-                cls.date >= time.strftime("%Y-%m-%d %H:%M:%S",
-                                          time.localtime(time.time() - 86400 * int(days)))
+                cls.date >= time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() - 86400 * int(days))),
             )
         )
         return list(result.scalars().all())

@@ -1,8 +1,9 @@
 import urllib.parse
-from typing import Tuple, List
+from typing import Any, Tuple, List
 
-from app.runtime.config import settings
-from app.application.configuration import get_configured_system_config as SystemConfigOper
+from app.runtime.settings import get_runtime_setting
+
+from app.application.configuration import get_configured_system_config
 from app.runtime.log import logger
 from app.schemas.types import MediaType
 from app.adapters.network.http import RequestUtils, AsyncRequestUtils
@@ -60,7 +61,8 @@ class HaiDanSpider:
         return None
 
     def __init__(self, indexer: dict):
-        self.systemconfig = SystemConfigOper()
+        """使用站点配置初始化 HaiDan API 请求上下文。"""
+        self.systemconfig = get_configured_system_config()
         if indexer:
             self._indexerid = indexer.get('id')
             self._url = indexer.get('domain')
@@ -68,7 +70,7 @@ class HaiDanSpider:
             self._searchurl = self._searchurl % self._url
             self._name = indexer.get('name')
             if indexer.get('proxy'):
-                self._proxy = settings.PROXY
+                self._proxy = get_runtime_setting('PROXY')
             self._cookie = indexer.get('cookie')
             self._ua = indexer.get('ua')
             self._timeout = indexer.get('timeout') or 15
@@ -147,6 +149,20 @@ class HaiDanSpider:
             torrents.append(torrent)
         return torrents
 
+    def __process_response(self, res: Any) -> Tuple[bool, List[dict[str, Any]]]:
+        """统一判定搜索响应状态、业务代码并投影 HaiDan 结果。"""
+        if res and res.status_code == 200:
+            result = res.json()
+            if result.get('code') != 0:
+                logger.warn(f"{self._name} 搜索失败：{result.get('msg')}")
+                return True, []
+            return False, self.__parse_result(result)
+        if res is not None:
+            logger.warn(f"{self._name} 搜索失败，错误码：{res.status_code}")
+            return True, []
+        logger.warn(f"{self._name} 搜索失败，无法连接 {self._domain}")
+        return True, []
+
     def search(self, keyword: str, mtype: MediaType = None) -> Tuple[bool, List[dict]]:
         """
         搜索
@@ -166,19 +182,7 @@ class HaiDanSpider:
             proxies=self._proxy,
             timeout=self._timeout
         ).get_res(url=f"{self._searchurl}?{params_str}")
-        if res and res.status_code == 200:
-            result = res.json()
-            code = result.get('code')
-            if code != 0:
-                logger.warn(f"{self._name} 搜索失败：{result.get('msg')}")
-                return True, []
-            return False, self.__parse_result(result)
-        elif res is not None:
-            logger.warn(f"{self._name} 搜索失败，错误码：{res.status_code}")
-            return True, []
-        else:
-            logger.warn(f"{self._name} 搜索失败，无法连接 {self._domain}")
-            return True, []
+        return self.__process_response(res)
 
     async def async_search(self, keyword: str, mtype: MediaType = None) -> Tuple[bool, List[dict]]:
         """
@@ -199,19 +203,7 @@ class HaiDanSpider:
             timeout=self._timeout
         ).get_res(url=f"{self._searchurl}?{params_str}")
 
-        if res and res.status_code == 200:
-            result = res.json()
-            code = result.get('code')
-            if code != 0:
-                logger.warn(f"{self._name} 搜索失败：{result.get('msg')}")
-                return True, []
-            return False, self.__parse_result(result)
-        elif res is not None:
-            logger.warn(f"{self._name} 搜索失败，错误码：{res.status_code}")
-            return True, []
-        else:
-            logger.warn(f"{self._name} 搜索失败，无法连接 {self._domain}")
-            return True, []
+        return self.__process_response(res)
 
     def __get_downloadvolumefactor(self, discount: str) -> float:
         """

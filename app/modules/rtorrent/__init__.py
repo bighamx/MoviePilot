@@ -2,12 +2,12 @@ from pathlib import Path
 from typing import Set, Tuple, Optional, Union, List, Dict
 
 from app.schemas.dashboard import DownloaderInfo as _SchemaDownloaderInfo
-from app.runtime.config import settings
 from app.domain.metainfo import MetaInfo
 from app.runtime.log import logger
-from app.modules._base import _DownloaderModuleBase
+from app.runtime.settings import get_runtime_setting
+from app.modules._base.downloader import _DownloaderModuleBase
 from app.modules.rtorrent.rtorrent import Rtorrent
-from app.schemas.transfer import DownloaderTorrent
+from app.schemas.transfer import DownloaderFile, DownloaderTorrent
 from app.schemas.types import (
     DownloadTaskState,
     DownloaderType,
@@ -20,7 +20,10 @@ from app.foundation import temporal as time_tools
 from app.foundation import text as text_tools
 
 
+
 class RtorrentModule(_DownloaderModuleBase[Rtorrent]):
+    """rTorrent 下载器模块，负责任务添加、标签和文件状态转换。"""
+
     def init_module(self) -> None:
         """
         初始化模块
@@ -31,6 +34,7 @@ class RtorrentModule(_DownloaderModuleBase[Rtorrent]):
 
     @staticmethod
     def get_name() -> str:
+        """返回模块展示名称。"""
         return "Rtorrent"
 
     @staticmethod
@@ -55,9 +59,11 @@ class RtorrentModule(_DownloaderModuleBase[Rtorrent]):
         return 3
 
     def stop(self):
+        """下载器客户端由服务基类管理，本模块无额外停止动作。"""
         pass
 
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
+        """下载器实例由系统配置管理，不声明独立模块开关。"""
         pass
 
     def download(
@@ -106,8 +112,8 @@ class RtorrentModule(_DownloaderModuleBase[Rtorrent]):
         tag = text_tools.random_string(10)
         if label:
             tags = label.split(",") + [tag]
-        elif settings.TORRENT_TAG:
-            tags = [tag, settings.TORRENT_TAG]
+        elif get_runtime_setting('TORRENT_TAG'):
+            tags = [tag, get_runtime_setting('TORRENT_TAG')]
         else:
             tags = [tag]
         # 如果要选择文件则先暂停
@@ -153,14 +159,14 @@ class RtorrentModule(_DownloaderModuleBase[Rtorrent]):
                                     ids=torrent_hash, tag=["已整理"]
                                 )
                             if (
-                                settings.TORRENT_TAG
-                                and settings.TORRENT_TAG not in torrent_tags
+                                get_runtime_setting('TORRENT_TAG')
+                                and get_runtime_setting('TORRENT_TAG') not in torrent_tags
                             ):
                                 logger.info(
-                                    f"给种子 {torrent_hash} 打上标签：{settings.TORRENT_TAG}"
+                                    f"给种子 {torrent_hash} 打上标签：{get_runtime_setting('TORRENT_TAG')}"
                                 )
                                 server.set_torrents_tag(
-                                    ids=torrent_hash, tags=[settings.TORRENT_TAG]
+                                    ids=torrent_hash, tags=[get_runtime_setting('TORRENT_TAG')]
                                 )
                             return (
                                 downloader or self.get_default_config_name(),
@@ -259,7 +265,7 @@ class RtorrentModule(_DownloaderModuleBase[Rtorrent]):
             servers: Dict[str, Rtorrent] = self.get_instances()
         ret_torrents = []
         query_status = self._normalize_query_status(status)
-        query_tags = None if include_all_tags else settings.TORRENT_TAG
+        query_tags = None if include_all_tags else get_runtime_setting('TORRENT_TAG')
 
         def __get_torrent_path(torrent_data: dict) -> Path:
             """
@@ -519,14 +525,16 @@ class RtorrentModule(_DownloaderModuleBase[Rtorrent]):
 
     def torrent_files(
         self, tid: str, downloader: Optional[str] = None
-    ) -> Optional[List[Dict]]:
+    ) -> Optional[List[DownloaderFile]]:
         """
-        获取种子文件列表
+        获取种子文件列表，并在模块边界把字典投影为宿主 DTO。
         """
         server: Rtorrent = self.get_instance(downloader)
         if not server:
             return None
-        return server.get_files(tid=tid)
+        return self._normalize_torrent_files(
+            server.get_files(tid=tid), DownloaderFile.model_validate
+        )
 
     def downloader_info(
         self, downloader: Optional[str] = None

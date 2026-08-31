@@ -6,7 +6,6 @@ from typing import Optional, Type
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
-from app.agent.tools.tags import ToolTag
 from app.agent.tools.impl._filter_rule_utils import (
     build_custom_rule_map,
     collect_rule_group_usages,
@@ -14,9 +13,10 @@ from app.agent.tools.impl._filter_rule_utils import (
     get_custom_rules,
     get_rule_groups,
     normalize_rule_group,
-    save_system_config,
+    publish_rule_config_changed,
     serialize_rule_group,
 )
+from app.agent.tools.tags import ToolTag
 from app.runtime.log import logger
 from app.schemas.types import SystemConfigKey
 
@@ -35,7 +35,7 @@ class AddRuleGroupInput(BaseModel):
     )
     media_type: Optional[str] = Field(
         None,
-        description="Optional media type scope: '电影', '电视剧', 'movie', or 'tv'.",
+        description="Optional media type scope: '电影', '电视剧', '音乐', 'movie', 'tv', or 'music'.",
     )
     category: Optional[str] = Field(
         None,
@@ -78,6 +78,9 @@ class AddRuleGroupTool(MoviePilotTool):
                 build_custom_rule_map(custom_rules).keys()
             )
             rule_groups = get_rule_groups()
+            expected_definitions = [
+                group.model_dump(exclude_none=True) for group in rule_groups
+            ]
             new_group, _ = normalize_rule_group(
                 name=name,
                 rule_string=rule_string,
@@ -88,11 +91,22 @@ class AddRuleGroupTool(MoviePilotTool):
             )
 
             rule_groups.append(new_group)
-            await save_system_config(
+            definitions = [
+                group.model_dump(exclude_none=True) for group in rule_groups
+            ]
+            async with self.data.async_rule_group_mutation_scope() as mutation:
+                await mutation.apply(
+                    definitions,
+                    expected_rule_groups=expected_definitions,
+                )
+            await publish_rule_config_changed(
                 SystemConfigKey.UserFilterRuleGroups,
-                [group.model_dump(exclude_none=True) for group in rule_groups],
+                definitions,
             )
-            usage = await collect_rule_group_usages([new_group.name])
+            usage = await collect_rule_group_usages(
+                self.data.subscriptions,
+                [new_group.name],
+            )
 
             return json.dumps(
                 {

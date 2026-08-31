@@ -1,21 +1,25 @@
 import asyncio
+from concurrent.futures import Future
+from dataclasses import replace
 from unittest.mock import AsyncMock, Mock, patch
 
-from app.agent import MoviePilotAgent
+from app.agent.orchestrator import AgentManagerQueueFullError, MoviePilotAgent
 from app.agent.tools.impl.ask_user_choice import (
     AskUserChoiceTool,
     UserChoiceOptionInput,
 )
 from app.agent.tools.impl.send_message import SendMessageTool
-from app.chain.message import MessageChain
-from app.runtime.config import settings
-from app.db import SessionFactory
-from app.db.oper.message import MessageOper
-from app.db.models.message import Message
 from app.application.messaging.agent import AgentInteractionOption, agent_interaction_manager
 from app.application.messaging.interaction import InteractionContext
 from app.application.messaging.media import media_interaction_manager
-from app.schemas.types import NotificationChannel, MessageType
+from app.chain.message import MessageChain
+from app.db.models.message import Message
+from app.db.oper.message import MessageOper
+from app.db.session import SessionFactory
+from app.runtime.config import settings
+from app.runtime.loop import main_loop_registry
+from app.runtime.tasks import TaskRegistry
+from app.schemas.types import MessageType, NotificationChannel
 
 
 def _clear_messages() -> None:
@@ -23,6 +27,81 @@ def _clear_messages() -> None:
     with SessionFactory() as db:
         db.query(Message).delete()
         db.commit()
+
+
+def _running_loop_stub() -> Mock:
+    """提供满足主程序生命周期合同的事件循环替身。"""
+    return Mock(
+        **{"is_running.return_value": True, "is_closed.return_value": False}
+    )
+
+
+def test_agent_session_clear_uses_owned_threadsafe_submission():
+    """Agent 会话清理应登记稳定 owner，纳入宿主关停收口。"""
+    loop = _running_loop_stub()
+    manager = Mock(clear_session=AsyncMock())
+
+    def submit(coroutine, **_kwargs):
+        """关闭测试协程，避免替身提交留下未等待警告。"""
+        coroutine.close()
+        return Future()
+
+    with patch.object(main_loop_registry, "require", return_value=loop), patch(
+        "app.chain.message.get_running_agent_manager", return_value=manager
+    ), patch("app.chain.message.get_task_registry") as get_registry:
+        get_registry.return_value.submit_threadsafe.side_effect = submit
+        MessageChain._schedule_agent_session_clear("session-1", "10001")
+
+    manager.clear_session.assert_called_once_with(
+        session_id="session-1", user_id="10001"
+    )
+    get_registry.return_value.submit_threadsafe.assert_called_once()
+    assert get_registry.return_value.submit_threadsafe.call_args.kwargs == {
+        "loop": loop,
+        "owner": "chain.message.agent_session_clear",
+    }
+
+
+def test_agent_session_clear_handles_closed_task_registry():
+    """宿主已停止接收任务时，同步消息清理链应记录拒绝而不是泄漏协程。"""
+    registry = TaskRegistry()
+    asyncio.run(registry.shutdown(timeout_seconds=0.01))
+    manager = Mock(clear_session=AsyncMock())
+
+    with patch.object(
+        main_loop_registry, "require", return_value=_running_loop_stub()
+    ), patch(
+        "app.chain.message.get_running_agent_manager", return_value=manager
+    ), patch("app.chain.message.get_task_registry", return_value=registry), patch(
+        "app.chain.message.logger"
+    ) as logger:
+        MessageChain._schedule_agent_session_clear("session-1", "10001")
+
+    logger.warning.assert_called_once()
+    assert "正在关闭" in logger.warning.call_args.args[0]
+
+
+def test_remote_session_clear_reuses_owned_clear_scheduler():
+    """远程清理命令应复用唯一 Agent 会话清理入口。"""
+    chain = MessageChain()
+    session_service = Mock()
+    session_service.clear.return_value = "session-1"
+
+    with patch.object(
+        chain, "_message_session_service", return_value=session_service
+    ), patch.object(
+        chain, "_schedule_agent_session_clear"
+    ) as schedule_clear, patch.object(chain, "post_message") as post_message:
+        chain.remote_clear_session(
+            channel=NotificationChannel.Telegram,
+            userid="10001",
+            source="telegram-test",
+        )
+
+    schedule_clear.assert_called_once_with("session-1", "10001")
+    notification = post_message.call_args.args[0]
+    assert notification.title == "智能体会话已清除，下次将创建新的会话"
+    assert notification.save_history is False
 
 
 def test_explicit_ai_message_bypasses_pending_media_interaction():
@@ -63,9 +142,12 @@ def test_explicit_ai_message_bypasses_pending_media_interaction():
 def test_explicit_ai_message_is_not_recorded_to_message_history():
     """显式 /ai 消息不登记到数据库或实时消息队列。"""
     chain = MessageChain()
+    chain.runtime_config = replace(chain.runtime_config, ai_agent_enable=True)
     manager = Mock(process_message=AsyncMock())
 
-    with patch.object(settings, "AI_AGENT_ENABLE", True), patch.object(
+    with patch.object(
+        main_loop_registry, "require", return_value=_running_loop_stub()
+    ), patch.object(settings, "AI_AGENT_ENABLE", True), patch.object(
         chain, "_record_user_message"
     ) as record_user_message, patch(
         "app.chain.message.get_running_agent_manager", return_value=manager
@@ -85,12 +167,51 @@ def test_explicit_ai_message_is_not_recorded_to_message_history():
     manager.process_message.assert_called_once()
 
 
+def test_agent_queue_full_is_reported_to_the_originating_channel():
+    """消息队列满时应消费 Future 异常并向原渠道返回可重试提示。"""
+    chain = MessageChain()
+    chain.runtime_config = replace(chain.runtime_config, ai_agent_enable=True)
+    manager = Mock(process_message=AsyncMock())
+    failed = Future()
+    failed.set_exception(AgentManagerQueueFullError("session-1", 8))
+
+    def submit(coro, _loop):
+        coro.close()
+        return failed
+
+    with patch.object(
+        main_loop_registry, "require", return_value=_running_loop_stub()
+    ), patch.object(
+        settings, "AI_AGENT_ENABLE", True
+    ), patch(
+        "app.chain.message.get_running_agent_manager", return_value=manager
+    ), patch(
+        "app.chain.message.asyncio.run_coroutine_threadsafe",
+        side_effect=submit,
+    ), patch.object(chain, "post_message") as post_message:
+        assert chain._handle_ai_message(
+            text="/ai 检查状态",
+            channel=NotificationChannel.Telegram,
+            source="telegram-test",
+            userid="10001",
+            username="tester",
+        ) is True
+
+    notification = post_message.call_args.args[0]
+    assert notification.title == "智能助手当前排队已满，请稍后重试"
+    assert notification.userid == "10001"
+    assert notification.save_history is False
+
+
 def test_message_chain_passes_stable_channel_admin_principal_to_agent():
     """消息链应将渠道适配器生成的管理员事实传给 Agent。"""
     chain = MessageChain()
+    chain.runtime_config = replace(chain.runtime_config, ai_agent_enable=True)
     manager = Mock(process_message=AsyncMock())
 
-    with patch.object(settings, "AI_AGENT_ENABLE", True), patch(
+    with patch.object(
+        main_loop_registry, "require", return_value=_running_loop_stub()
+    ), patch.object(settings, "AI_AGENT_ENABLE", True), patch(
         "app.chain.message.get_running_agent_manager", return_value=manager
     ), patch(
         "app.chain.message.asyncio.run_coroutine_threadsafe",
@@ -111,9 +232,12 @@ def test_message_chain_passes_stable_channel_admin_principal_to_agent():
 def test_message_chain_does_not_trust_channel_display_username():
     """消息链应保留适配器给出的明确非管理员结论。"""
     chain = MessageChain()
+    chain.runtime_config = replace(chain.runtime_config, ai_agent_enable=True)
     manager = Mock(process_message=AsyncMock())
 
-    with patch.object(settings, "AI_AGENT_ENABLE", True), patch(
+    with patch.object(
+        main_loop_registry, "require", return_value=_running_loop_stub()
+    ), patch.object(settings, "AI_AGENT_ENABLE", True), patch(
         "app.chain.message.get_running_agent_manager", return_value=manager
     ), patch(
         "app.chain.message.asyncio.run_coroutine_threadsafe",
@@ -134,9 +258,12 @@ def test_message_chain_does_not_trust_channel_display_username():
 def test_message_chain_uses_same_admin_contract_for_slack():
     """管理员事实透传应复用于其他消息渠道，而不是 Telegram 特判。"""
     chain = MessageChain()
+    chain.runtime_config = replace(chain.runtime_config, ai_agent_enable=True)
     manager = Mock(process_message=AsyncMock())
 
-    with patch.object(settings, "AI_AGENT_ENABLE", True), patch(
+    with patch.object(
+        main_loop_registry, "require", return_value=_running_loop_stub()
+    ), patch.object(settings, "AI_AGENT_ENABLE", True), patch(
         "app.chain.message.get_running_agent_manager", return_value=manager
     ), patch(
         "app.chain.message.asyncio.run_coroutine_threadsafe",
@@ -170,7 +297,7 @@ def test_ask_user_choice_message_is_not_recorded_to_message_history():
             "app.runtime.events.EventManager.async_send_event",
             new_callable=AsyncMock,
         ) as async_send_event, patch(
-            "app.application.messaging.message.MessageQueueManager.async_send_message",
+            "app.application.messaging.message.MessageQueueClient.async_send_message",
             new_callable=AsyncMock,
         ) as async_send_message:
             result = asyncio.run(
@@ -239,6 +366,7 @@ def test_send_message_tool_disables_notification_history():
 def test_agent_choice_callback_is_not_recorded_to_message_history():
     """Agent 按钮选择回传不登记到数据库或实时消息队列。"""
     chain = MessageChain()
+    chain.runtime_config = replace(chain.runtime_config, ai_agent_enable=True)
     request = agent_interaction_manager.create_request(
         session_id="session-choice",
         user_id="10001",
@@ -255,7 +383,9 @@ def test_agent_choice_callback_is_not_recorded_to_message_history():
     manager = Mock(process_message=AsyncMock())
 
     try:
-        with patch.object(settings, "AI_AGENT_ENABLE", True), patch.object(
+        with patch.object(
+            main_loop_registry, "require", return_value=_running_loop_stub()
+        ), patch.object(settings, "AI_AGENT_ENABLE", True), patch.object(
             chain, "_record_user_message"
         ) as record_user_message, patch.object(
             chain, "edit_message", return_value=True

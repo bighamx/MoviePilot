@@ -1,16 +1,67 @@
 import base64
 import time
-from typing import Tuple, Optional
+from typing import Any, Callable, Optional, Protocol, Tuple
+from urllib.parse import urljoin, urlparse
 
 from lxml import etree
 
-from app.adapters.network.browser import BrowserPage, PlaywrightHelper
-from app.adapters.external.ocr import OcrHelper
 from app.application.security.twofactor import TwoFactorAuth
-from app.runtime.log import logger
-from app.adapters.network.http import RequestUtils
 from app.domain.site import SiteUtils
 from app.foundation import url as url_tools
+from app.runtime.log import logger
+
+CookieResult = Tuple[Optional[str], Optional[str], str]
+
+
+class CookieBrowserPort(Protocol):
+    """声明站点登录用例所需的受控浏览器执行能力。"""
+
+    def action(self, *, url: str, callback: Callable[[Any], CookieResult],
+               proxies: Optional[dict[str, Any]], timeout: Optional[int]) -> CookieResult:
+        """在受控页面会话内执行登录回调并返回兼容三元组。"""
+
+
+class CaptchaHttpPort(Protocol):
+    """声明验证码图片下载能力。"""
+
+    def fetch(self, *, url: str, cookie: str, ua: str) -> Optional[bytes]:
+        """下载验证码图片字节。"""
+
+
+class CaptchaOcrPort(Protocol):
+    """声明验证码图片识别能力。"""
+
+    def recognize(self, image_b64: str) -> str:
+        """识别 Base64 编码的验证码图片。"""
+
+
+_cookie_browser_port: Optional[CookieBrowserPort] = None
+_captcha_http_port: Optional[CaptchaHttpPort] = None
+_captcha_ocr_port: Optional[CaptchaOcrPort] = None
+
+
+def configure_cookie_ports(*, browser: CookieBrowserPort, http: CaptchaHttpPort,
+                           ocr: CaptchaOcrPort) -> None:
+    """由组合根装配站点登录与验证码端口。"""
+    global _cookie_browser_port, _captcha_http_port, _captcha_ocr_port
+    _cookie_browser_port = browser
+    _captcha_http_port = http
+    _captcha_ocr_port = ocr
+
+
+def reset_cookie_ports() -> None:
+    """清除站点登录端口，避免跨生命周期保留 Adapter。"""
+    global _cookie_browser_port, _captcha_http_port, _captcha_ocr_port
+    _cookie_browser_port = None
+    _captcha_http_port = None
+    _captcha_ocr_port = None
+
+
+def _require_cookie_ports() -> Tuple[CookieBrowserPort, CaptchaHttpPort, CaptchaOcrPort]:
+    """返回已装配端口，缺失时明确拒绝隐式构造 Adapter。"""
+    if _cookie_browser_port is None or _captcha_http_port is None or _captcha_ocr_port is None:
+        raise RuntimeError("站点登录端口尚未由启动组合根装配")
+    return _cookie_browser_port, _captcha_http_port, _captcha_ocr_port
 
 
 class CookieHelper:
@@ -66,7 +117,7 @@ class CookieHelper:
     }
 
     @staticmethod
-    def get_page_content(page: BrowserPage, retries: int = 3, interval: float = 1.0) -> Optional[str]:
+    def get_page_content(page: Any, retries: int = 3, interval: float = 1.0) -> Optional[str]:
         """
         获取页面源码，页面跳转中（如登录前后的重定向）会导致 page.content() 抛出
         "Unable to retrieve content because the page is navigating" 异常，等待加载完成后重试
@@ -107,6 +158,24 @@ class CookieHelper:
             cookie_str += f"{cookie['name']}={cookie['value']}; "
         return cookie_str
 
+    @staticmethod
+    def _find_login_page_url(html: etree._Element, current_url: str) -> Optional[str]:
+        """从首页查找同源登录入口，避免把账号密码提交到跨域页面。"""
+        login_hrefs = html.xpath(
+            "//a["
+            "contains(translate(@href, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'login')"
+            " or contains(translate(@href, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'signin')"
+            "]/@href"
+        )
+        current = urlparse(current_url)
+        for href in login_hrefs:
+            login_url = urljoin(current_url, href)
+            target = urlparse(login_url)
+            if target.scheme in ("http", "https") and \
+                    target.scheme == current.scheme and target.netloc == current.netloc:
+                return str(login_url)
+        return None
+
     def get_site_cookie_ua(self,
                            url: str,
                            username: str,
@@ -114,6 +183,23 @@ class CookieHelper:
                            two_step_code: Optional[str] = None,
                            proxies: Optional[dict] = None,
                            timeout: int = None) -> Tuple[Optional[str], Optional[str], str]:
+        """获取站点 Cookie、User-Agent 和兼容错误消息。"""
+        return self._get_site_cookie_ua_impl(
+            url=url,
+            username=username,
+            password=password,
+            two_step_code=two_step_code,
+            proxies=proxies,
+            timeout=timeout,
+        )
+
+    def _get_site_cookie_ua_impl(self,
+                                 url: str,
+                                 username: str,
+                                 password: str,
+                                 two_step_code: Optional[str] = None,
+                                 proxies: Optional[dict] = None,
+                                 timeout: int = None) -> Tuple[Optional[str], Optional[str], str]:
         """
         获取站点cookie和ua
         :param url: 站点地址
@@ -125,7 +211,7 @@ class CookieHelper:
         :return: cookie、ua、message
         """
 
-        def __page_handler(page: BrowserPage) -> Tuple[Optional[str], Optional[str], str]:
+        def __page_handler(page: Any) -> CookieResult:
             """
             页面处理
             :return: Cookie和UA
@@ -144,6 +230,25 @@ class CookieHelper:
                     if html.xpath(xpath):
                         username_xpath = xpath
                         break
+                if not username_xpath:
+                    login_url = self._find_login_page_url(html, page.url or url)
+                    if login_url:
+                        try:
+                            page.goto(
+                                login_url,
+                                wait_until="domcontentloaded",
+                                timeout=(timeout or 60) * 1000,
+                            )
+                        except Exception as e:
+                            return None, None, f"打开登录页面失败：{str(e)}"
+                        html_text = self.get_page_content(page)
+                        html = etree.HTML(html_text) if html_text else None
+                        if html is None:
+                            return None, None, "解析网页源码失败"
+                        for xpath in self._SITE_LOGIN_XPATH["username"]:
+                            if html.xpath(xpath):
+                                username_xpath = xpath
+                                break
                 if not username_xpath:
                     # 登录页可能为JS动态渲染（如SPA），等待用户名输入框出现后重试
                     try:
@@ -318,16 +423,17 @@ class CookieHelper:
                         error_msg = html.xpath(error_xpath)[0]
                         return None, None, error_msg
             finally:
-                if html:
+                if html is not None:
                     del html
 
         if not url or not username or not password:
             return None, None, "参数错误"
 
-        return PlaywrightHelper().action(url=url,
-                                         callback=__page_handler,
-                                         proxies=proxies,
-                                         timeout=timeout)
+        browser_port, _, _ = _require_cookie_ports()
+        return browser_port.action(url=url,
+                                   callback=__page_handler,
+                                   proxies=proxies,
+                                   timeout=timeout)
 
     @staticmethod
     def __get_captcha_text(cookie: str, ua: str, code_url: str) -> str:
@@ -336,15 +442,11 @@ class CookieHelper:
         """
         if not code_url:
             return ""
-        ret = RequestUtils(ua=ua, cookies=cookie).get_res(code_url)
-        if ret:
-            if not ret.content:
-                return ""
-            return OcrHelper().get_captcha_text(
-                image_b64=base64.b64encode(ret.content).decode()
-            )
-        else:
+        _, http_port, ocr_port = _require_cookie_ports()
+        content = http_port.fetch(url=code_url, cookie=cookie, ua=ua)
+        if not content:
             return ""
+        return ocr_port.recognize(base64.b64encode(content).decode())
 
     @staticmethod
     def __get_captcha_url(siteurl: str, imageurl: str) -> str:

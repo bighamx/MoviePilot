@@ -25,6 +25,9 @@
       "FilterModule": {
         "name": "Filter"
       },
+      "ImdbModule": {
+        "name": "IMDb"
+      },
       "IndexerModule": {
         "name": "Site Indexer"
       },
@@ -109,10 +112,15 @@
     "TMDB请求失败": "TMDB request failed",
     "媒体服务器请求失败": "Media server request failed",
     "附件保存失败": "Failed to save attachment",
+    "通知配置保存成功": "Notification configuration saved successfully",
+    "通知配置保存失败": "Failed to save notification configuration",
+    "通知配置已保存，但缓存同步失败，请重试": "Notification configuration was saved, but cache synchronization failed. Please try again",
     "该选择已失效，请重新发起选择": "This selection has expired. Please start the selection again",
     "会话不存在或无权访问": "The conversation does not exist or you do not have access",
     "会话保存失败": "Failed to save conversation",
     "后台服务不存在": "Background service does not exist",
+    "当前管理用户缺少可审计身份": "The current administrator does not have an auditable identity",
+    "人工复核任务不存在": "The manual review task does not exist",
     "任务添加失败": "Failed to add task",
     "无法识别媒体信息": "Unable to recognize media information",
     "未识别到媒体信息": "Unable to recognize media information",
@@ -122,6 +130,17 @@
     "音乐实体类型无效，仅支持 recording 或 album": "Invalid music entity type; only recording or album is supported",
     "音乐下载只能使用音乐元数据源": "Music downloads can only use music metadata sources",
     "音乐重新识别只能使用音乐元数据源": "Music re-identification can only use music metadata sources",
+    "读取数据库备份列表失败，请查看日志": "Failed to load database backups. Check the logs for details",
+    "创建数据库备份失败，请查看日志": "Failed to create the database backup. Check the logs for details",
+    "已有数据库备份任务正在执行": "A database backup task is already in progress",
+    "数据库备份文件名无效": "The database backup file name is invalid",
+    "数据库备份不存在": "The database backup does not exist",
+    "校验数据库备份失败，请查看日志": "Failed to verify the database backup. Check the logs for details",
+    "删除数据库备份失败，请查看日志": "Failed to delete the database backup. Check the logs for details",
+    "数据库备份周期格式不正确": "The database backup schedule format is invalid",
+    "数据库备份目录必须是路径字符串": "The database backup directory must be a path string",
+    "数据库备份过期天数必须是大于等于 0 的整数": "Database backup retention days must be an integer greater than or equal to 0",
+    "数据库备份最大保留份数必须是大于等于 0 的整数": "The maximum number of database backups must be an integer greater than or equal to 0",
     "记录不存在": "Record does not exist",
     "MoviePilot智能助手未启用": "MoviePilot Assistant is not enabled",
     "整理记录不存在": "Organization record does not exist",
@@ -193,6 +212,7 @@
     "测试目标重定向次数过多": "Test target redirected too many times",
     "当前运行环境不支持重启操作！": "The current runtime environment does not support restart!",
     "当前运行环境不支持升级操作！": "The current runtime environment does not support upgrade!",
+    "Release 更新请使用 /system/update/check、download 和 install 接口": "Use the /system/update/check, download, and install endpoints for Release updates",
     "命令不能为空！": "Command cannot be empty!",
     "未找到指定的种子": "Specified torrent not found",
     "种子删除成功": "Torrent deleted successfully",
@@ -210,6 +230,8 @@
     "密码需要同时包含字母、数字、特殊字符中的至少两项，且长度大于6位": "Password must contain at least two of letters, numbers, and special characters, and be longer than 6 characters",
     "用户名不能为空": "Username cannot be empty",
     "用户名已被使用": "Username is already in use",
+    "系统已经完成初始化": "The system has already been initialized",
+    "必须保留至少一个启用的超级管理员": "At least one active superuser must remain",
     "用户不存在": "User does not exist",
     "已存在相同名称的工作流": "A workflow with the same name already exists",
     "创建工作流成功": "Workflow created successfully",
@@ -309,6 +331,8 @@
     "微信 ClawBot 通知未启用或配置尚未保存，请先保存并启用当前渠道": "WeChat ClawBot notification is not enabled or the configuration has not been saved. Please save and enable this channel first",
     "请输入至少一个有效的站点 ID": "Enter at least one valid site ID",
     "所有订阅搜索完成": "All subscription searches are complete",
+    "订阅搜索锁等待超时，已跳过本轮": "Subscription search lock timed out, this round was skipped",
+    "订阅匹配锁等待超时，已跳过本轮": "Subscription matching lock timed out, this round was skipped",
     "请输入订阅 ID，多个 ID 用空格分隔，或输入 all": "Enter subscription IDs separated by spaces, or enter all",
     "请输入至少一个有效的订阅 ID": "Enter at least one valid subscription ID",
     "格式错误，请输入：cookie <id> <username> <password> [2fa_code/secret]": "Invalid format. Enter: cookie <id> <username> <password> [2fa_code/secret]",
@@ -332,7 +356,7 @@
     "样本未识别到有效集数，智能生成失败": "No valid episode number was recognized from the sample, and intelligent generation failed",
     "不存在依赖": "No dependencies exist",
     "主运行环境已恢复": "Main runtime environment has been restored",
-    "[PIP] 所有策略均安装依赖失败，请检查网络连接、PIP 配置或插件依赖约束": "[PIP] All dependency installation strategies failed. Please check the network connection, PIP configuration, or plugin dependency constraints",
+    "[UV] 所有策略均安装依赖失败，请检查网络连接、包源配置或插件依赖约束": "[UV] All dependency installation strategies failed. Please check the network connection, package index configuration, or plugin dependency constraints",
     "可执行文件模式下，只能安装本地插件": "In executable mode, only local plugins can be installed",
     "不支持的插件仓库地址格式": "Unsupported plugin repository URL format",
     "本地插件来源与插件ID不匹配": "Local plugin source does not match the plugin ID",
@@ -342,6 +366,7 @@
     "文件列表为空": "File list is empty",
     "requirements.txt 文件下载失败": "Failed to download requirements.txt",
     "插件在仓库中不存在或返回数据格式不正确": "The plugin does not exist in the repository or the returned data format is invalid",
+    "未找到该插件的仓库绑定信息": "No repository binding was found for this plugin",
     "插件数据解析失败": "Failed to parse plugin data",
     "没有传入需要安装的依赖项": "No dependencies to install were provided",
     "资产缺少ID信息": "Asset is missing ID information",
@@ -840,6 +865,10 @@
       "target": "Failed to create plugin clone: {reason}"
     },
     {
+      "source": "请先卸载该插件的分身：{instances}",
+      "target": "Uninstall this plugin's instances first: {instances}"
+    },
+    {
       "source": "{domain} 站点己存在",
       "target": "Site {domain} already exists"
     },
@@ -948,12 +977,12 @@
       "target": "Cookie decryption failed: {reason}"
     },
     {
-      "source": "插件限定的系统版本范围 {range} 必须是字符串，请使用 pip 依赖版本格式，例如 >=2.12.0,<3",
-      "target": "The plugin system version range {range} must be a string. Use pip dependency version format, for example >=2.12.0,<3"
+      "source": "插件限定的系统版本范围 {range} 必须是字符串，请使用 PEP 440 版本范围格式，例如 >=2.12.0,<3",
+      "target": "The plugin system version range {range} must be a string. Use PEP 440 version specifier format, for example >=2.12.0,<3"
     },
     {
-      "source": "插件限定的系统版本范围格式不正确：{range}，请使用 pip 依赖版本格式，例如 >=2.12.0,<3",
-      "target": "The plugin system version range format is invalid: {range}. Use pip dependency version format, for example >=2.12.0,<3"
+      "source": "插件限定的系统版本范围格式不正确：{range}，请使用 PEP 440 版本范围格式，例如 >=2.12.0,<3",
+      "target": "The plugin system version range format is invalid: {range}. Use PEP 440 version specifier format, for example >=2.12.0,<3"
     },
     {
       "source": "当前 MoviePilot 版本 {version} 无法解析，已拒绝安装带版本限制的插件",
@@ -988,8 +1017,8 @@
       "target": "Failed to recover {desc}"
     },
     {
-      "source": "[PIP] 所有策略均安装依赖失败：{reason}",
-      "target": "[PIP] All dependency installation strategies failed: {reason}"
+      "source": "[UV] 所有策略均安装依赖失败：{reason}",
+      "target": "[UV] All dependency installation strategies failed: {reason}"
     },
     {
       "source": "{pid} 未声明 Release 安装，无法安装指定版本",

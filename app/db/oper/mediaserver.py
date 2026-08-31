@@ -1,5 +1,6 @@
-from typing import Optional
+from typing import Optional, Union
 
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Session
 
 from app.db.base import DbOper
@@ -11,7 +12,11 @@ class MediaServerOper(DbOper):
     媒体服务器数据管理
     """
 
-    def __init__(self, db: Optional[Session] = None):
+    def __init__(
+        self,
+        db: Optional[Union[Session, AsyncSession]] = None,
+    ) -> None:
+        """保存调用方提供的同步或异步查询会话。"""
         super().__init__(db)
 
     @staticmethod
@@ -24,6 +29,12 @@ class MediaServerOper(DbOper):
             if hasattr(MediaServerItem, k) and k != "id"
         }
 
+    @staticmethod
+    def _contains_season(item: MediaServerItem, season: int) -> bool:
+        """兼容 JSON 往返后变为字符串的 seasoninfo 键。"""
+        seasoninfo = item.seasoninfo or {}
+        return season in seasoninfo or str(season) in seasoninfo
+
     def add(self, **kwargs) -> bool:
         """
         新增媒体服务器数据
@@ -34,8 +45,13 @@ class MediaServerOper(DbOper):
         if not server or not item_id:
             return False
         item = MediaServerItem(**kwargs)
-        if not item.get_by_server_itemid(self._db, server, item_id):
-            item.create(self._db)
+        existing = self._execute_sync_query(
+            lambda session: MediaServerItem.get_by_server_itemid(
+                session, server, item_id
+            )
+        )
+        if not existing:
+            self._stage_create(item)
             return True
         return False
 
@@ -49,47 +65,72 @@ class MediaServerOper(DbOper):
         if not server or not item_id:
             return False
 
-        item = MediaServerItem.get_by_server_itemid(self._db, server, item_id)
+        item = self._execute_sync_query(
+            lambda session: MediaServerItem.get_by_server_itemid(
+                session, server, item_id
+            )
+        )
         if item:
-            item.update(self._db, kwargs)
+            self._stage_update(item, kwargs)
             return False
 
-        MediaServerItem(**kwargs).create(self._db)
+        self._stage_create(MediaServerItem(**kwargs))
         return True
 
     def empty(self, server: Optional[str] = None):
         """
         清空媒体服务器数据
         """
-        MediaServerItem.empty(self._db, server)
+        self._execute_sync_write(
+            lambda session: MediaServerItem.empty(session, server)
+        )
 
     def delete_stale(self, server: str, sync_time: str) -> int:
         """
         删除本轮同步未更新的旧数据
         """
-        return MediaServerItem.delete_stale(self._db, server, sync_time)
+        return self._execute_sync_write(
+            lambda session: MediaServerItem.delete_stale(
+                session,
+                server,
+                sync_time,
+            )
+        )
 
     def delete_excluded_servers(self, servers: list[str]) -> int:
         """
         删除未启用或已移除媒体服务器的数据
         """
-        return MediaServerItem.delete_excluded_servers(self._db, servers)
+        return self._execute_sync_write(
+            lambda session: MediaServerItem.delete_excluded_servers(
+                session,
+                servers,
+            )
+        )
 
     def exists(self, **kwargs) -> Optional[MediaServerItem]:
         """
         判断媒体服务器数据是否存在
         """
         if kwargs.get("media_source") and kwargs.get("media_id"):
-            item = MediaServerItem.exist_by_media_identity(
-                self._db,
-                media_source=kwargs.get("media_source"),
-                media_id=kwargs.get("media_id"),
-                mtype=kwargs.get("mtype"),
+            item = self._execute_sync_query(
+                lambda session: MediaServerItem.exist_by_media_identity(
+                    session,
+                    media_source=kwargs.get("media_source"),
+                    media_id=kwargs.get("media_id"),
+                    mtype=kwargs.get("mtype"),
+                )
             )
         elif kwargs.get("title"):
             # 按标题、类型、年份查
-            item = MediaServerItem.exists_by_title(self._db, title=kwargs.get("title"),
-                                                   mtype=kwargs.get("mtype"), year=kwargs.get("year"))
+            item = self._execute_sync_query(
+                lambda session: MediaServerItem.exists_by_title(
+                    session,
+                    title=kwargs.get("title"),
+                    mtype=kwargs.get("mtype"),
+                    year=kwargs.get("year"),
+                )
+            )
         else:
             return None
         if not item:
@@ -97,10 +138,7 @@ class MediaServerOper(DbOper):
 
         if kwargs.get("season") is not None:
             # 判断季是否存在
-            if not item.seasoninfo:
-                return None
-            seasoninfo = item.seasoninfo or {}
-            if kwargs.get("season") not in seasoninfo.keys():
+            if not self._contains_season(item, kwargs["season"]):
                 return None
         return item
 
@@ -109,16 +147,24 @@ class MediaServerOper(DbOper):
         异步判断媒体服务器数据是否存在
         """
         if kwargs.get("media_source") and kwargs.get("media_id"):
-            item = await MediaServerItem.async_exist_by_media_identity(
-                self._db,
-                media_source=kwargs.get("media_source"),
-                media_id=kwargs.get("media_id"),
-                mtype=kwargs.get("mtype"),
+            item = await self._execute_async_query(
+                lambda session: MediaServerItem.async_exist_by_media_identity(
+                    session,
+                    media_source=kwargs.get("media_source"),
+                    media_id=kwargs.get("media_id"),
+                    mtype=kwargs.get("mtype"),
+                )
             )
         elif kwargs.get("title"):
             # 按标题、类型、年份查
-            item = await MediaServerItem.async_exists_by_title(self._db, title=kwargs.get("title"),
-                                                               mtype=kwargs.get("mtype"), year=kwargs.get("year"))
+            item = await self._execute_async_query(
+                lambda session: MediaServerItem.async_exists_by_title(
+                    session,
+                    title=kwargs.get("title"),
+                    mtype=kwargs.get("mtype"),
+                    year=kwargs.get("year"),
+                )
+            )
         else:
             return None
         if not item:
@@ -126,10 +172,7 @@ class MediaServerOper(DbOper):
 
         if kwargs.get("season") is not None:
             # 判断季是否存在
-            if not item.seasoninfo:
-                return None
-            seasoninfo = item.seasoninfo or {}
-            if kwargs.get("season") not in seasoninfo.keys():
+            if not self._contains_season(item, kwargs["season"]):
                 return None
         return item
 

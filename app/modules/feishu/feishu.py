@@ -23,25 +23,25 @@ from lark_oapi.api.im.v1 import (
     CreateFileRequestBody,
     CreateImageRequest,
     CreateImageRequestBody,
-    CreateMessageRequest,
-    CreateMessageRequestBody,
     CreateMessageReactionRequest,
     CreateMessageReactionRequestBody,
+    CreateMessageRequest,
+    CreateMessageRequestBody,
     DeleteMessageReactionRequest,
+    Emoji,
     GetFileRequest,
     GetImageRequest,
     GetMessageResourceRequest,
-    PatchMessageRequest,
-    PatchMessageRequestBody,
     P2ImChatAccessEventBotP2pChatEnteredV1,
     P2ImMessageMessageReadV1,
     P2ImMessageReactionCreatedV1,
     P2ImMessageReactionDeletedV1,
     P2ImMessageRecalledV1,
     P2ImMessageReceiveV1,
+    PatchMessageRequest,
+    PatchMessageRequestBody,
     ReplyMessageRequest,
     ReplyMessageRequestBody,
-    Emoji,
 )
 from lark_oapi.core.const import FEISHU_DOMAIN
 from lark_oapi.core.enum import LogLevel
@@ -50,30 +50,75 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTriggerResponse,
 )
 
-from app.runtime.config import settings
-from app.domain.context import Context, MediaInfo
-from app.application.security.user import get_configured_user_channel_lookup
-from app.application.messaging.agent import matches_channel_admin
-from app.runtime.log import logger
-from app.schemas.message import IncomingMessage
-from app.schemas.message import Message
-from app.schemas.types import NotificationChannel, MessageType
 from app.adapters.network.http import RequestUtils
+from app.application.messaging.agent import matches_channel_admin
+from app.application.messaging.ingress import submit_message_to_host
+from app.application.security.user import get_configured_user_channel_lookup
+from app.domain.context import Context, MediaInfo
+from app.runtime.log import logger
+from app.runtime.settings import get_runtime_setting
+from app.runtime.thread import ThreadHelper
+from app.schemas.message import IncomingMessage, Message
+from app.schemas.types import MessageType, NotificationChannel
 
 
-class UserOper:
-    """兼容飞书模块存量测试的渠道用户查询门面。"""
+class _ThreadLocalEventLoopProxy:
+    """为使用模块级 loop 的飞书 SDK 路由当前实例线程的事件循环。"""
 
-    @staticmethod
-    def get_name(**bindings) -> Optional[str]:
-        """把渠道标识查询转发到启动组合根登记的用户端口。"""
-        return get_configured_user_channel_lookup()(**bindings)
+    def __init__(self, fallback: asyncio.AbstractEventLoop) -> None:
+        """保存 SDK 原始循环，并初始化互不共享的线程绑定。"""
+        self._fallback = fallback
+        self._state = threading.local()
+
+    def bind(
+            self,
+            loop: asyncio.AbstractEventLoop,
+            stop_event: threading.Event,
+    ) -> None:
+        """为当前飞书实例线程绑定循环和停止信号。"""
+        self._state.loop = loop
+        self._state.stop_event = stop_event
+
+    def unbind(self) -> None:
+        """清除当前线程绑定，防止复用线程时误取已关闭循环。"""
+        self._state.__dict__.clear()
+
+    def stop_event(self) -> Optional[threading.Event]:
+        """返回当前实例线程的停止信号，未绑定时返回空。"""
+        return getattr(self._state, "stop_event", None)
+
+    def __getattr__(self, name: str) -> Any:
+        """把 SDK loop 操作转发给当前线程循环或原始兼容循环。"""
+        loop = getattr(self._state, "loop", self._fallback)
+        return getattr(loop, name)
+
+
+_LARK_WS_ORIGINAL_SELECT = lark_ws_client_module._select
+_lark_ws_loop_proxy = _ThreadLocalEventLoopProxy(lark_ws_client_module.loop)
+
+
+async def _select_bound_ws_client() -> None:
+    """按当前实例的停止信号结束 SDK 阻塞选择；未绑定时保持 SDK 原行为。"""
+    stop_event = _lark_ws_loop_proxy.stop_event()
+    if stop_event is None:
+        await _LARK_WS_ORIGINAL_SELECT()
+        return
+    while not stop_event.is_set():
+        await asyncio.sleep(1)
+
+
+# lark_oapi 以模块全局 loop 驱动所有 Client；静态安装线程路由后，多配置实例
+# 不再在启动/退出时反复覆盖同一全局对象。
+lark_ws_client_module.loop = _lark_ws_loop_proxy
+lark_ws_client_module._select = _select_bound_ws_client
 
 
 class Feishu:
     """飞书通知客户端，负责长连接收消息与主动发送通知。"""
 
     PROCESSING_REACTION_EMOJI = "GLANCE"
+    _ws_shutdown_timeout_seconds = 5
+    _ws_join_timeout_seconds = 5
     STREAM_CARD_TITLE_ELEMENT_ID = "mp_stream_title"
     STREAM_CARD_BODY_ELEMENT_ID = "mp_stream_body"
     IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tiff", ".heic"}
@@ -172,18 +217,11 @@ class Feishu:
 
     def _run_ws_client(self) -> None:
         """在后台线程中运行飞书长连接客户端。"""
-        original_select = lark_ws_client_module._select
-        original_loop = lark_ws_client_module.loop
         loop = asyncio.new_event_loop()
         original_create_task = loop.create_task
         self._ws_loop = loop
         asyncio.set_event_loop(loop)
-        lark_ws_client_module.loop = loop
-
-        async def _wait_for_stop() -> None:
-            """等待停止信号，让 SDK 的阻塞 select 可被本地生命周期控制。"""
-            while not self._stop_event.is_set():
-                await asyncio.sleep(1)
+        _lark_ws_loop_proxy.bind(loop, self._stop_event)
 
         def _create_tracked_task(coro, *args, **kwargs) -> asyncio.Task:
             """跟踪 SDK 后台任务，避免关闭时产生未取回的任务异常。"""
@@ -198,7 +236,6 @@ class Feishu:
                 task.add_done_callback(self._consume_ws_task_result)
             return task
 
-        lark_ws_client_module._select = _wait_for_stop
         loop.create_task = _create_tracked_task
         try:
             self._ws_client = lark.ws.Client(
@@ -219,8 +256,6 @@ class Feishu:
         finally:
             if not loop.is_closed():
                 loop.run_until_complete(self._shutdown_ws_client())
-            lark_ws_client_module._select = original_select
-            lark_ws_client_module.loop = original_loop
             loop.create_task = original_create_task
             pending_tasks = [
                 task
@@ -236,6 +271,7 @@ class Feishu:
             loop.close()
             asyncio.set_event_loop(None)
             self._ws_loop = None
+            _lark_ws_loop_proxy.unbind()
 
     def _consume_ws_task_result(self, task: asyncio.Task) -> None:
         """取回飞书 SDK 后台任务结果，防止 asyncio 在关机时输出未消费异常。"""
@@ -293,19 +329,13 @@ class Feishu:
             ws_client._service_id = ""
             ws_client._lock.release()
 
-    def _forward_to_message_chain(self, payload: dict) -> None:
+    def _forward_to_message_chain(self, payload: dict) -> bool:
         """将飞书入站消息转发到统一消息入口，复用现有交互主链。"""
-
-        def _run() -> None:
-            try:
-                RequestUtils(timeout=15).post_res(
-                    f"http://127.0.0.1:{settings.PORT}/api/v1/message?token={settings.API_TOKEN}&source={self._name}",
-                    json=payload,
-                )
-            except Exception as err:
-                logger.error(f"飞书转发消息失败：{err}")
-
-        threading.Thread(target=_run, daemon=True).start()
+        return submit_message_to_host(
+            payload,
+            self._name,
+            submit=ThreadHelper().submit,
+        )
 
     @staticmethod
     def _parse_message_content(message) -> Tuple[
@@ -480,7 +510,7 @@ class Feishu:
             binding_ids["feishu_userid"] = user_id
         if binding_ids:
             try:
-                mapped_username = UserOper().get_name(**binding_ids)
+                mapped_username = get_configured_user_channel_lookup()(**binding_ids)
                 if mapped_username:
                     return mapped_username
             except Exception as err:
@@ -638,12 +668,13 @@ class Feishu:
         """返回飞书客户端是否已就绪。"""
         return self._ready.is_set() and self._api_client is not None
 
-    def stop(self) -> None:
-        """停止飞书客户端并结束长连接线程。"""
+    def stop(self) -> bool:
+        """停止飞书客户端，并返回长连接线程是否已经终止。"""
         self._stop_event.set()
         self._ready.clear()
         ws_client = self._ws_client
         ws_loop = self._ws_loop
+        ws_thread = self._ws_thread
         if ws_client:
             try:
                 ws_client._auto_reconnect = False
@@ -652,11 +683,19 @@ class Feishu:
                         self._shutdown_ws_client(),
                         ws_loop,
                     )
-                    shutdown_future.result(timeout=5)
+                    shutdown_future.result(timeout=self._ws_shutdown_timeout_seconds)
             except Exception as err:
                 logger.debug(f"停止飞书客户端失败：{err}")
-        if self._ws_thread and self._ws_thread.is_alive():
-            self._ws_thread.join(timeout=5)
+        if (
+            ws_thread
+            and ws_thread.is_alive()
+            and ws_thread is not threading.current_thread()
+        ):
+            ws_thread.join(timeout=self._ws_join_timeout_seconds)
+        if ws_thread and ws_thread.is_alive():
+            logger.error("飞书长连接线程未在关闭预算内退出")
+            return False
+        return True
 
     def parse_message(self, body: Any) -> Optional[IncomingMessage]:
         """解析飞书转发到消息入口的 JSON 报文。"""
@@ -1014,7 +1053,7 @@ class Feishu:
         response = None
         temp_path = None
         try:
-            response = RequestUtils(timeout=30, ua=settings.USER_AGENT).get_res(image_url)
+            response = RequestUtils(timeout=30, ua=get_runtime_setting('USER_AGENT')).get_res(image_url)
             if not response or not getattr(response, "content", None):
                 logger.warning(f"飞书图片下载失败：{image_url}")
                 return None

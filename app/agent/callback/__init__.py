@@ -3,17 +3,12 @@ import re
 import threading
 from typing import Any, Optional, Tuple
 
-from fastapi.concurrency import run_in_threadpool
-
-from app.agent.policy import sanitize_for_host
-from app.chain import ChainBase
+from app.runtime.execution import run_in_threadpool
+from app.agent.policy.sanitizer import sanitize_for_host
+from app.chain.base import ChainBase
 from app.runtime.log import logger
-from app.schemas.message import Message
-from app.schemas.message import (
-    MessageResponse,
-    ChannelCapabilityManager,
-    ChannelCapability,
-)
+from app.schemas.message import Message, MessageResponse
+from app.schemas.notification import ChannelCapabilityManager, ChannelCapability
 from app.schemas.types import NotificationChannel, MessageType
 
 
@@ -63,6 +58,7 @@ class StreamingHandler:
         # 流式输出相关状态
         self._streaming_enabled = False
         self._flush_task: Optional[asyncio.Task] = None
+        self._streaming_lifecycle_lock = asyncio.Lock()
         # 当前消息的发送信息（用于编辑消息）
         self._message_response: Optional[MessageResponse] = None
         # 已发送给用户的文本（用于追踪增量）
@@ -82,6 +78,8 @@ class StreamingHandler:
         self._allow_dispatch_without_context = False
         # 非啰嗦模式下的待输出工具统计，等下一段文本到来时再统一补一句摘要
         self._pending_tool_stats: dict[str, dict[str, Any]] = {}
+        # 本轮已写入缓冲区的工具摘要行，供 Telegram 富文本渲染时做区分样式
+        self._tool_summaries: set[str] = set()
 
     def set_dispatch_policy(
         self, allow_dispatch_without_context: bool = False
@@ -143,6 +141,7 @@ class StreamingHandler:
             self._message_response = None
             self._msg_start_offset = 0
             self._pending_tool_stats = {}
+            self._tool_summaries = set()
 
     def reset(self):
         """
@@ -157,8 +156,31 @@ class StreamingHandler:
             self._sent_text = ""
             self._msg_start_offset = 0
             self._pending_tool_stats = {}
+            self._tool_summaries = set()
 
     async def start_streaming(
+        self,
+        channel: Optional[str] = None,
+        source: Optional[str] = None,
+        user_id: Optional[str] = None,
+        username: Optional[str] = None,
+        original_message_id: Optional[str] = None,
+        original_chat_id: Optional[str] = None,
+        title: str = "",
+    ):
+        """串行启动流式输出，禁止新一轮覆盖尚未结束的刷新 owner。"""
+        async with self._streaming_lifecycle_lock:
+            await self._start_streaming(
+                channel=channel,
+                source=source,
+                user_id=user_id,
+                username=username,
+                original_message_id=original_message_id,
+                original_chat_id=original_chat_id,
+                title=title,
+            )
+
+    async def _start_streaming(
         self,
         channel: Optional[str] = None,
         source: Optional[str] = None,
@@ -180,6 +202,10 @@ class StreamingHandler:
         :param original_message_id: 原始消息ID（如果是回复消息）
         :param original_chat_id: 原始聊天ID（如果是回复消息）
         """
+        if self._flush_task is not None:
+            self._streaming_enabled = False
+            await self._cancel_flush_task()
+
         self._channel = channel
         self._source = source
         self._user_id = user_id
@@ -193,6 +219,7 @@ class StreamingHandler:
         self._message_response = None
         self._msg_start_offset = 0
         self._pending_tool_stats = {}
+        self._tool_summaries = set()
 
         # 检查渠道是否支持消息编辑，不支持则仅收集 token 到 buffer，不实时推送
         if not self._can_stream():
@@ -213,6 +240,11 @@ class StreamingHandler:
         logger.debug("流式输出已启动")
 
     async def stop_streaming(self) -> Tuple[bool, str]:
+        """串行停止流式输出，并等待本轮刷新与最终消息收口。"""
+        async with self._streaming_lifecycle_lock:
+            return await self._stop_streaming()
+
+    async def _stop_streaming(self) -> Tuple[bool, str]:
         """
         停止流式输出。执行最后一次刷新确保所有内容都已发送。
         :return: (all_sent, final_text)
@@ -257,6 +289,7 @@ class StreamingHandler:
             self._message_response = None
             self._msg_start_offset = 0
             self._pending_tool_stats = {}
+            self._tool_summaries = set()
             if all_sent:
                 # 所有内容已通过流式发送，清空缓冲区
                 self._buffer = ""
@@ -434,11 +467,14 @@ class StreamingHandler:
             return ""
 
         summary = f"（{'，'.join(parts)}）"
+        self._tool_summaries.add(summary)
+        # 摘要前始终保证一个空行，让工具执行信息与正文分属不同段落，
+        # 避免 Markdown 富文本把单个换行折叠成同一段落内的软换行
         visible_buffer = self._buffer.rstrip(" \t")
-        last_char = visible_buffer[-1:] if visible_buffer.strip() else ""
+        trailing_newlines = len(visible_buffer) - len(visible_buffer.rstrip("\n"))
         prefix = ""
-        if self._buffer and last_char != "\n":
-            prefix = "\n\n"
+        if visible_buffer.strip():
+            prefix = "\n" * max(2 - trailing_newlines, 0)
         return f"{prefix}{summary}\n\n"
 
     @staticmethod
@@ -485,6 +521,28 @@ class StreamingHandler:
             )
         except (ValueError, KeyError):
             return False
+
+    def _get_rich_message(self, text: str) -> Optional[str]:
+        """
+        为 Telegram 流式消息返回 Rich Markdown，其他渠道继续使用原有格式。
+        """
+        if self._channel != NotificationChannel.Telegram.value:
+            return None
+        return self._quote_tool_summary_lines(text)
+
+    def _quote_tool_summary_lines(self, text: str) -> str:
+        """
+        将缓冲区中的工具摘要整行转换为 Markdown 引用块。
+
+        富文本会把普通段落间的空行折叠成紧凑排版，引用块作为独立 block 类型
+        渲染，保证工具执行信息在 Telegram 上始终与正文有可辨识的视觉分隔。
+        """
+        if not self._tool_summaries or not text:
+            return text
+        return "\n".join(
+            f"> {line}" if line in self._tool_summaries else line
+            for line in text.split("\n")
+        )
 
     async def _flush_loop(self):
         """
@@ -557,6 +615,7 @@ class StreamingHandler:
                         original_chat_id=self._original_chat_id,
                         title=self._title,
                         text=current_text,
+                        rich_message=self._get_rich_message(current_text),
                         save_history=False,
                     ),
                 )
@@ -603,6 +662,7 @@ class StreamingHandler:
                                 original_chat_id=self._original_chat_id,
                                 title=self._title,
                                 text=current_text,
+                                rich_message=self._get_rich_message(current_text),
                                 save_history=False,
                             ),
                         )
@@ -623,6 +683,11 @@ class StreamingHandler:
                     except (ValueError, KeyError):
                         return
 
+                    metadata = dict(self._message_response.metadata or {})
+                    rich_message = self._get_rich_message(current_text)
+                    if rich_message:
+                        # 通用编辑接口不增加渠道专属参数，通过元数据交给 Telegram 模块消费。
+                        metadata["telegram_rich_message"] = rich_message
                     success = await run_in_threadpool(
                         chain.edit_message,
                         channel=channel_enum,
@@ -631,7 +696,7 @@ class StreamingHandler:
                         chat_id=self._message_response.chat_id,
                         text=current_text,
                         title=self._title,
-                        metadata=self._message_response.metadata,
+                        metadata=metadata,
                     )
                     if success:
                         with self._lock:

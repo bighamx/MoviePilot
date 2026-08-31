@@ -4,10 +4,13 @@ import threading
 import time
 from types import SimpleNamespace
 
-from app.chain import workflow as workflow_module
-from app.schemas import Action, ActionContext, ActionResult
-from app.schemas.types import EventType
+import pytest
+
 from app import workflow as workflow_package
+from app.chain import workflow as workflow_module
+from app.runtime.correlation import correlation_scope, get_correlation_id
+from app.schemas.types import EventType
+from app.schemas.workflow import Action, ActionContext, ActionResult
 
 
 def _build_workflow(current_action=None, context=None, actions=None, flows=None,
@@ -127,6 +130,58 @@ class _OpaqueValue:
         return "opaque-value"
 
 
+def test_workflow_executor_preserves_trigger_context(monkeypatch):
+    """工作流节点及其完成回调应保留触发链路的关联 ID。"""
+    observed = []
+    release = threading.Event()
+
+    def run_action(_action, context):
+        observed.append(("node", get_correlation_id()))
+        assert release.wait(timeout=1)
+        return ActionResult(success=True, message="ok", context=context)
+
+    fake_manager = _FakeWorkflowManager(
+        [],
+        results={"A": run_action},
+    )
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(
+        workflow_module.runtime_stop_state,
+        "resume_workflow",
+        lambda _workflow_id: None,
+    )
+    monkeypatch.setattr(
+        workflow_module.runtime_stop_state,
+        "is_workflow_stopped",
+        lambda _workflow_id: False,
+    )
+
+    executor = workflow_module.WorkflowExecutor(
+        _build_workflow(
+            actions=[
+                {"id": "A", "type": "FakeAction", "name": "动作A", "data": {}}
+            ],
+            flows=[],
+        ),
+        step_callback=lambda _action, _context: observed.append(
+            ("completion", get_correlation_id())
+        ),
+    )
+    timer = threading.Timer(0.05, release.set)
+    try:
+        with correlation_scope("workflow-request"):
+            timer.start()
+            executor.execute()
+    finally:
+        release.set()
+        timer.join(timeout=1)
+
+    assert observed == [
+        ("node", "workflow-request"),
+        ("completion", "workflow-request"),
+    ]
+
+
 def test_workflow_executor_resumes_downstream_nodes(monkeypatch):
     """恢复执行时应释放已完成节点的后继节点。"""
     calls = []
@@ -136,9 +191,9 @@ def test_workflow_executor_resumes_downstream_nodes(monkeypatch):
         context=_encoded_context(ActionContext()),
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -161,9 +216,9 @@ def test_workflow_executor_restores_structured_context(monkeypatch):
         },
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -179,9 +234,9 @@ def test_workflow_executor_reports_incremental_progress(monkeypatch):
     progresses = []
     fake_manager = _FakeWorkflowManager(calls)
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(
         _build_workflow(),
@@ -219,9 +274,9 @@ def test_workflow_executor_skips_false_condition_branch(monkeypatch):
         ],
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -272,9 +327,9 @@ def test_workflow_executor_all_success_join_waits_parallel_branches(monkeypatch)
         ],
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -314,9 +369,9 @@ def test_workflow_executor_any_success_join_runs_after_available_branch(monkeypa
         ],
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -346,9 +401,9 @@ def test_workflow_executor_all_done_join_can_continue_after_failure(monkeypatch)
         ],
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -385,9 +440,9 @@ def test_workflow_executor_exclusive_branch_uses_first_matching_flow(monkeypatch
         ],
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -422,9 +477,9 @@ def test_workflow_executor_passes_declared_inputs(monkeypatch):
         ],
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -463,9 +518,9 @@ def test_workflow_executor_uses_contract_inputs(monkeypatch):
         ],
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -490,9 +545,9 @@ def test_workflow_executor_persists_structured_state(monkeypatch):
         }
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(
         _build_workflow(actions=[{"id": "A", "type": "FakeAction", "name": "动作A", "data": {}}], flows=[]),
@@ -523,9 +578,9 @@ def test_workflow_executor_restores_outputs_from_execution_state(monkeypatch):
         ],
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -550,9 +605,9 @@ def test_workflow_executor_keeps_execution_state_dict_for_non_json_leaf(monkeypa
         }
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(
         _build_workflow(actions=[{"id": "A", "type": "FakeAction", "name": "动作A", "data": {}}], flows=[]),
@@ -580,16 +635,32 @@ def test_workflow_chain_process_serializes_circular_context(monkeypatch):
         flows=[{"id": "flow-end", "source": "A", "target": "END", "animated": True}],
     )
     fake_oper = _FakeWorkflowOper(workflow)
+    port_calls = []
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module, "WorkflowOper", lambda: fake_oper)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    def get_execution_port():
+        """记录单次执行获取事务端口的次数。"""
+        port_calls.append(True)
+        return fake_oper
+
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(
+        workflow_module,
+        "get_configured_workflow_execution",
+        get_execution_port,
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "get_configured_workflow_query",
+        lambda: SimpleNamespace(get_sync=lambda _workflow_id: workflow),
+    )
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     success, message = workflow_module.WorkflowChain.process(workflow_id=1)
 
     assert success is True
     assert message == ""
+    assert port_calls == [True]
     assert fake_oper.succeeded is True
     saved_workflow_context = fake_oper.steps[-1]["context"]["workflow_context"]
     saved_self = saved_workflow_context["self"]
@@ -630,9 +701,9 @@ def test_workflow_executor_concurrency_key_serializes_parallel_nodes(monkeypatch
         execution_config={"max_workers": 2},
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -668,9 +739,9 @@ def test_workflow_executor_filter_action_replaces_artifact_outputs(monkeypatch):
         ],
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -719,9 +790,9 @@ def test_workflow_executor_filter_action_replaces_with_empty_outputs(monkeypatch
         ],
     )
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     executor = workflow_module.WorkflowExecutor(workflow)
     executor.execute()
@@ -736,9 +807,9 @@ def test_workflow_executor_stop_is_not_success(monkeypatch):
     calls = []
     fake_manager = _FakeWorkflowManager(calls)
 
-    monkeypatch.setattr(workflow_module, "WorkFlowManager", lambda: fake_manager)
-    monkeypatch.setattr(workflow_module.global_vars, "workflow_resume", lambda workflow_id: None)
-    monkeypatch.setattr(workflow_module.global_vars, "is_workflow_stopped", lambda workflow_id: True)
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: fake_manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda workflow_id: None)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: True)
 
     executor = workflow_module.WorkflowExecutor(_build_workflow())
     executor.execute()
@@ -747,6 +818,210 @@ def test_workflow_executor_stop_is_not_success(monkeypatch):
     assert executor.stopped is True
     assert executor.success is False
     assert executor.errmsg == "工作流已停止"
+
+
+def test_workflow_manager_shutdown_retains_blocked_execution_for_retry(monkeypatch):
+    """阻塞动作超时时保留 manager owner，释放后同一执行可重试收敛。"""
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingAction:
+        """模拟不响应取消令牌的第三方同步工作流动作。"""
+
+        def __init__(self, action_id):
+            """保存动作标识。"""
+            self.action_id = action_id
+            self.success = True
+            self.message = ""
+
+        def execute_with_inputs(self, workflow_id, params, inputs, runtime, context):
+            """阻塞到测试显式释放，并返回原工作流上下文。"""
+            _ = workflow_id, params, inputs, runtime
+            entered.set()
+            release.wait()
+            return ActionResult(success=True, context=context)
+
+    manager = object.__new__(workflow_package.WorkflowManager)
+    manager._lock = threading.RLock()
+    manager._actions = {"BlockingAction": BlockingAction}
+    manager._event_workflows = {}
+    manager._accepting_executions = True
+    manager._executions = {}
+    workflow = _build_workflow(
+        actions=[{
+            "id": "A",
+            "type": "BlockingAction",
+            "name": "阻塞动作",
+            "data": {},
+        }],
+        flows=[],
+    )
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: manager)
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda _workflow_id: None)
+    monkeypatch.setattr(
+        workflow_module.runtime_stop_state,
+        "is_workflow_stopped",
+        lambda _workflow_id: False,
+    )
+
+    executor = workflow_module.WorkflowExecutor(workflow)
+    execution_thread = threading.Thread(target=executor.execute, daemon=True)
+    execution_thread.start()
+    try:
+        assert entered.wait(timeout=1)
+        started_at = time.monotonic()
+
+        assert manager.stop(timeout=0.01) is False
+
+        assert time.monotonic() - started_at < 1
+        assert executor.cancel_token.is_cancelled() is True
+        assert manager._actions == {"BlockingAction": BlockingAction}
+        assert manager._executions == {id(executor): executor}
+
+        rejected = workflow_module.WorkflowExecutor(workflow)
+        assert rejected.admit() is False
+        assert rejected.errmsg == "工作流服务正在停止"
+    finally:
+        release.set()
+        execution_thread.join(timeout=2)
+
+    assert not execution_thread.is_alive()
+    assert executor.wait_stopped(timeout=1) is True
+    assert manager.stop(timeout=1) is True
+    assert manager._executions == {}
+    assert manager._actions == {}
+
+
+def test_workflow_manager_shutdown_continues_across_owner_failures():
+    """单个执行 owner 抛错不得跳过其它活动工作流的停止和等待。"""
+
+    class ObservedOwner:
+        """记录 manager 对多个 owner 的关闭调用。"""
+
+        def __init__(self, manager, *, fail: bool = False):
+            """保存管理器、失败开关和调用计数。"""
+            self.manager = manager
+            self.fail = fail
+            self.stop_calls = 0
+            self.wait_calls = 0
+
+        def request_stop(self) -> None:
+            """记录停止请求，并按需模拟第三方 owner 异常。"""
+            self.stop_calls += 1
+            if self.fail:
+                raise RuntimeError("stop failed")
+
+        def wait_stopped(self, timeout: float) -> bool:
+            """记录等待；正常 owner 从 manager 注册表释放自身。"""
+            _ = timeout
+            self.wait_calls += 1
+            if self.fail:
+                raise RuntimeError("wait failed")
+            self.manager.unregister_execution(self)
+            return True
+
+    manager = object.__new__(workflow_package.WorkflowManager)
+    manager._lock = threading.RLock()
+    action_marker = object()
+    manager._actions = {"FakeAction": action_marker}
+    manager._event_workflows = {}
+    manager._accepting_executions = True
+    manager._executions = {}
+    failing_owner = ObservedOwner(manager, fail=True)
+    healthy_owner = ObservedOwner(manager)
+    assert manager.register_execution(failing_owner) is True
+    assert manager.register_execution(healthy_owner) is True
+
+    assert manager.stop(timeout=0.01) is False
+
+    assert failing_owner.stop_calls == 1
+    assert failing_owner.wait_calls == 1
+    assert healthy_owner.stop_calls == 1
+    assert healthy_owner.wait_calls == 1
+    assert manager._executions == {id(failing_owner): failing_owner}
+    assert manager._actions == {"FakeAction": action_marker}
+
+
+def test_workflow_chain_rejects_execution_before_persisting_running_state(monkeypatch):
+    """停机封口后的新执行不得先把数据库状态写成运行中。"""
+
+    class RejectingWorkflowManager(_FakeWorkflowManager):
+        """模拟已经封口的 concrete 工作流运行时。"""
+
+        def register_execution(self, _owner) -> bool:
+            """拒绝停机后的新执行 owner。"""
+            return False
+
+    workflow = _build_workflow()
+    workflowoper = _FakeWorkflowOper(workflow)
+    manager = RejectingWorkflowManager([])
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: manager)
+    monkeypatch.setattr(
+        workflow_module,
+        "get_configured_workflow_execution",
+        lambda: workflowoper,
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "get_configured_workflow_query",
+        lambda: SimpleNamespace(get_sync=lambda _workflow_id: workflow),
+    )
+
+    def unexpected_resume(_workflow_id: int) -> None:
+        """拒绝准入时若仍恢复停止标记则立即暴露回归。"""
+        raise AssertionError("拒绝准入时不得恢复工作流")
+
+    monkeypatch.setattr(
+        workflow_module.runtime_stop_state,
+        "resume_workflow",
+        unexpected_resume,
+    )
+
+    success, message = workflow_module.WorkflowChain.process(workflow_id=1)
+
+    assert success is False
+    assert message == "工作流服务正在停止"
+    assert workflowoper.started is False
+
+
+def test_workflow_chain_releases_admitted_owner_when_start_fails(monkeypatch):
+    """数据库启动状态写入异常时不得遗留尚未执行的 manager owner。"""
+
+    class FailingWorkflowOper(_FakeWorkflowOper):
+        """模拟执行状态 start 事务失败。"""
+
+        def start(self, wid):
+            """在 owner 已准入后抛出持久化异常。"""
+            _ = wid
+            raise RuntimeError("start failed")
+
+    manager = object.__new__(workflow_package.WorkflowManager)
+    manager._lock = threading.RLock()
+    manager._actions = {"FakeAction": object()}
+    manager._event_workflows = {}
+    manager._accepting_executions = True
+    manager._executions = {}
+    workflowoper = FailingWorkflowOper(_build_workflow())
+    monkeypatch.setattr(workflow_module, "get_workflow_manager", lambda: manager)
+    monkeypatch.setattr(
+        workflow_module,
+        "get_configured_workflow_execution",
+        lambda: workflowoper,
+    )
+    monkeypatch.setattr(
+        workflow_module,
+        "get_configured_workflow_query",
+        lambda: SimpleNamespace(
+            get_sync=lambda _workflow_id: workflowoper.workflow
+        ),
+    )
+    monkeypatch.setattr(workflow_module.runtime_stop_state, "resume_workflow", lambda _workflow_id: None)
+
+    with pytest.raises(RuntimeError, match="start failed"):
+        workflow_module.WorkflowChain.process(workflow_id=1)
+
+    assert manager._executions == {}
+    assert manager._accepting_executions is True
 
 
 def test_workflow_context_merge_preserves_runtime_objects():
@@ -779,7 +1054,7 @@ class _FakeEventManager:
 def test_workflow_event_listener_keeps_shared_handler_until_last_workflow(monkeypatch):
     """同一事件下移除单个工作流时不应断开其他工作流监听。"""
     fake_eventmanager = _FakeEventManager()
-    manager = object.__new__(workflow_package.WorkFlowManager)
+    manager = object.__new__(workflow_package.WorkflowManager)
     manager._lock = threading.Lock()
     manager._event_workflows = {}
 
@@ -818,9 +1093,9 @@ def test_workflow_manager_retries_action_until_success(monkeypatch):
                 return ActionResult(success=False, message="第一次失败", context=context)
             return ActionResult(success=True, message="第二次成功", context=context, outputs={"ok": True})
 
-    manager = object.__new__(workflow_package.WorkFlowManager)
+    manager = object.__new__(workflow_package.WorkflowManager)
     manager._actions = {"RetryAction": RetryAction}
-    monkeypatch.setattr(workflow_package.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(workflow_package.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     result = manager.execute(
         workflow_id=1,

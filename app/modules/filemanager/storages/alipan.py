@@ -6,19 +6,17 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-import requests
-
-from app.schemas.file import StorageUsage as _SchemaStorageUsage
-from app.schemas.workflow import FileItem as _SchemaFileItem
-from app.runtime.config import settings, global_vars
-from app.runtime.log import logger
-from app.modules.filemanager import StorageBase
-from app.modules.filemanager.storages import transfer_process
-from app.schemas.exception import StorageQueryError
-from app.schemas.types import StorageSchema
-from app.adapters.network.http import RequestUtils
-from app.foundation.singleton import WeakSingleton
+from app.adapters.network.http import HttpRequestError, RequestUtils
 from app.foundation import temporal as time_tools
+from app.foundation.singleton import WeakSingleton
+from app.modules.filemanager.storages import StorageBase, transfer_process
+from app.runtime.log import logger
+from app.runtime.settings import get_runtime_setting
+from app.runtime.stop import runtime_stop_state
+from app.schemas.exception import StorageQueryError
+from app.schemas.file import StorageUsage as _SchemaStorageUsage
+from app.schemas.types import StorageSchema
+from app.schemas.workflow import FileItem as _SchemaFileItem
 
 lock = threading.Lock()
 
@@ -46,7 +44,7 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
     base_url = "https://openapi.alipan.com"
 
     # 阿里云盘目录时间不随子文件变更而更新，默认关闭目录修改时间检查
-    snapshot_check_folder_modtime = settings.ALIPAN_SNAPSHOT_CHECK_FOLDER_MODTIME
+    snapshot_check_folder_modtime = get_runtime_setting('ALIPAN_SNAPSHOT_CHECK_FOLDER_MODTIME')
 
     # 文件块大小，默认10MB
     chunk_size = 10 * 1024 * 1024
@@ -54,14 +52,18 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
     def __init__(self):
         super().__init__()
         self._auth_state = {}
-        self.session = requests.Session()
+        self._request_utils = RequestUtils(
+            use_session=True,
+            timeout=20,
+            verify=True,
+        )
         self._init_session()
 
     def _init_session(self):
         """
         初始化带速率限制的会话
         """
-        self.session.headers.update({"Content-Type": "application/json"})
+        self._request_utils.update_headers({"Content-Type": "application/json"})
 
     def _check_session(self):
         """
@@ -101,7 +103,9 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
                     self.set_config({"refresh_time": int(time.time()), **tokens})
             access_token = tokens.get("access_token")
             if access_token:
-                self.session.headers.update({"Authorization": f"Bearer {access_token}"})
+                self._request_utils.update_headers(
+                    {"Authorization": f"Bearer {access_token}"}
+                )
             return access_token
 
     def generate_qrcode(self) -> Tuple[dict, str]:
@@ -112,10 +116,10 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
         # 生成PKCE参数
         code_verifier = secrets.token_urlsafe(96)[:128]
         # 请求设备码
-        resp = self.session.post(
+        resp = self._request_utils.post_res(
             f"{self.base_url}/oauth/authorize/qrcode",
             json={
-                "client_id": settings.ALIPAN_APP_ID,
+                "client_id": get_runtime_setting('ALIPAN_APP_ID'),
                 "scopes": [
                     "user:base",
                     "file:all:read",
@@ -151,7 +155,7 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
         if not self._auth_state:
             return {}, "生成二维码失败"
         try:
-            resp = self.session.get(
+            resp = self._request_utils.get_res(
                 f"{self.base_url}/oauth/qrcode/{self._auth_state['sid']}/status"
             )
             if resp is None:
@@ -167,7 +171,7 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
                     self.set_config({"refresh_time": int(time.time()), **tokens})
                     self.__get_drive_id()
             return {"status": status, "tip": _status_text.get(status, "未知错误")}, ""
-        except Exception as e:
+        except HttpRequestError as e:
             return {}, str(e)
 
     def __get_access_token(self) -> dict:
@@ -176,10 +180,10 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
         """
         if not self._auth_state:
             raise SessionInvalidException("【阿里云盘】请先生成二维码")
-        resp = self.session.post(
+        resp = self._request_utils.post_res(
             f"{self.base_url}/oauth/access_token",
             json={
-                "client_id": settings.ALIPAN_APP_ID,
+                "client_id": get_runtime_setting('ALIPAN_APP_ID'),
                 "grant_type": "authorization_code",
                 "code": self._auth_state["authCode"],
                 "code_verifier": self._auth_state["code_verifier"],
@@ -200,10 +204,10 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
         """
         if not refresh_token:
             raise SessionInvalidException("【阿里云盘】会话失效，请重新扫码登录！")
-        resp = self.session.post(
+        resp = self._request_utils.post_res(
             f"{self.base_url}/oauth/access_token",
             json={
-                "client_id": settings.ALIPAN_APP_ID,
+                "client_id": get_runtime_setting('ALIPAN_APP_ID'),
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
             },
@@ -224,7 +228,9 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
         """
         获取默认存储桶ID
         """
-        resp = self.session.post(f"{self.base_url}/adrive/v1.0/user/getDriveInfo")
+        resp = self._request_utils.post_res(
+            f"{self.base_url}/adrive/v1.0/user/getDriveInfo"
+        )
         if resp is None:
             logger.error("获取默认存储桶ID失败")
             return None
@@ -261,8 +267,13 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
         no_error_log = kwargs.pop("no_error_log", False)
 
         try:
-            resp = self.session.request(method, f"{self.base_url}{endpoint}", **kwargs)
-        except requests.exceptions.RequestException as e:
+            resp = self._request_utils.request(
+                method,
+                f"{self.base_url}{endpoint}",
+                raise_exception=True,
+                **kwargs,
+            )
+        except Exception as e:
             logger.error(f"【阿里云盘】{method} 请求 {endpoint} 网络错误: {str(e)}")
             return None
 
@@ -343,6 +354,10 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
 
     def init_storage(self):
         pass
+
+    def close(self) -> None:
+        """关闭阿里云盘 HTTP 客户端。"""
+        self._request_utils.close()
 
     def list(self, fileitem: _SchemaFileItem) -> List[_SchemaFileItem]:
         """
@@ -561,7 +576,7 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
         """
         上传单个分片
         """
-        return requests.put(upload_url, data=data, timeout=60.0)
+        return RequestUtils(timeout=60, verify=True).put_res(upload_url, data=data)
 
     def _list_uploaded_parts(self, drive_id: str, file_id: str, upload_id: str) -> dict:
         """
@@ -643,7 +658,7 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
         uploaded_size = 0
         with open(local_path, "rb") as f:
             for part_info in part_info_list:
-                if global_vars.is_transfer_stopped(local_path.as_posix()):
+                if runtime_stop_state.consume_transfer_stop(local_path.as_posix()):
                     logger.info(f"【阿里云盘】{target_name} 上传已取消！")
                     return None
 
@@ -743,7 +758,7 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
             logger.error(f"【阿里云盘】下载链接为空: {fileitem.name}")
             return None
 
-        local_path = self._build_download_path(fileitem, path or settings.TEMP_PATH)
+        local_path = self._build_download_path(fileitem, path or get_runtime_setting('TEMP_PATH'))
         if not local_path:
             return None
 
@@ -757,7 +772,7 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
         try:
             # 构建请求头，包含必要的认证信息
             headers = {
-                "User-Agent": settings.NORMAL_USER_AGENT,
+                "User-Agent": get_runtime_setting('NORMAL_USER_AGENT'),
                 "Referer": "https://www.aliyundrive.com/",
                 "Accept": "*/*",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
@@ -778,7 +793,7 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
                 downloaded_size = 0
                 with open(local_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=self.chunk_size):
-                        if global_vars.is_transfer_stopped(fileitem.path):
+                        if runtime_stop_state.consume_transfer_stop(fileitem.path):
                             logger.info(f"【阿里云盘】{fileitem.path} 下载已取消！")
                             return None
                         if chunk:
@@ -813,7 +828,7 @@ class AliPan(StorageBase, metaclass=WeakSingleton):
                 json={"drive_id": fileitem.drive_id, "file_id": fileitem.fileid},
             )
             return True
-        except requests.exceptions.HTTPError:
+        except HttpRequestError:
             return False
 
     def rename(self, fileitem: _SchemaFileItem, name: str) -> bool:

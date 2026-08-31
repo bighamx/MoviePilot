@@ -41,6 +41,21 @@ def configure_service_directory(
     _module_loader = modules
 
 
+def reset_service_directory() -> None:
+    """恢复未装配服务目录，禁止跨 lifespan 复用旧模块对象。"""
+    global _config_loader, _module_loader
+    _config_loader = _unconfigured_configs
+    _module_loader = _unconfigured_modules
+
+
+def get_service_configs(
+    config_key: SystemConfigKey,
+    conf_type: Type[TConf],
+) -> list[TConf]:
+    """通过组合根登记的读取器返回已校验服务配置。"""
+    return _config_loader(config_key, conf_type)
+
+
 class ServiceBaseHelper(Generic[TConf]):
     """通过应用端口查询服务配置和对应运行实例。"""
 
@@ -57,7 +72,7 @@ class ServiceBaseHelper(Generic[TConf]):
 
     def get_configs(self, include_disabled: bool = False) -> Dict[str, TConf]:
         """返回按名称索引的有效服务配置。"""
-        configs = _config_loader(self.config_key, self.conf_type)
+        configs = get_service_configs(self.config_key, self.conf_type)
         return {
             config.name: config
             for config in configs

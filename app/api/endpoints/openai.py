@@ -1,14 +1,34 @@
 import asyncio
-import json
 import time
 import uuid
 from threading import Lock
 from typing import AsyncIterator, List, Optional, Tuple
 
-from fastapi import APIRouter, Request, Security
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Request, Security
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials
 
+from app.adapters.web.security.access import (
+    openai_bearer_scheme,
+    validate_api_credential_identity,
+)
+from app.agent.contracts import ReplyMode
+from app.agent.loader import get_moviepilot_agent_type
+from app.api.context import (
+    get_background_task_registry_compat,
+    resolve_background_task_registry,
+)
+from app.api.presentation.sse import build_sse_response, encode_data_event
+from app.api.protocol import (
+    build_completion_payload,
+    build_prompt,
+    build_responses_input,
+    build_session_id,
+)
+from app.application.agent import get_running_agent_manager
+from app.application.configuration import get_api_runtime_config_snapshot
+from app.runtime.execution import run_in_threadpool
+from app.runtime.tasks import TaskRegistry
 from app.schemas.openai import OpenAIChatCompletionResponse as _SchemaOpenAIChatCompletionResponse
 from app.schemas.openai import OpenAIChatCompletionsRequest as _SchemaOpenAIChatCompletionsRequest
 from app.schemas.openai import OpenAIErrorDetail as _SchemaOpenAIErrorDetail
@@ -20,19 +40,6 @@ from app.schemas.openai import OpenAIResponsesOutputText as _SchemaOpenAIRespons
 from app.schemas.openai import OpenAIResponsesRequest as _SchemaOpenAIResponsesRequest
 from app.schemas.openai import OpenAIResponsesResponse as _SchemaOpenAIResponsesResponse
 from app.schemas.openai import OpenAIUsage as _SchemaOpenAIUsage
-from app.api.openai_utils import (
-    build_completion_payload,
-    build_prompt,
-    build_responses_input,
-    build_session_id,
-)
-from app.agent.runtime_loader import (
-    get_moviepilot_agent_type,
-    get_running_agent_manager,
-)
-from app.agent.contracts import ReplyMode
-from app.runtime.config import settings
-from app.adapters.web.security.access import openai_bearer_scheme
 from app.schemas.types import NotificationChannel
 
 OPENAI_ERROR_RESPONSES = {
@@ -216,7 +223,8 @@ def _get_collecting_agent_type() -> type:
 
 
 def _sse_payload(data: dict) -> str:
-    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+    """保留旧测试入口并委托独立 OpenAI SSE wire mapper。"""
+    return encode_data_event(data)
 
 
 async def _stream_response(
@@ -227,6 +235,7 @@ async def _stream_response(
     prompt: str,
     images: List[str],
     cleanup_session: bool,
+    task_registry: TaskRegistry | None = None,
 ) -> AsyncIterator[str]:
     event_queue: asyncio.Queue = asyncio.Queue()
 
@@ -254,7 +263,10 @@ async def _stream_response(
         finally:
             await event_queue.put(None)
 
-    task = asyncio.create_task(_run_agent())
+    task = resolve_background_task_registry(task_registry).create(
+        _run_agent(),
+        owner="api.openai.stream",
+    )
 
     try:
         yield _sse_payload(
@@ -345,6 +357,35 @@ def _is_manager_unavailable(error: BaseException) -> bool:
     return getattr(error, "code", None) == "agent_manager_unavailable"
 
 
+def _is_manager_queue_full(error: BaseException) -> bool:
+    """识别 Agent 会话排队已满，供兼容 API 返回可重试状态。"""
+    return getattr(error, "code", None) == "agent_manager_queue_full"
+
+
+def _manager_execution_error(error: BaseException) -> JSONResponse:
+    """把 AgentManager 稳定错误映射为 OpenAI 兼容错误响应。"""
+    if _is_manager_unavailable(error):
+        return _error_response(
+            "MoviePilot AI agent is unavailable.",
+            503,
+            error_type="server_error",
+            code="ai_agent_unavailable",
+        )
+    if _is_manager_queue_full(error):
+        return _error_response(
+            str(error),
+            429,
+            error_type="rate_limit_error",
+            code="ai_agent_queue_full",
+        )
+    return _error_response(
+        str(error),
+        500,
+        error_type="server_error",
+        code="agent_execution_failed",
+    )
+
+
 async def _run_managed_agent(
     *,
     manager,
@@ -410,7 +451,7 @@ def _error_response(
     )
 
 
-def _check_auth(
+async def _check_auth(
     credentials: Optional[HTTPAuthorizationCredentials],
 ) -> Optional[JSONResponse]:
     """
@@ -423,12 +464,26 @@ def _check_auth(
             error_type="authentication_error",
             code="invalid_api_key",
         )
-    if credentials.credentials != settings.API_TOKEN:
+    if credentials.credentials != get_api_runtime_config_snapshot().api_token:
         return _error_response(
             "Invalid bearer token.",
             401,
             error_type="authentication_error",
             code="invalid_api_key",
+        )
+    try:
+        await run_in_threadpool(validate_api_credential_identity)
+    except HTTPException as error:
+        authentication_error = error.status_code == 401
+        return _error_response(
+            (
+                "Invalid bearer token."
+                if authentication_error
+                else "Authentication service unavailable."
+            ),
+            error.status_code,
+            error_type="authentication_error" if authentication_error else "api_error",
+            code="invalid_api_key" if authentication_error else None,
         )
     return None
 
@@ -443,7 +498,7 @@ async def list_models(
         openai_bearer_scheme
     ),
 ):
-    auth_error = _check_auth(credentials)
+    auth_error = await _check_auth(credentials)
     if auth_error:
         return auth_error
     now = int(time.time())
@@ -452,31 +507,19 @@ async def list_models(
     )
 
 
-@router.post(
-    "/chat/completions",
-    summary="OpenAI compatible chat completions",
-    response_model=_SchemaOpenAIChatCompletionResponse,
-    responses={
-        200: {
-            "description": "OpenAI chat completion 或 SSE 数据流",
-            "content": {
-                "text/event-stream": {"schema": {"type": "string"}},
-            },
-        }
-    },
-)
-async def chat_completions(
+async def _chat_completions_impl(
     payload: _SchemaOpenAIChatCompletionsRequest,
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Security(
         openai_bearer_scheme
     ),
+    task_registry: TaskRegistry | None = None,
 ):
-    auth_error = _check_auth(credentials)
+    auth_error = await _check_auth(credentials)
     if auth_error:
         return auth_error
 
-    if not settings.AI_AGENT_ENABLE:
+    if not get_api_runtime_config_snapshot().ai_agent_enable:
         return _error_response(
             "MoviePilot AI agent is disabled.",
             503,
@@ -519,7 +562,7 @@ async def chat_completions(
     session_id = build_session_id(session_key, SESSION_PREFIX)
     username = str(payload.user or "openai-client")
     if payload.stream:
-        return StreamingResponse(
+        return build_sse_response(
             _stream_response(
                 manager=manager,
                 session_id=session_id,
@@ -528,13 +571,8 @@ async def chat_completions(
                 prompt=prompt,
                 images=images,
                 cleanup_session=not use_server_session,
+                task_registry=task_registry,
             ),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
         )
 
     collected_messages = []
@@ -550,19 +588,7 @@ async def chat_completions(
             stream_mode=False,
         )
     except Exception as exc:
-        if _is_manager_unavailable(exc):
-            return _error_response(
-                "MoviePilot AI agent is unavailable.",
-                503,
-                error_type="server_error",
-                code="ai_agent_unavailable",
-            )
-        return _error_response(
-            str(exc),
-            500,
-            error_type="server_error",
-            code="agent_execution_failed",
-        )
+        return _manager_execution_error(exc)
     finally:
         if not use_server_session:
             await manager.clear_session(session_id=session_id, user_id=session_key)
@@ -580,22 +606,17 @@ async def chat_completions(
     return JSONResponse(content=build_completion_payload(content, MODEL_ID))
 
 
-@router.post(
-    "/responses",
-    summary="OpenAI compatible responses",
-    response_model=_SchemaOpenAIResponsesResponse,
-)
-async def responses(
+async def _responses_impl(
     payload: _SchemaOpenAIResponsesRequest,
     credentials: Optional[HTTPAuthorizationCredentials] = Security(
         openai_bearer_scheme
     ),
 ):
-    auth_error = _check_auth(credentials)
+    auth_error = await _check_auth(credentials)
     if auth_error:
         return auth_error
 
-    if not settings.AI_AGENT_ENABLE:
+    if not get_api_runtime_config_snapshot().ai_agent_enable:
         return _error_response(
             "MoviePilot AI agent is disabled.",
             503,
@@ -650,19 +671,7 @@ async def responses(
             stream_mode=False,
         )
     except Exception as exc:
-        if _is_manager_unavailable(exc):
-            return _error_response(
-                "MoviePilot AI agent is unavailable.",
-                503,
-                error_type="server_error",
-                code="ai_agent_unavailable",
-            )
-        return _error_response(
-            str(exc),
-            500,
-            error_type="server_error",
-            code="agent_execution_failed",
-        )
+        return _manager_execution_error(exc)
     finally:
         if not payload.user:
             await manager.clear_session(session_id=session_id, user_id=session_key)
@@ -690,3 +699,37 @@ async def responses(
         output=[output_message],
         usage=_SchemaOpenAIUsage(),
     )
+
+
+@router.post(
+    "/chat/completions",
+    summary="OpenAI compatible chat completions",
+    response_model=_SchemaOpenAIChatCompletionResponse,
+    responses={200: {"description": "OpenAI chat completion 或 SSE 数据流", "content": {"text/event-stream": {"schema": {"type": "string"}}}}},
+)
+async def chat_completions(
+    payload: _SchemaOpenAIChatCompletionsRequest,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(openai_bearer_scheme),
+    task_registry: TaskRegistry = Depends(get_background_task_registry_compat),
+):
+    """OpenAI Chat Completions 兼容公开入口。"""
+    return await _chat_completions_impl(
+        payload,
+        request,
+        credentials,
+        task_registry=task_registry,
+    )
+
+
+@router.post(
+    "/responses",
+    summary="OpenAI compatible responses",
+    response_model=_SchemaOpenAIResponsesResponse,
+)
+async def responses(
+    payload: _SchemaOpenAIResponsesRequest,
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(openai_bearer_scheme),
+):
+    """OpenAI Responses 兼容公开入口。"""
+    return await _responses_impl(payload, credentials)

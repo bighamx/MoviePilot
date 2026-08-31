@@ -1,16 +1,19 @@
 from types import SimpleNamespace
 
-from app.schemas import ActionContext, DownloadTask, FileItem
-from app.schemas.workflow import ActionResult
+from app.domain.context import Context, TorrentInfo
+from app.domain.metainfo import MetaInfo
+from app.schemas.download import DownloadTask
+from app.schemas.file import FileItem
+from app.schemas.workflow import ActionContext, ActionResult
+from app.workflow import WorkflowManager
 from app.workflow.actions import BaseAction
 from app.workflow.actions import fetch_downloads as fetch_downloads_module
 from app.workflow.actions import fetch_torrents as fetch_torrents_module
 from app.workflow.actions import scrape_file as scrape_file_module
 from app.workflow.actions.fetch_downloads import FetchDownloadsAction
+from app.workflow.actions.fetch_rss import FetchRssAction
 from app.workflow.actions.fetch_torrents import FetchTorrentsAction
 from app.workflow.actions.scrape_file import ScrapeFileAction
-from app.workflow.actions.fetch_rss import FetchRssAction
-from app.workflow import WorkFlowManager
 
 
 def test_fetch_downloads_updates_context_downloads(monkeypatch):
@@ -25,7 +28,7 @@ def test_fetch_downloads_updates_context_downloads(monkeypatch):
             return [SimpleNamespace(path="/downloads/movie.mkv", progress=100)]
 
     monkeypatch.setattr(fetch_downloads_module, "ActionChain", FakeActionChain)
-    monkeypatch.setattr(fetch_downloads_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(fetch_downloads_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
 
     context = ActionContext(
         downloads=[
@@ -52,20 +55,18 @@ def test_fetch_torrents_filters_special_season_zero(monkeypatch):
 
         def search_by_title(self, **_kwargs):
             return [
-                SimpleNamespace(
-                    meta_info=SimpleNamespace(year=None, begin_season=0),
-                    media_info=None,
-                    torrent_info=SimpleNamespace(title="Test S00"),
+                Context(
+                    meta_info=MetaInfo("Test S00"),
+                    torrent_info=TorrentInfo(title="Test S00"),
                 ),
-                SimpleNamespace(
-                    meta_info=SimpleNamespace(year=None, begin_season=1),
-                    media_info=None,
-                    torrent_info=SimpleNamespace(title="Test S01"),
+                Context(
+                    meta_info=MetaInfo("Test S01"),
+                    torrent_info=TorrentInfo(title="Test S01"),
                 ),
             ]
 
     monkeypatch.setattr(fetch_torrents_module, "SearchChain", FakeSearchChain)
-    monkeypatch.setattr(fetch_torrents_module.global_vars, "is_workflow_stopped", lambda _workflow_id: False)
+    monkeypatch.setattr(fetch_torrents_module.runtime_stop_state, "is_workflow_stopped", lambda _workflow_id: False)
 
     action = FetchTorrentsAction("fetch-torrents")
     action.job_done = lambda *_args, **_kwargs: None
@@ -103,7 +104,7 @@ def test_scrape_file_keeps_workflow_action_context(monkeypatch):
     monkeypatch.setattr(scrape_file_module, "StorageChain", FakeStorageChain)
     monkeypatch.setattr(scrape_file_module, "MediaChain", FakeMediaChain)
     monkeypatch.setattr(scrape_file_module, "ScrapingChain", FakeScrapingChain)
-    monkeypatch.setattr(scrape_file_module.global_vars, "is_workflow_stopped", lambda workflow_id: False)
+    monkeypatch.setattr(scrape_file_module.runtime_stop_state, "is_workflow_stopped", lambda workflow_id: False)
     monkeypatch.setattr(ScrapeFileAction, "check_cache", lambda self, workflow_id, key: False)
     monkeypatch.setattr(ScrapeFileAction, "save_cache", lambda self, workflow_id, data: None)
 
@@ -150,7 +151,7 @@ def test_scrape_file_does_not_cache_failed_music_scrape(monkeypatch):
     monkeypatch.setattr(scrape_file_module, "MediaChain", FakeMediaChain)
     monkeypatch.setattr(scrape_file_module, "ScrapingChain", FakeScrapingChain)
     monkeypatch.setattr(
-        scrape_file_module.global_vars,
+        scrape_file_module.runtime_stop_state,
         "is_workflow_stopped",
         lambda workflow_id: False,
     )
@@ -192,20 +193,9 @@ def test_execute_with_inputs_maps_contract_inputs_outputs_and_runtime(monkeypatc
             "outputs": [{"name": "downloads", "label": "下载任务", "kind": "list"}],
         }
 
-        @classmethod
-        @property
-        def name(cls) -> str:
-            return "契约动作"
-
-        @classmethod
-        @property
-        def description(cls) -> str:
-            return "测试契约动作"
-
-        @classmethod
-        @property
-        def data(cls) -> dict:
-            return {}
+        name = "契约动作"
+        description = "测试契约动作"
+        data = {}
 
         @property
         def success(self) -> bool:
@@ -249,10 +239,13 @@ def test_execute_with_inputs_maps_contract_inputs_outputs_and_runtime(monkeypatc
 
 def test_workflow_manager_list_actions_exposes_contract():
     """动作列表应返回固定输入输出契约。"""
-    manager = object.__new__(WorkFlowManager)
+    manager = object.__new__(WorkflowManager)
     manager._actions = {"FetchRssAction": FetchRssAction}
 
     actions = manager.list_actions()
 
+    assert actions[0]["name"] == "获取RSS资源"
+    assert actions[0]["description"] == "订阅RSS地址获取资源"
+    assert isinstance(actions[0]["data"], dict)
     assert actions[0]["contract"]["outputs"][0]["name"] == "torrents"
     assert actions[0]["contract"]["condition_fields"][0]["label"] == "资源"

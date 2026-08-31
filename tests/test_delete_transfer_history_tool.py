@@ -1,8 +1,21 @@
 import asyncio
+import threading
 from types import SimpleNamespace
 
+from app.agent.prompt.transfer import build_manual_redo_template_context
 from app.agent.tools.impl.delete_transfer_history import DeleteTransferHistoryTool
-from app.agent.prompt.transfer_redo import build_manual_redo_template_context
+
+
+def _tool(history_repository, execution_repository=None):
+    """构造显式注入整理仓储的工具。"""
+    return DeleteTransferHistoryTool(
+        session_id="redo-session",
+        user_id="10001",
+        data=SimpleNamespace(
+            transfer_history=history_repository,
+            transfer_execution=execution_repository or SimpleNamespace(),
+        ),
+    )
 
 
 def test_delete_transfer_history_tool_removes_old_dest_file_before_history(monkeypatch):
@@ -40,15 +53,11 @@ def test_delete_transfer_history_tool_removes_old_dest_file_before_history(monke
             return True
 
     monkeypatch.setattr(
-        "app.agent.tools.impl.delete_transfer_history.TransferHistoryOper",
-        FakeTransferHistoryOper,
-    )
-    monkeypatch.setattr(
         "app.agent.tools.impl.delete_transfer_history.StorageChain",
         FakeStorageChain,
     )
 
-    tool = DeleteTransferHistoryTool(session_id="redo-session", user_id="10001")
+    tool = _tool(FakeTransferHistoryOper())
     result = asyncio.run(tool.run(history_id=7))
 
     assert "已删除整理历史记录" in result
@@ -95,15 +104,11 @@ def test_delete_transfer_history_tool_keeps_history_when_old_dest_delete_fails(m
             return False
 
     monkeypatch.setattr(
-        "app.agent.tools.impl.delete_transfer_history.TransferHistoryOper",
-        FakeTransferHistoryOper,
-    )
-    monkeypatch.setattr(
         "app.agent.tools.impl.delete_transfer_history.StorageChain",
         FakeStorageChain,
     )
 
-    tool = DeleteTransferHistoryTool(session_id="redo-session", user_id="10001")
+    tool = _tool(FakeTransferHistoryOper())
     result = asyncio.run(tool.run(history_id=8))
 
     assert "旧媒体库文件删除失败" in result
@@ -149,15 +154,11 @@ def test_delete_transfer_history_tool_deletes_history_when_old_dest_is_missing(m
             return False
 
     monkeypatch.setattr(
-        "app.agent.tools.impl.delete_transfer_history.TransferHistoryOper",
-        FakeTransferHistoryOper,
-    )
-    monkeypatch.setattr(
         "app.agent.tools.impl.delete_transfer_history.StorageChain",
         FakeStorageChain,
     )
 
-    tool = DeleteTransferHistoryTool(session_id="redo-session", user_id="10001")
+    tool = _tool(FakeTransferHistoryOper())
     result = asyncio.run(tool.run(history_id=13))
 
     assert "已删除整理历史记录" in result
@@ -204,15 +205,11 @@ def test_delete_transfer_history_tool_keeps_successful_move_dest_as_reorganize_s
             return True
 
     monkeypatch.setattr(
-        "app.agent.tools.impl.delete_transfer_history.TransferHistoryOper",
-        FakeTransferHistoryOper,
-    )
-    monkeypatch.setattr(
         "app.agent.tools.impl.delete_transfer_history.StorageChain",
         FakeStorageChain,
     )
 
-    tool = DeleteTransferHistoryTool(session_id="redo-session", user_id="10001")
+    tool = _tool(FakeTransferHistoryOper())
     result = asyncio.run(tool.run(history_id=9))
 
     assert "已删除整理历史记录" in result
@@ -257,15 +254,11 @@ def test_delete_transfer_history_tool_only_treats_exact_move_as_reorganize_sourc
             return True
 
     monkeypatch.setattr(
-        "app.agent.tools.impl.delete_transfer_history.TransferHistoryOper",
-        FakeTransferHistoryOper,
-    )
-    monkeypatch.setattr(
         "app.agent.tools.impl.delete_transfer_history.StorageChain",
         FakeStorageChain,
     )
 
-    tool = DeleteTransferHistoryTool(session_id="redo-session", user_id="10001")
+    tool = _tool(FakeTransferHistoryOper())
     result = asyncio.run(tool.run(history_id=11))
 
     assert "已删除旧媒体库文件" in result
@@ -275,6 +268,116 @@ def test_delete_transfer_history_tool_only_treats_exact_move_as_reorganize_sourc
         ("delete_dest", "/library/奔跑吧 (2014)/Keep.Running.mkv"),
         ("delete_history", 11),
     ]
+
+
+def test_delete_transfer_history_storage_work_runs_outside_event_loop(monkeypatch):
+    """整理历史的本地存储操作应在 storage worker 中执行。"""
+    caller_thread = threading.get_ident()
+    storage_threads = []
+    history = SimpleNamespace(
+        id=15,
+        title="奔跑吧",
+        src="/downloads/Keep.Running.mkv",
+        status=True,
+        mode="copy",
+        dest_fileitem={
+            "storage": "local",
+            "path": "/library/奔跑吧 (2014)/Keep.Running.mkv",
+            "name": "Keep.Running.mkv",
+            "type": "file",
+        },
+    )
+
+    class FakeTransferHistoryOper:
+        async def async_get(self, history_id):
+            return history
+
+        async def async_delete(self, history_id):
+            return None
+
+    class FakeStorageChain:
+        def exists(self, fileitem):
+            storage_threads.append(threading.get_ident())
+            return True
+
+        def delete_media_file(self, fileitem):
+            storage_threads.append(threading.get_ident())
+            return True
+
+    monkeypatch.setattr(
+        "app.agent.tools.impl.delete_transfer_history.StorageChain",
+        FakeStorageChain,
+    )
+
+    result = asyncio.run(
+        _tool(FakeTransferHistoryOper()).run(history_id=15)
+    )
+
+    assert "已删除整理历史记录" in result
+    assert storage_threads
+    assert all(thread_id != caller_thread for thread_id in storage_threads)
+
+
+def test_delete_transfer_history_cancellation_keeps_history_record(monkeypatch):
+    """取消等待存储清理时不得继续提交整理历史删除。"""
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    history = SimpleNamespace(
+        id=16,
+        title="奔跑吧",
+        src="/downloads/Keep.Running.mkv",
+        status=True,
+        mode="copy",
+        dest_fileitem={
+            "storage": "local",
+            "path": "/library/奔跑吧 (2014)/Keep.Running.mkv",
+            "name": "Keep.Running.mkv",
+            "type": "file",
+        },
+    )
+    delete_history_calls = []
+
+    class FakeTransferHistoryOper:
+        async def async_get(self, history_id):
+            return history
+
+        async def async_delete(self, history_id):
+            delete_history_calls.append(history_id)
+
+    class FakeStorageChain:
+        def exists(self, fileitem):
+            started.set()
+            release.wait(timeout=1)
+            return True
+
+        def delete_media_file(self, fileitem):
+            finished.set()
+            return True
+
+    monkeypatch.setattr(
+        "app.agent.tools.impl.delete_transfer_history.StorageChain",
+        FakeStorageChain,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(
+            _tool(FakeTransferHistoryOper()).run(history_id=16)
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        release.set()
+
+    assert delete_history_calls == []
+    assert finished.wait(timeout=1)
 
 
 def test_manual_redo_context_uses_dest_path_for_successful_move_record():

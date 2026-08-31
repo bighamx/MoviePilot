@@ -6,7 +6,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import get_id_column, Base
-from app.db.decorators import db_query, db_update, async_db_query
 
 
 class SiteStatistic(Base):
@@ -30,17 +29,21 @@ class SiteStatistic(Base):
     note: Mapped[Optional[Any]] = mapped_column(JSON)
 
     @classmethod
-    @db_query
     def get_by_domain(cls, db: Session, domain: str):
+        """在调用方 Session 中查询站点统计。"""
         return db.execute(select(cls).where(cls.domain == domain)).scalars().first()
 
     @classmethod
-    @async_db_query
-    async def async_get_by_domain(cls, db: AsyncSession, domain: str):
+    async def async_get_by_domain(
+        cls,
+        db: AsyncSession,
+        domain: str,
+    ):
+        """在调用方 AsyncSession 中查询站点统计。"""
         result = await db.execute(select(cls).where(cls.domain == domain))
         return result.scalar_one_or_none()
 
     @classmethod
-    @db_update
     def reset(cls, db: Session):
+        """在调用方持有的事务中暂存统计表清空操作。"""
         db.execute(delete(cls))

@@ -2,18 +2,22 @@ from types import SimpleNamespace
 
 from app.api.endpoints.transfer import (
     manual_transfer as manual_transfer_endpoint,
+)
+from app.api.endpoints.transfer import (
     query_manual_transfer_history,
 )
-from app.chain.transfer import TransferChain
-from app.runtime.config import settings
-from app.db.oper.transferhistory import TransferHistoryOper
 from app.application.history import (
+    TransferHistoryWrite,
     clear_transfer_failures,
     failed_retry_count,
     max_failed_retries,
     record_transfer_failure,
 )
-from app.schemas import ManualTransferItem
+from app.chain.transfer import TransferChain
+from app.db.adapters.history.transfer import TransactionalTransferHistoryRepository
+from app.db.session import SessionFactory, async_session_scope
+from app.runtime.config import settings
+from app.schemas.transfer import ManualTransferItem
 from tests.test_transfer_sync_extra_files import (
     FakeMeta,
     make_fileitem,
@@ -24,6 +28,14 @@ from tests.test_transfer_sync_extra_files import (
 def _reset_failed_retries(src_path, storage=None):
     """清空失败重试计数，隔离用例之间共享的模块级计数缓存。"""
     clear_transfer_failures(src_path, storage)
+
+
+def _history_repository() -> TransactionalTransferHistoryRepository:
+    """构造类型化整理历史仓储。"""
+    return TransactionalTransferHistoryRepository(
+        sync_session=SessionFactory,
+        async_session=async_session_scope,
+    )
 
 
 def _patch_transfer_planning(monkeypatch, chain, fileitem, history, planned, deleted):
@@ -58,33 +70,20 @@ def _patch_transfer_planning(monkeypatch, chain, fileitem, history, planned, del
         get_by_dest=lambda dest, storage=None: None,
         delete=lambda history_id: deleted.append(("history", history_id)),
     )
-    monkeypatch.setattr(
-        "app.chain.transfer.TransferHistoryOper",
-        lambda: history_oper,
+    chain.transfer_history_repository = history_oper
+    chain.download_history_repository = SimpleNamespace(
+        get_by_hash=lambda download_hash: None,
+        get_file_by_fullpath=lambda fullpath: None,
+        get_files_by_savepath=lambda savepath: [],
+        get_by_path=lambda path: None,
     )
-    monkeypatch.setattr("app.chain._transfer.TransferHistoryOper", lambda: history_oper)
     monkeypatch.setattr(
-        "app.chain.transfer.DownloadHistoryOper",
-        lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ),
-    )
-    monkeypatch.setattr("app.chain._transfer.DownloadHistoryOper", lambda: SimpleNamespace(
-            get_by_hash=lambda download_hash: None,
-            get_file_by_fullpath=lambda fullpath: None,
-            get_files_by_savepath=lambda savepath: [],
-            get_by_path=lambda path: None,
-        ))
-    monkeypatch.setattr(
-        "app.chain.transfer.get_configured_system_config",
+        "app.chain.transfer.workflow.get_configured_system_config",
         lambda: SimpleNamespace(get=lambda key: None),
     )
-    monkeypatch.setattr("app.chain._transfer.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
+    monkeypatch.setattr("app.chain.transfer.format.get_configured_system_config", lambda: SimpleNamespace(get=lambda key: None))
     monkeypatch.setattr(
-        "app.chain.transfer.StorageChain",
+        "app.chain.transfer.settlement.StorageChain",
         lambda: SimpleNamespace(
             exists=lambda current_fileitem: True,
             delete_media_file=lambda current_fileitem: deleted.append(
@@ -93,7 +92,7 @@ def _patch_transfer_planning(monkeypatch, chain, fileitem, history, planned, del
             or True,
         ),
     )
-    monkeypatch.setattr("app.chain._transfer.StorageChain", lambda: SimpleNamespace(
+    monkeypatch.setattr("app.chain.transfer.records.StorageChain", lambda: SimpleNamespace(
             exists=lambda current_fileitem: True,
             delete_media_file=lambda current_fileitem: deleted.append(
                 ("target", current_fileitem.path)
@@ -101,7 +100,7 @@ def _patch_transfer_planning(monkeypatch, chain, fileitem, history, planned, del
             or True,
         ))
     monkeypatch.setattr(
-        "app.chain.transfer.MetaInfoPath",
+        "app.chain.transfer.request.MetaInfoPath",
         lambda path, custom_words=None, **kwargs: FakeMeta(1),
     )
 
@@ -211,23 +210,23 @@ def test_history_endpoint_reorganize_uses_chain_cleanup(monkeypatch):
 
 def test_success_history_directory_query_excludes_failed_and_siblings():
     """目录历史查询应限定路径边界，并且只返回成功记录。"""
-    transfer_history_oper = TransferHistoryOper()
+    transfer_history_oper = _history_repository()
     created_histories = [
-        transfer_history_oper.add_force(
+        transfer_history_oper.replace(TransferHistoryWrite(
             src="/issue-6191/show/episode-1.mkv",
             src_storage="local",
             status=True,
-        ),
-        transfer_history_oper.add_force(
+        )),
+        transfer_history_oper.replace(TransferHistoryWrite(
             src="/issue-6191/show/episode-2.mkv",
             src_storage="local",
             status=False,
-        ),
-        transfer_history_oper.add_force(
+        )),
+        transfer_history_oper.replace(TransferHistoryWrite(
             src="/issue-6191/show-other/episode-3.mkv",
             src_storage="local",
             status=True,
-        ),
+        )),
     ]
     try:
         histories = transfer_history_oper.list_success_by_src(
@@ -246,18 +245,18 @@ def test_success_history_directory_query_excludes_failed_and_siblings():
 
 def test_success_history_directory_query_escapes_sql_wildcards():
     """目录名中的 SQL 通配符应按普通字符匹配，不能扩大查询范围。"""
-    transfer_history_oper = TransferHistoryOper()
+    transfer_history_oper = _history_repository()
     created_histories = [
-        transfer_history_oper.add_force(
+        transfer_history_oper.replace(TransferHistoryWrite(
             src="/issue-6191/show_100%/episode-1.mkv",
             src_storage="local",
             status=True,
-        ),
-        transfer_history_oper.add_force(
+        )),
+        transfer_history_oper.replace(TransferHistoryWrite(
             src="/issue-6191/showA100B/episode-2.mkv",
             src_storage="local",
             status=True,
-        ),
+        )),
     ]
     try:
         histories = transfer_history_oper.list_success_by_src(
@@ -276,9 +275,9 @@ def test_success_history_directory_query_escapes_sql_wildcards():
 
 def test_successful_move_history_is_found_by_current_destination():
     """成功移动后从媒体库现址打开整理界面时，应识别原整理历史。"""
-    transfer_history_oper = TransferHistoryOper()
+    transfer_history_oper = _history_repository()
     destination = make_fileitem("/library/Test Show/Test.Show.S01E01.mkv")
-    history = transfer_history_oper.add_force(
+    history = transfer_history_oper.replace(TransferHistoryWrite(
         src="/downloads/Test.Show.S01E01.mkv",
         src_storage="local",
         dest=destination.path,
@@ -286,10 +285,12 @@ def test_successful_move_history_is_found_by_current_destination():
         dest_fileitem=destination.model_dump(),
         mode="move",
         status=True,
-    )
+    ))
     try:
+        chain = make_transfer_chain()
+        chain.transfer_history_repository = transfer_history_oper
         histories = TransferChain.get_manual_transfer_histories(
-            make_transfer_chain(),
+            chain,
             [destination],
         )
 

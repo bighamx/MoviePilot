@@ -4,29 +4,35 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pydantic import BaseModel
 
-from app.runtime.config import global_vars
-from app.runtime.events import eventmanager, Event
-from app.application.chain.data import WorkflowPortProxy as WorkflowOper
+from app.application.workflow import (
+    WorkflowExecutionOwner,
+    WorkflowSnapshot,
+    get_configured_workflow_query,
+)
 from app.foundation.reflection import ModuleHelper
-from app.runtime.log import logger
-from app.schemas.workflow import ActionContext
-from app.schemas.workflow import Action
-from app.schemas.workflow import ActionResult
-from app.schemas.workflow import Workflow
-from app.schemas.types import EventType
 from app.foundation.singleton import Singleton
+from app.runtime.events import Event, eventmanager
+from app.runtime.log import logger
+from app.runtime.stop import runtime_stop_state
+from app.schemas.types import EventType
+from app.schemas.workflow import Action, ActionContext, ActionResult
+
+_WORKFLOW_STOP_TIMEOUT_SECONDS = 10.0
 
 
-class WorkFlowManager(metaclass=Singleton):
+class WorkflowManager(metaclass=Singleton):
     """
     工作流管理器
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
+        """创建动作、事件触发器和活动执行 owner 注册表。"""
         # 所有动作定义
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._actions: Dict[str, Any] = {}
         self._event_workflows: Dict[str, List[int]] = {}
+        self._accepting_executions = True
+        self._executions: Dict[int, WorkflowExecutionOwner] = {}
         self.init()
 
     def init(self):
@@ -62,14 +68,61 @@ class WorkFlowManager(metaclass=Singleton):
         # 加载工作流事件触发器
         self.load_workflow_events()
 
-    def stop(self):
+    def register_execution(self, owner: WorkflowExecutionOwner) -> bool:
+        """登记活动执行；生命周期封口后拒绝新的工作流。"""
+        with self._lock:
+            if not self._accepting_executions:
+                return False
+            self._executions[id(owner)] = owner
+            return True
+
+    def unregister_execution(self, owner: WorkflowExecutionOwner) -> None:
+        """仅在执行及其节点线程池真实终止后释放 owner。"""
+        with self._lock:
+            self._executions.pop(id(owner), None)
+
+    def stop(
+            self,
+            timeout: float = _WORKFLOW_STOP_TIMEOUT_SECONDS,
+    ) -> bool:
         """
-        停止
+        封口工作流入口并有限等待全部活动执行。
+
+        :param timeout: 等待活动执行真实终止的最长秒数
+        :return: 全部执行终止并安全释放动作注册表时返回 True
         """
-        for event_type_str in list(self._event_workflows.keys()):
+        with self._lock:
+            self._accepting_executions = False
+            event_type_values = tuple(self._event_workflows)
+        for event_type_str in event_type_values:
             self.remove_workflow_event(event_type_str=event_type_str)
-        self._actions = {}
-        self._event_workflows = {}
+        with self._lock:
+            self._event_workflows = {}
+            executions = tuple(self._executions.values())
+
+        converged = True
+        for execution in executions:
+            try:
+                execution.request_stop()
+            except Exception as err:
+                converged = False
+                logger.error("请求停止工作流执行失败：%s", err)
+
+        deadline = monotonic() + max(0.0, timeout)
+        for execution in executions:
+            try:
+                if not execution.wait_stopped(
+                        timeout=max(0.0, deadline - monotonic()),
+                ):
+                    converged = False
+            except Exception as err:
+                converged = False
+                logger.error("等待工作流执行停止失败：%s", err)
+        with self._lock:
+            converged = converged and not self._executions
+            if converged:
+                self._actions = {}
+        return converged
 
     def execute(self, workflow_id: int, action: Action, context: ActionContext = None,
                 inputs: Optional[dict] = None, runtime: Optional[dict] = None,
@@ -230,7 +283,7 @@ class WorkFlowManager(metaclass=Singleton):
     def _is_cancelled(workflow_id: int, cancel_token: Optional[Any]) -> bool:
         if cancel_token and cancel_token.is_cancelled():
             return True
-        return global_vars.is_workflow_stopped(workflow_id)
+        return runtime_stop_state.is_workflow_stopped(workflow_id)
 
     def _sleep_with_cancel(self, workflow_id: int, seconds: float, cancel_token: Optional[Any]) -> None:
         deadline = monotonic() + seconds
@@ -265,7 +318,7 @@ class WorkFlowManager(metaclass=Singleton):
             return {}
         return action.get_contract()
 
-    def update_workflow_event(self, workflow: Workflow):
+    def update_workflow_event(self, workflow: WorkflowSnapshot):
         """
         更新工作流事件触发器
         """
@@ -282,11 +335,11 @@ class WorkFlowManager(metaclass=Singleton):
         """
         workflows = []
         if workflow_id:
-            workflow = WorkflowOper().get(workflow_id)
+            workflow = get_configured_workflow_query().get_sync(workflow_id)
             if workflow:
                 workflows = [workflow]
         else:
-            workflows = WorkflowOper().get_event_triggered_workflows()
+            workflows = get_configured_workflow_query().list_event_enabled()
         try:
             for workflow in workflows:
                 self.update_workflow_event(workflow)
@@ -359,7 +412,7 @@ class WorkFlowManager(metaclass=Singleton):
         """
         try:
             # 检查工作流是否存在且启用
-            workflow = WorkflowOper().get(workflow_id)
+            workflow = get_configured_workflow_query().get_sync(workflow_id)
             if not workflow or workflow.state == 'P':
                 return
 

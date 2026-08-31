@@ -2,16 +2,14 @@ from typing import Optional
 
 from pydantic import Field
 
-from app.workflow.actions import BaseAction
 from app.chain.download import DownloadChain
 from app.chain.media import MediaChain
-from app.runtime.config import global_vars
 from app.domain.metainfo import MetaInfo
 from app.runtime.log import logger
-from app.schemas.workflow import ActionParams
-from app.schemas.workflow import ActionContext
-from app.schemas.workflow import DownloadTask
+from app.runtime.stop import runtime_stop_state
 from app.schemas.types import MediaType
+from app.schemas.workflow import ActionContext, ActionParams, DownloadTask
+from app.workflow.actions import BaseAction
 
 
 class AddDownloadParams(ActionParams):
@@ -40,20 +38,9 @@ class AddDownloadAction(BaseAction):
         self._added_downloads = []
         self._has_error = False
 
-    @classmethod
-    @property
-    def name(cls) -> str:  # noqa
-        return "添加下载"
-
-    @classmethod
-    @property
-    def description(cls) -> str:  # noqa
-        return "根据资源列表添加下载任务"
-
-    @classmethod
-    @property
-    def data(cls) -> dict:  # noqa
-        return AddDownloadParams().model_dump()
+    name = "添加下载"
+    description = "根据资源列表添加下载任务"
+    data = AddDownloadParams().model_dump()
 
     @property
     def success(self) -> bool:
@@ -66,7 +53,7 @@ class AddDownloadAction(BaseAction):
         params = AddDownloadParams(**params)
         _started = False
         for t in context.torrents:
-            if global_vars.is_workflow_stopped(workflow_id):
+            if runtime_stop_state.is_workflow_stopped(workflow_id):
                 break
             # 检查缓存
             cache_key = f"{t.torrent_info.site}-{t.torrent_info.title}"

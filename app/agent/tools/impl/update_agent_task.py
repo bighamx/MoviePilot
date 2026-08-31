@@ -7,9 +7,9 @@ from pydantic import BaseModel, Field, model_validator
 
 from app.agent.tools.base import MoviePilotTool
 from app.agent.tools.tags import ToolTag
-from app.runtime.config import settings
-from app.application.agentdata import AgentTaskPort as AgentTaskOper
+from app.application.agenttask import agent_task_to_dict
 from app.runtime.scheduling import TimerUtils
+from app.runtime.settings import get_runtime_setting
 
 
 class UpdateAgentTaskInput(BaseModel):
@@ -98,11 +98,14 @@ class UpdateAgentTaskTool(MoviePilotTool):
         """生成更新定时任务的提示消息。"""
         return f"更新自主定时任务：{kwargs.get('task_id', '')}"
 
-    def _update_task(self, payload: UpdateAgentTaskInput) -> Optional[dict]:
+    def _update_task(
+        self,
+        payload: UpdateAgentTaskInput,
+    ) -> Optional[dict[str, object]]:
         """更新当前用户的任务并刷新运行时调度。"""
         from app.application.scheduling import update_agent_task_job
 
-        oper = AgentTaskOper()
+        oper = self.data.tasks
         task = oper.get(task_id=payload.task_id, user_id=str(self._user_id))
         if not task:
             return None
@@ -113,7 +116,7 @@ class UpdateAgentTaskTool(MoviePilotTool):
         trigger_type = payload.trigger_type or task.trigger_type
         trigger_value = payload.trigger
         if trigger_type == "date" and payload.delay_minutes is not None:
-            timezone = pytz.timezone(settings.TZ)
+            timezone = pytz.timezone(get_runtime_setting('TZ'))
             trigger_value = (
                 datetime.now(timezone) + timedelta(minutes=payload.delay_minutes)
             ).isoformat(timespec="seconds")
@@ -129,10 +132,12 @@ class UpdateAgentTaskTool(MoviePilotTool):
             and trigger_type == "date"
         )
         if has_schedule_update or validates_existing_date_schedule:
+            if trigger_value is None:
+                raise ValueError("Agent 定时任务缺少触发配置")
             normalized_type, normalized_trigger = TimerUtils.normalize_schedule_trigger(
                 trigger_type=trigger_type,
                 trigger_value=trigger_value,
-                timezone_name=settings.TZ,
+                timezone_name=get_runtime_setting('TZ'),
                 require_future=bool(
                     trigger_type == "date"
                     and (
@@ -142,7 +147,7 @@ class UpdateAgentTaskTool(MoviePilotTool):
                 ),
             )
 
-        update_payload = {}
+        update_payload: dict[str, object] = {}
         if payload.name is not None:
             update_payload["name"] = payload.name.strip()
         if payload.content is not None:
@@ -176,10 +181,12 @@ class UpdateAgentTaskTool(MoviePilotTool):
             return None
         next_run_at = update_agent_task_job(payload.task_id)
         updated_task = oper.get(task_id=payload.task_id, user_id=str(self._user_id))
-        return oper.to_dict(
+        if updated_task is None:
+            return None
+        return agent_task_to_dict(
             updated_task,
             next_run_at=next_run_at,
-            timezone=settings.TZ,
+            timezone=get_runtime_setting('TZ'),
         )
 
     async def run(
@@ -206,6 +213,7 @@ class UpdateAgentTaskTool(MoviePilotTool):
         task = await self.run_blocking("db", self._update_task, payload)
         if not task:
             return f"Agent 定时任务 {task_id} 不存在或不属于当前用户"
-        if task.get("error"):
-            return task["error"]
+        error = task.get("error")
+        if error:
+            return str(error)
         return json.dumps(task, ensure_ascii=False, indent=2)

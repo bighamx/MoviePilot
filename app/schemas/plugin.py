@@ -1,14 +1,76 @@
-from typing import Optional, List, Dict, Union
+from enum import Enum as _Enum
+from typing import Annotated as _Annotated
+from typing import Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field, RootModel
+from pydantic import AfterValidator as _AfterValidator
+from pydantic import BaseModel, Field, RootModel, field_validator
+from pydantic import PrivateAttr as _PrivateAttr
 
 from app.schemas.common import JsonData
+
+
+class PluginRuntimeStatus(str, _Enum):
+    """插件从源码准备到运行激活的六类状态。"""
+
+    SOURCE_MISSING = "source_missing"
+    DEPENDENCY_PENDING = "dependency_pending"
+    READY = "ready"
+    ACTIVE = "active"
+    BLOCKED_BY_POLICY = "blocked_by_policy"
+    LOAD_FAILED = "load_failed"
+
+
+class PluginSourceBindingStatus(str, _Enum):
+    """已安装插件的在线更新仓库绑定状态。"""
+
+    BOUND = "bound"
+    BINDING_REQUIRED = "binding_required"
+    LOCAL_ONLY = "local_only"
+
+
+class PluginUpdateCandidate(BaseModel):  # type: ignore[misc]
+    """插件市场为已安装插件选择的当前更新候选。"""
+
+    source_type: Literal["official", "third_party"] = Field(
+        description="候选仓库是官方来源还是第三方来源"
+    )
+    source_key: str = Field(description="候选仓库的规范来源键")
+    repo_url: str = Field(description="候选仓库的公开 GitHub 地址")
+    version: str = Field(description="候选仓库当前可安装版本")
+    is_bound: bool = Field(description="候选仓库是否为插件当前已绑定仓库")
+
+
+def _validate_plugin_id(value: str) -> str:
+    """限制插件实例标识为可安全用作 Python 类名和路由段的格式。"""
+    if not value or not value[0].isalpha() or not value.isalnum():
+        raise ValueError("插件 ID 必须以字母开头且只能包含字母和数字")
+    if len(value) > 128:
+        raise ValueError("插件 ID 长度不能超过 128 个字符")
+    return value
+
+
+_PluginId = _Annotated[str, _AfterValidator(_validate_plugin_id)]
+
+
+class PluginInstance(BaseModel):
+    """持久化一个共享源码插件的独立运行实例。"""
+
+    instance_id: _PluginId = Field(
+        description="运行实例 ID，也是配置、数据和路由命名空间"
+    )
+    source_plugin_id: _PluginId = Field(description="提供代码与前端资源的源插件 ID")
+    plugin_name: Optional[str] = Field(default=None, description="实例展示名称")
+    plugin_desc: Optional[str] = Field(default=None, description="实例展示描述")
+    plugin_icon: Optional[str] = Field(default=None, description="实例展示图标")
+    mode: Literal["virtual"] = Field(default="virtual", description="实例实现模式")
 
 
 class Plugin(BaseModel):
     """
     插件信息
     """
+    _package_version: Optional[str] = _PrivateAttr(default=None)
+
     id: str = None
     # 插件名称
     plugin_name: Optional[str] = None
@@ -34,10 +96,16 @@ class Plugin(BaseModel):
     installed: Optional[bool] = False
     # 运行状态
     state: Optional[bool] = False
+    # 插件源码、依赖和运行时加载状态
+    runtime_status: Optional[PluginRuntimeStatus] = None
     # 是否有详情页面
     has_page: Optional[bool] = False
     # 是否有新版本
     has_update: Optional[bool] = False
+    # 当前市场选择的更新候选；绑定仓库可更新时优先返回该仓库
+    update_candidate: Optional[PluginUpdateCandidate] = None
+    # 插件仓库绑定状态；仅已安装物理插件由后端投影真实身份
+    source_binding_status: PluginSourceBindingStatus = PluginSourceBindingStatus.BOUND
     # 主系统版本是否兼容
     system_version_compatible: Optional[bool] = True
     # 主系统版本兼容提示
@@ -58,6 +126,173 @@ class Plugin(BaseModel):
     add_time: Optional[int] = 0
     # 插件公钥
     plugin_public_key: Optional[str] = None
+    # 共享代码与前端资源的源插件 ID；普通插件为空
+    source_plugin_id: Optional[str] = None
+    # 是否为共享源码的虚拟实例
+    is_instance: Optional[bool] = False
+    # 实例实现模式；存量物理分身为空
+    instance_mode: Optional[str] = None
+
+    @property
+    def package_version(self) -> Optional[str]:
+        """读取仅供宿主内部候选选择使用的插件包代际。"""
+        return self._package_version
+
+    @package_version.setter
+    def package_version(self, value: Optional[str]) -> None:
+        """保存插件包代际，但不把它暴露到 API 响应模型。"""
+        self._package_version = value
+
+
+class PluginRuntimeSummary(BaseModel):
+    """插件后台收敛状态和前端刷新代次。"""
+
+    ready: bool = Field(description="本轮插件源码、依赖和加载是否已收敛")
+    generation: int = Field(description="插件运行状态变化代次")
+    pending_count: int = Field(description="仍处于准备阶段的插件数量")
+    failed_count: int = Field(description="加载失败或被策略阻止的插件数量")
+    restart_required_plugin_ids: List[str] = Field(
+        default_factory=list,
+        description="重启后才能完整激活新原生依赖的物理插件 ID",
+    )
+
+
+class PluginInstallOutcome(BaseModel):
+    """插件载荷写入成功后的前端反馈依据。"""
+
+    restart_required: bool = Field(
+        description="本次依赖更新是否需要重启 MoviePilot 才能完成"
+    )
+
+
+class PluginCloneRequest(BaseModel):
+    """创建虚拟插件分身的请求参数。"""
+
+    suffix: str = Field(
+        min_length=1,
+        max_length=20,
+        pattern=r"^[A-Za-z0-9]+$",
+        description="追加到当前插件 ID 后的 ASCII 字母或数字后缀",
+    )
+    name: str = Field(default="", description="分身展示名称")
+    description: str = Field(default="", description="分身展示描述")
+    icon: Optional[str] = Field(default=None, description="分身展示图标")
+    version: Optional[str] = Field(
+        default=None,
+        description="兼容旧客户端保留，虚拟分身始终跟随源插件版本",
+    )
+
+
+class PluginSourceIdentity(BaseModel):  # type: ignore[misc]
+    """显式换源确认所需的插件来源身份投影。"""
+
+    plugin_id: str = Field(description="物理插件 ID")
+    trusted_source_type: str = Field(description="当前可信在线来源类型")
+    trusted_source_key: Optional[str] = Field(
+        default=None,
+        description="规范化的可信在线来源键；未绑定时为空",
+    )
+    binding_basis: str = Field(description="当前可信来源的建立依据")
+    payload_source_type: str = Field(description="最近一次已提交载荷的来源类型")
+    payload_source_key: Optional[str] = Field(
+        default=None,
+        description="最近一次在线载荷的来源键；本地或未知载荷为空",
+    )
+    revision: int = Field(ge=1, description="显式换源使用的身份 CAS revision")
+
+
+class PluginSourceCandidate(BaseModel):  # type: ignore[misc]
+    """一个可供管理员识别的脱敏插件来源候选。"""
+
+    source_type: Literal["official", "third_party", "local"] = Field(
+        description="来源类型；本地候选不公开路径"
+    )
+    source_key: Optional[str] = Field(
+        default=None,
+        description="规范化在线来源键；本地候选为空",
+    )
+    repo_url: Optional[str] = Field(
+        default=None,
+        description="可明确选择的在线仓库地址；本地候选为空",
+    )
+    package_generation: Literal["v1", "v2", "v3"] = Field(
+        description="当前运行时会采用的插件包代际"
+    )
+    plugin_version: Optional[str] = Field(
+        default=None,
+        description="该来源当前可安装的插件版本",
+    )
+
+
+class PluginSourceOptions(BaseModel):  # type: ignore[misc]
+    """来源选择界面所需的当前身份、候选和准入状态。"""
+
+    plugin_id: str = Field(description="物理插件 ID")
+    inventory_complete: bool = Field(
+        description="本轮配置市场是否全部得到确定读取结果"
+    )
+    selection_status: Literal[
+        "selected", "unavailable", "conflict", "incomplete"
+    ] = Field(description="未指定新来源时的当前准入状态")
+    selection_reason: str = Field(description="当前准入状态的人类可读原因")
+    identity: Optional[PluginSourceIdentity] = Field(
+        default=None,
+        description="已安装插件的来源身份；未建立身份时为空",
+    )
+    candidates: List[PluginSourceCandidate] = Field(
+        default_factory=list,
+        description="按来源归并后的在线候选及可选本地候选",
+    )
+
+
+class PluginSourceInstallRequest(BaseModel):  # type: ignore[misc]
+    """管理员为未绑定插件明确选择初始在线来源的请求参数。"""
+
+    repo_url: str = Field(min_length=1, description="明确选择的目标插件仓库地址")
+    release_version: Optional[str] = Field(
+        default=None,
+        description="指定安装的 Release 资产版本；为空时使用当前索引版本",
+    )
+    force: bool = Field(
+        default=False,
+        description="是否强制重新下载并安装所选来源载荷",
+    )
+
+    @field_validator("repo_url")  # type: ignore[misc]
+    @classmethod
+    def normalize_repo_url(cls, value: str) -> str:
+        """拒绝只含空白或本地路径标识的来源选择。"""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("显式安装必须指定目标在线来源")
+        if normalized.startswith("local://"):
+            raise ValueError("显式来源安装只接受在线插件仓库")
+        return normalized
+
+
+class PluginSourceChangeRequest(BaseModel):  # type: ignore[misc]
+    """管理员显式切换插件在线来源的请求参数。"""
+
+    repo_url: str = Field(min_length=1, description="明确选择的目标插件仓库地址")
+    expected_revision: int = Field(
+        ge=1,
+        description="提交换源时必须匹配的当前身份 revision",
+    )
+    release_version: Optional[str] = Field(
+        default=None,
+        description="指定安装的 Release 资产版本；为空时使用当前索引版本",
+    )
+
+    @field_validator("repo_url")  # type: ignore[misc]
+    @classmethod
+    def normalize_repo_url(cls, value: str) -> str:
+        """拒绝只含空白或本地路径标识的换源目标。"""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("显式换源必须指定目标在线来源")
+        if normalized.startswith("local://"):
+            raise ValueError("显式换源只接受在线插件仓库")
+        return normalized
 
 
 class PluginDashboard(Plugin):
@@ -141,6 +376,7 @@ class PluginRemoteInfo(BaseModel):
     id: str
     url: str
     name: str
+    source_plugin_id: Optional[str] = None
 
 
 class PluginReleaseItem(BaseModel):

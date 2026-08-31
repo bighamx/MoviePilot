@@ -5,11 +5,18 @@ from unittest.mock import patch
 
 import pytest
 
+from app.domain.context import MediaInfo
 from app.domain.metainfo import MetaInfo, MetaInfoPath, find_metainfo
-from app.domain.meta.metabase import MetaBase
+from app.domain.meta.metabase import MetaBase, MetaInfoSnapshot
 from app.domain.meta.metamusic import MetaMusic
 from app.domain.meta.metaanime import MetaAnime
-from app.application.torrent import TorrentHelper
+from app.domain.meta.runtime import (
+    configure_recognition_runtime,
+    get_audio_extensions,
+    get_media_extensions,
+    get_metainfo_accelerator,
+)
+from app.application.torrent.download import TorrentHelper
 from app.schemas.types import MediaSource, MediaType
 from tests.cases.meta import meta_cases
 
@@ -99,6 +106,78 @@ def test_metainfopath_with_empty_custom_words():
     assert meta is not None
 
 
+def test_metainfo_snapshot_exposes_complete_immutable_contract():
+    """稳定快照应包含路径合并字段，且不受原 MetaBase 后续修改影响。"""
+    meta = MetaInfo("Show.S01E01.2026.2160p.WEB-DL.HDR.H265.10bit-GROUP.mkv")
+    meta.web_source = "Amazon"
+    snapshot = MetaInfoSnapshot.from_meta(meta)
+    meta.web_source = "Netflix"
+
+    assert snapshot.kind == "video"
+    assert snapshot.begin_season == 1
+    assert snapshot.begin_episode == 1
+    assert snapshot.resource_effect == "HDR"
+    assert snapshot.video_bit == "10bit"
+    assert snapshot.web_source == "Amazon"
+    assert snapshot.apply_words == ()
+
+
+def test_metainfopath_merges_parent_streaming_platform():
+    """文件名缺少平台时应从父目录补充，避免路径识别丢失稳定资源字段。"""
+    media_extensions = get_media_extensions()
+    audio_extensions = get_audio_extensions()
+    accelerator = get_metainfo_accelerator()
+    configure_recognition_runtime(
+        media_extensions_provider=lambda: (".mkv",),
+        audio_extensions_provider=lambda: (),
+        accelerator=None,
+    )
+    try:
+        meta = MetaInfoPath(Path("/Show 2024 AMZN WEB-DL/Show.S01E01.mkv"))
+    finally:
+        configure_recognition_runtime(
+            media_extensions_provider=lambda: media_extensions,
+            audio_extensions_provider=lambda: audio_extensions,
+            accelerator=accelerator,
+        )
+
+    assert meta.web_source == "Amazon"
+    assert meta.year == "2024"
+    assert meta.episode == "E01"
+
+
+def test_numeric_video_filename_sets_single_episode_total():
+    """纯数字视频文件名表示单集时，范围字段必须保持自洽。"""
+    media_extensions = get_media_extensions()
+    audio_extensions = get_audio_extensions()
+    accelerator = get_metainfo_accelerator()
+    configure_recognition_runtime(
+        media_extensions_provider=lambda: (".mkv",),
+        audio_extensions_provider=lambda: (),
+        accelerator=None,
+    )
+    try:
+        meta = MetaInfo("5.mkv")
+    finally:
+        configure_recognition_runtime(
+            media_extensions_provider=lambda: media_extensions,
+            audio_extensions_provider=lambda: audio_extensions,
+            accelerator=accelerator,
+        )
+
+    assert meta.begin_episode == 5
+    assert meta.end_episode is None
+    assert meta.total_episode == 1
+
+
+def test_empty_video_title_keeps_optional_original_name_none():
+    """无法提取标题时 original_name 保持空值，不使用含义不同的空字符串。"""
+    meta = MetaInfo("S02E1000.mkv")
+
+    assert meta.name == ""
+    assert meta.original_name is None
+
+
 def test_custom_words_apply_words_recording():
     """测试 apply_words 记录功能。"""
     custom_words = ["替换词 => 新词"]
@@ -158,6 +237,29 @@ def test_torrent_title_match_ignores_question_mark_variants():
         torrent_meta=torrent_meta,
         torrent=torrent,
     )
+
+
+def test_torrent_title_match_rejects_season_absent_from_target_series():
+    """无年份同名剧的资源季超出目标剧季范围时应拒绝。"""
+    mediainfo = MediaInfo(
+        title="家族计划",
+        original_title="가족계획",
+        names=["Family Matters"],
+        type=MediaType.TV,
+        year="2024",
+        number_of_seasons=1,
+        seasons={1: list(range(1, 7))},
+        season_years={1: "2024"},
+    )
+    torrent_meta = MetaInfo("Family Matters S02 1080p WEBRip DD2.0 x264-TrollHD")
+    torrent = SimpleNamespace(
+        site_name="测试站点",
+        title=torrent_meta.org_string,
+        category=MediaType.TV.value,
+        description=None,
+    )
+
+    assert not TorrentHelper.match_torrent(mediainfo, torrent_meta, torrent)
 
 
 def test_python_metainfo_fallback_preserves_xxx_movie_title():

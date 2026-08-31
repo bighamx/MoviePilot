@@ -40,9 +40,9 @@ ROLE_LABEL = "org.moviepilot.perf.role"
 SOURCE_LABEL = "org.moviepilot.perf.source-commit"
 SUBSTRATE_LABEL = "org.moviepilot.perf.substrate"
 CRITICAL_SUBSTRATE_PATHS = (
-    "requirements.in",
+    "pyproject.toml",
+    "uv.lock",
     "docker/Dockerfile",
-    "scripts/uv-pip-compat.sh",
 )
 SEED_COMPATIBILITY_PATHS = ("database/versions",)
 AGENT_HEAVY_MODULE_PREFIXES = (
@@ -107,7 +107,7 @@ FROM ${MP_SUBSTRATE} AS frozen
 RUN set -eux; \
     mkdir -p /frozen/plugins /frozen/site; \
     cp -a /app/app/plugins/. /frozen/plugins/; \
-    rm -f /frozen/plugins/__init__.py; \
+    test -f /frozen/plugins/__init__.py; \
     rm -rf /frozen/plugins/__pycache__; \
     find /app/app/application/site -maxdepth 1 -type f \
       \( -name 'sites.*.so' -o -name 'user.sites.v3.bin' \) \
@@ -800,7 +800,7 @@ def wait_for_ready(container, started_at: float, timeout: float) -> float:
         "-fsS",
         "--max-time",
         "2",
-        "http://127.0.0.1:3001/api/v1/system/global?token=moviepilot",
+        "http://127.0.0.1:3001/health/ready",
     ]
     while time.monotonic() < deadline:
         if not container_running(container):

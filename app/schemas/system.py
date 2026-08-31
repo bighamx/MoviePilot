@@ -1,5 +1,7 @@
 from dataclasses import dataclass
-from typing import Optional, Any
+from datetime import datetime as _DateTime
+from typing import Any, Literal, Optional
+from uuid import uuid4 as _uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -88,14 +90,16 @@ class NotificationConf(BaseModel):
     通知配置
     """
 
+    # 稳定渠道身份；名称变化时保持不变，用于运行态凭据和跨页面引用。
+    id: str = Field(default_factory=lambda: str(_uuid4()))
     # 名称
     name: Optional[str] = None
     # 类型 telegram/wechat/feishu/vocechat/synologychat/slack/webpush/qqbot
     type: Optional[str] = None
     # 配置
-    config: Optional[dict] = Field(default_factory=dict)
-    # 场景开关
-    switchs: Optional[list] = Field(default_factory=list)
+    config: Optional[dict[str, Any]] = Field(default_factory=dict)
+    # 场景开关名称列表；NotificationSwitchConf 属于全局通知范围配置，不是渠道字段。
+    switchs: Optional[list[str]] = Field(default_factory=list)
     # 是否启用
     enabled: Optional[bool] = False
 
@@ -140,6 +144,32 @@ class SystemEnvironmentUpdateData(BaseModel):
 
     success_updates: dict[str, tuple[Optional[bool], str]] = Field(default_factory=dict)
     failed_updates: dict[str, tuple[Optional[bool], str]] = Field(default_factory=dict)
+
+
+class SystemUpdateStatus(BaseModel):
+    """主程序后台更新的可恢复状态快照。"""
+
+    state: Literal[
+        "idle",
+        "available",
+        "downloading",
+        "ready",
+        "installing",
+        "failed",
+    ] = "idle"
+    current_version: str
+    version: Optional[str] = None
+    frontend_version: Optional[str] = None
+    release_name: Optional[str] = None
+    release_notes: Optional[str] = None
+    published_at: Optional[str] = None
+    checked_at: Optional[str] = None
+    downloaded_bytes: int = 0
+    total_bytes: int = 0
+    progress: int = 0
+    error: Optional[str] = None
+    can_update: bool = False
+    can_install: bool = False
 
 
 class PluginMarketSyncData(BaseModel):
@@ -188,6 +218,22 @@ class SystemModuleListData(BaseModel):
     """已加载系统模块列表。"""
 
     modules: list[SystemModuleInfo] = Field(default_factory=list)
+
+
+class DatabaseBackupArtifactData(BaseModel):  # type: ignore[misc]
+    """Web 管理端可见的受管数据库备份摘要。"""
+
+    name: str  # 受管文件名，不包含宿主目录
+    db_type: str  # 创建制品的数据库类型
+    created_at: _DateTime  # 从受管文件名解析出的创建时间
+    size: int  # 备份文件字节数
+
+
+class DatabaseBackupVerificationData(BaseModel):  # type: ignore[misc]
+    """受管数据库备份的脱敏校验结果。"""
+
+    valid: bool  # 是否通过当前数据库类型的内容校验
+    method: str  # SQLite integrity_check 或 PostgreSQL 归档目录校验
 
 
 class TransferDirectoryConf(BaseModel):

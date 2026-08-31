@@ -17,7 +17,7 @@ from app.api.endpoints import storage as storage_endpoint
 from app.api.endpoints import system as system_endpoint
 from app.api.endpoints import transfer as transfer_endpoint
 from app.api.endpoints import user as user_endpoint
-from app.adapters.web.security.access import verify_resource_token
+from app.application.security.token import decode_access_token
 from app.api.deps import (
     get_current_active_manage_user,
     get_current_active_manage_user_async,
@@ -52,6 +52,10 @@ def test_system_sensitive_read_endpoints_require_superuser():
     """系统敏感读取接口必须只允许管理员访问。"""
     assert _dependency_of(system_endpoint.get_env_setting, "_") is get_current_active_superuser_async
     assert _dependency_of(system_endpoint.get_setting, "_") is get_current_active_superuser_async
+    assert _dependency_of(system_endpoint.list_database_backups, "_") is get_current_active_superuser_async
+    assert _dependency_of(system_endpoint.create_database_backup, "_") is get_current_active_superuser_async
+    assert _dependency_of(system_endpoint.verify_database_backup, "_") is get_current_active_superuser_async
+    assert _dependency_of(system_endpoint.delete_database_backup, "_") is get_current_active_superuser_async
 
 
 def test_system_public_read_endpoints_require_active_user():
@@ -148,7 +152,9 @@ def test_system_public_setting_allows_only_non_sensitive_keys(monkeypatch):
     response = asyncio.run(system_endpoint.get_public_setting("PLUGIN_MARKET"))
 
     assert response.success is True
-    assert response.data == {"value": system_endpoint.settings.PLUGIN_MARKET}
+    assert response.data == {
+        "value": system_endpoint.get_runtime_settings().get("PLUGIN_MARKET")
+    }
     assert calls == [SystemConfigKey.Directories]
 
     with pytest.raises(HTTPException) as exc_info:
@@ -181,24 +187,11 @@ def test_login_sets_resource_token_cookie(monkeypatch):
                 permissions={"discovery": True, "features": {}},
             )
 
-    class FakeSystemConfigOper:
-        """返回已完成向导状态的系统配置桩。"""
-
-        def get(self, key):
-            """返回测试配置值。"""
-            return "1"
-
     form_data = SimpleNamespace(username="user", password="password")
     request = _build_request()
     response = Response()
 
     monkeypatch.setattr(login_endpoint, "UserChain", FakeUserChain)
-    monkeypatch.setattr(
-        login_endpoint,
-        "get_configured_system_config",
-        lambda: FakeSystemConfigOper(),
-    )
-
     token = login_endpoint.login_access_token(
         request=request,
         response=response,
@@ -210,7 +203,7 @@ def test_login_sets_resource_token_cookie(monkeypatch):
     assert "set-cookie" in response.headers
 
     resource_cookie = response.headers["set-cookie"].split("=", 1)[1].split(";", 1)[0]
-    payload = verify_resource_token(resource_cookie)
+    payload = decode_access_token(resource_cookie, "resource")
     assert payload.sub == 1
     assert payload.username == "user"
     assert payload.purpose == "resource"
@@ -227,7 +220,7 @@ def test_plugin_static_file_requires_resource_token_by_default(monkeypatch):
             """返回插件认证入口列表。"""
             return []
 
-    monkeypatch.setattr(plugin_endpoint, "PluginManager", FakePluginManager)
+    monkeypatch.setattr(plugin_endpoint, "get_plugin_manager", FakePluginManager)
     monkeypatch.setattr(plugin_endpoint, "verify_resource_token", lambda token: calls.append(token))
 
     plugin_endpoint._verify_plugin_static_file_access(
@@ -257,7 +250,7 @@ def test_plugin_auth_remote_files_allow_anonymous_bootstrap(monkeypatch):
                 }
             ]
 
-    monkeypatch.setattr(plugin_endpoint, "PluginManager", FakePluginManager)
+    monkeypatch.setattr(plugin_endpoint, "get_plugin_manager", FakePluginManager)
     monkeypatch.setattr(plugin_endpoint, "verify_resource_token", lambda token: calls.append(token))
 
     plugin_endpoint._verify_plugin_static_file_access(
@@ -291,7 +284,7 @@ def test_upload_avatar_rejects_other_user_for_non_superuser():
             )
         )
 
-    assert exc_info.value.status_code == 400
+    assert exc_info.value.status_code == 403
     assert exc_info.value.detail == "用户权限不足"
 
 

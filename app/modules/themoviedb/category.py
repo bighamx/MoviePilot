@@ -5,7 +5,8 @@ from typing import Union
 import ruamel.yaml
 from ruamel.yaml import CommentedMap
 
-from app.runtime.config import settings
+from app.runtime.settings import get_runtime_setting
+
 from app.runtime.log import logger
 from app.schemas.category import CategoryConfig
 from app.foundation.singleton import WeakSingleton
@@ -31,7 +32,7 @@ class CategoryHelper(metaclass=WeakSingleton):
     """
 
     def __init__(self):
-        self._category_path: Path = settings.CONFIG_PATH / "category.yaml"
+        self._category_path: Path = get_runtime_setting('CONFIG_PATH') / "category.yaml"
         self._categorys = {}
         self._movie_categorys = {}
         self._tv_categorys = {}
@@ -43,7 +44,7 @@ class CategoryHelper(metaclass=WeakSingleton):
         """
         try:
             if not self._category_path.exists():
-                shutil.copy(settings.INNER_CONFIG_PATH / "category.yaml", self._category_path)
+                shutil.copy(get_runtime_setting('INNER_CONFIG_PATH') / "category.yaml", self._category_path)
             with open(self._category_path, mode='r', encoding='utf-8', errors='replace') as f:
                 try:
                     yaml_loader = ruamel.yaml.YAML()

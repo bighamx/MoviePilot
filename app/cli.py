@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -10,30 +11,32 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, get_args, get_origin
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
-from urllib.request import ProxyHandler, Request, build_opener, urlopen
+from urllib.request import Request, urlopen
 
 import click
 import psutil
 
-from app.runtime.config import Settings, settings
+from app.application.backup import BackupArtifact
+from app.application.configuration import get_runtime_settings
+from app.runtime.config import Settings
+from app.runtime.settings import get_runtime_setting
 from app.runtime.state import SystemHelper
-from version import APP_VERSION
+from app.runtime.version import get_app_version, get_frontend_version
+from app.startup.composition.database import build_database_governance
 
-BACKEND_RUNTIME_FILE = settings.TEMP_PATH / "moviepilot.runtime.json"
-BACKEND_STDIO_LOG_FILE = settings.LOG_PATH / "moviepilot.stdout.log"
-BACKEND_APP_LOG_FILE = settings.LOG_PATH / "moviepilot.log"
-FRONTEND_RUNTIME_FILE = settings.TEMP_PATH / "moviepilot.frontend.runtime.json"
-FRONTEND_STDIO_LOG_FILE = settings.LOG_PATH / "moviepilot.frontend.stdout.log"
-FRONTEND_DIR = settings.ROOT_PATH / "public"
+BACKEND_RUNTIME_FILE = get_runtime_setting('TEMP_PATH') / "moviepilot.runtime.json"
+BACKEND_STDIO_LOG_FILE = get_runtime_setting('LOG_PATH') / "moviepilot.stdout.log"
+BACKEND_APP_LOG_FILE = get_runtime_setting('LOG_PATH') / "moviepilot.log"
+FRONTEND_RUNTIME_FILE = get_runtime_setting('TEMP_PATH') / "moviepilot.frontend.runtime.json"
+FRONTEND_STDIO_LOG_FILE = get_runtime_setting('LOG_PATH') / "moviepilot.frontend.stdout.log"
+FRONTEND_DIR = get_runtime_setting('ROOT_PATH') / "public"
 FRONTEND_SERVICE_FILE = FRONTEND_DIR / "service.js"
 FRONTEND_VERSION_FILE = FRONTEND_DIR / "version.txt"
 HEALTH_PATH = "/api/v1/system/global"
 HEALTH_TOKEN = "moviepilot"
 FRONTEND_HEALTH_PATH = "/version.txt"
-BACKEND_RELEASES_API = "https://api.github.com/repos/jxxghp/MoviePilot/releases"
 LOCAL_HOSTS = {"0.0.0.0", "::", "::1", "", "localhost"}
 MANAGED_ACTIVE_STATES = {"running", "starting"}
-AUTO_UPDATE_ENABLED_VALUES = {"true", "release", "dev"}
 MASKED_FIELDS = {
     "API_TOKEN",
     "DB_POSTGRESQL_PASSWORD",
@@ -43,10 +46,13 @@ MASKED_FIELDS = {
 }
 MASKED_SUFFIXES = ("_TOKEN", "_PASSWORD", "_SECRET", "_API_KEY")
 CONTEXT_SETTINGS = {"help_option_names": ["-h", "--help"]}
+PREPARED_UPDATE_ROOT = get_runtime_setting('TEMP_PATH') / "moviepilot-update"
+PREPARED_UPDATE_MANIFEST = PREPARED_UPDATE_ROOT / "install.json"
+PREPARED_UPDATE_STATE = PREPARED_UPDATE_ROOT / "state.json"
 
 
 def _repo_root() -> Path:
-    return settings.ROOT_PATH
+    return get_runtime_setting('ROOT_PATH')
 
 
 def _read_json_file(path: Path) -> Optional[Dict[str, Any]]:
@@ -108,21 +114,21 @@ def _frontend_runtime() -> Optional[Dict[str, Any]]:
 
 def _backend_base_url(runtime: Optional[Dict[str, Any]] = None) -> str:
     runtime = runtime or _backend_runtime() or {}
-    host = runtime.get("host") or settings.HOST
-    port = runtime.get("port") or settings.PORT
+    host = runtime.get("host") or get_runtime_setting('HOST')
+    port = runtime.get("port") or get_runtime_setting('PORT')
     return f"http://{_client_host(host)}:{port}"
 
 
 def _frontend_base_url(runtime: Optional[Dict[str, Any]] = None) -> str:
     runtime = runtime or _frontend_runtime() or {}
-    host = runtime.get("host") or settings.HOST
-    port = runtime.get("port") or settings.NGINX_PORT
+    host = runtime.get("host") or get_runtime_setting('HOST')
+    port = runtime.get("port") or get_runtime_setting('NGINX_PORT')
     return f"http://{_client_host(host)}:{port}"
 
 
 def _runtime_api_token(runtime: Optional[Dict[str, Any]] = None) -> str:
     runtime = runtime or _backend_runtime() or {}
-    return runtime.get("api_token") or settings.API_TOKEN
+    return runtime.get("api_token") or get_runtime_setting('API_TOKEN')
 
 
 def _http_request(
@@ -216,49 +222,6 @@ def _release_prefix(version: Optional[str]) -> str:
     return matched.group(1) if matched else "v2"
 
 
-def _release_sort_key(tag: str) -> tuple[int, ...]:
-    return tuple(int(part) for part in re.findall(r"\d+", tag))
-
-
-def _github_api_json(url: str, *, repo: str) -> Any:
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": settings.USER_AGENT,
-    }
-    headers.update(settings.REPO_GITHUB_HEADERS(repo))
-    opener = build_opener(ProxyHandler(settings.PROXY or {}))
-    request = Request(url=url, headers=headers, method="GET")
-
-    try:
-        with opener.open(request, timeout=10.0) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"访问 GitHub API 失败（HTTP {exc.code}）: {detail or url}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"访问 GitHub API 失败：{exc.reason}") from exc
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"GitHub API 返回了无法解析的响应：{url}") from exc
-
-
-def _latest_release_tag(url: str, *, repo: str, prefix: str) -> Optional[str]:
-    payload = _github_api_json(url, repo=repo)
-    if not isinstance(payload, list):
-        raise RuntimeError(f"GitHub API 返回格式异常：{url}")
-
-    matched_tags = []
-    for item in payload:
-        if not isinstance(item, dict):
-            continue
-        tag_name = str(item.get("tag_name") or "").strip()
-        if tag_name.startswith(f"{prefix}."):
-            matched_tags.append(tag_name)
-
-    if not matched_tags:
-        return None
-    return sorted(matched_tags, key=_release_sort_key)[-1]
-
-
 def _git_current_branch() -> Optional[str]:
     try:
         branch = subprocess.check_output(
@@ -272,33 +235,139 @@ def _git_current_branch() -> Optional[str]:
 
 
 def _auto_update_mode() -> str:
-    one_shot_mode = SystemHelper.consume_one_shot_update_mode()
-    if one_shot_mode:
-        return one_shot_mode
-    return SystemHelper.get_auto_update_mode()
+    if SystemHelper.consume_one_shot_dev_update():
+        return "dev"
+    return str(get_runtime_setting('MOVIEPILOT_AUTO_UPDATE') or "").strip().lower()
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file_handle:
+        for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _mark_prepared_update_failed(message: str) -> None:
+    state = _read_json_file(PREPARED_UPDATE_STATE) or {}
+    state.update(
+        {
+            "state": "failed",
+            "error": message,
+            "can_update": True,
+            "can_install": False,
+        }
+    )
+    _write_json_file(PREPARED_UPDATE_STATE, state)
+    _clear_json_file(PREPARED_UPDATE_MANIFEST)
+
+
+def _local_update_env() -> dict[str, str]:
+    """构造本地更新子进程使用的包缓存、代理和认证环境。"""
+    update_env = os.environ.copy()
+    package_cache_root = Path(
+        update_env.get("PACKAGE_CACHE_ROOT", "").strip() or get_runtime_setting('PACKAGE_CACHE_PATH')
+    )
+    update_env.setdefault("PACKAGE_CACHE_ROOT", str(package_cache_root))
+    update_env.setdefault("UV_CACHE_DIR", str(package_cache_root / "uv"))
+    if get_runtime_setting('PIP_PROXY'):
+        update_env["PIP_PROXY"] = get_runtime_setting('PIP_PROXY')
+    if get_runtime_setting('PROXY_HOST'):
+        update_env["PROXY_HOST"] = get_runtime_setting('PROXY_HOST')
+        for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
+            update_env[key] = get_runtime_setting('PROXY_HOST')
+    if get_runtime_setting('GITHUB_TOKEN'):
+        update_env.setdefault("GITHUB_TOKEN", get_runtime_setting('GITHUB_TOKEN'))
+    return update_env
+
+
+def _apply_prepared_release_update() -> bool:
+    """本地 CLI 重启时离线安装已校验的 Release；返回是否发现安装意图。"""
+    manifest = _read_json_file(PREPARED_UPDATE_MANIFEST)
+    if not manifest:
+        return False
+
+    try:
+        version = str(manifest.get("version") or "").strip()
+        frontend_version = str(manifest.get("frontend_version") or "").strip()
+        backend_archive = Path(str(manifest.get("backend_archive") or ""))
+        frontend_archive = Path(str(manifest.get("frontend_archive") or ""))
+        if not version or not frontend_version:
+            raise RuntimeError("更新包清单缺少版本信息")
+        if (
+            not backend_archive.is_file()
+            or _file_sha256(backend_archive) != manifest.get("backend_sha256")
+        ):
+            raise RuntimeError("后端更新包校验失败")
+        if (
+            not frontend_archive.is_file()
+            or _file_sha256(frontend_archive) != manifest.get("frontend_sha256")
+        ):
+            raise RuntimeError("前端更新包校验失败")
+
+        update_command = [
+            sys.executable,
+            str(_repo_root() / "scripts" / "local_setup.py"),
+            "update",
+            "all",
+            "--ref",
+            version,
+            "--offline-backend",
+            "--frontend-version",
+            frontend_version,
+            "--frontend-archive",
+            str(frontend_archive),
+            "--skip-resources",
+            "--venv",
+            str(_repo_root() / "venv"),
+            "--config-dir",
+            str(get_runtime_setting('CONFIG_PATH')),
+        ]
+        click.echo(f"安装已下载并校验的 MoviePilot {version} 更新包")
+        result = subprocess.run(
+            update_command,
+            cwd=str(_repo_root()),
+            env=_local_update_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if result.returncode != 0:
+            lines = [line for line in (result.stdout or "").splitlines() if line.strip()]
+            detail = lines[-1] if lines else "未知错误"
+            raise RuntimeError(detail)
+
+        _clear_json_file(PREPARED_UPDATE_MANIFEST)
+        click.echo("已下载的 Release 更新安装完成")
+    except (OSError, RuntimeError, ValueError) as error:
+        message = f"本地 Release 更新安装失败：{error}"
+        _mark_prepared_update_failed(message)
+        _warn(f"{message}，继续使用当前版本启动")
+    return True
 
 
 def _resolve_auto_update_targets(mode: str) -> Optional[str]:
-    backend_prefix = _release_prefix(APP_VERSION)
-
-    if mode == "dev":
-        current_branch = _git_current_branch()
-        backend_ref = "latest"
-        if not current_branch or current_branch == "HEAD":
-            # 从 release 模式切回 dev 时，detached HEAD 需要一个明确分支。
-            backend_ref = backend_prefix
-    else:
-        backend_ref = _latest_release_tag(
-            BACKEND_RELEASES_API,
-            repo="jxxghp/MoviePilot",
-            prefix=backend_prefix,
-        )
+    if mode != "dev":
+        return None
+    backend_prefix = _release_prefix(get_app_version())
+    current_branch = _git_current_branch()
+    backend_ref = "latest"
+    if not current_branch or current_branch == "HEAD":
+        # 从 release 模式切回 dev 时，detached HEAD 需要一个明确分支。
+        backend_ref = backend_prefix
     return backend_ref
 
 
 def _best_effort_auto_update() -> None:
+    if _apply_prepared_release_update():
+        return
+
     mode = _auto_update_mode()
-    if mode not in AUTO_UPDATE_ENABLED_VALUES:
+    # Release 更新先在后台下载并经用户确认；这里只保留开发版分支跟踪。
+    if mode != "dev":
         return
 
     try:
@@ -321,28 +390,14 @@ def _best_effort_auto_update() -> None:
         "--venv",
         str(_repo_root() / "venv"),
         "--config-dir",
-        str(settings.CONFIG_PATH),
+        str(get_runtime_setting('CONFIG_PATH')),
     ]
-
-    update_env = os.environ.copy()
-    package_cache_root = Path(update_env.get("PACKAGE_CACHE_ROOT", "").strip() or settings.PACKAGE_CACHE_PATH)
-    update_env.setdefault("PACKAGE_CACHE_ROOT", str(package_cache_root))
-    update_env.setdefault("PIP_CACHE_DIR", str(package_cache_root / "pip"))
-    update_env.setdefault("UV_CACHE_DIR", str(package_cache_root / "uv"))
-    if settings.PIP_PROXY:
-        update_env["PIP_PROXY"] = settings.PIP_PROXY
-    if settings.PROXY_HOST:
-        update_env["PROXY_HOST"] = settings.PROXY_HOST
-        for key in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"):
-            update_env[key] = settings.PROXY_HOST
-    if settings.GITHUB_TOKEN:
-        update_env.setdefault("GITHUB_TOKEN", settings.GITHUB_TOKEN)
 
     click.echo(f"检测到 MOVIEPILOT_AUTO_UPDATE={mode}，启动前执行本地自动更新")
     result = subprocess.run(
         update_command,
         cwd=str(_repo_root()),
-        env=update_env,
+        env=_local_update_env(),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -591,10 +646,12 @@ def _parse_key_value_pairs(items: Iterable[str]) -> Dict[str, str]:
 
 
 def _ensure_local_api_token() -> bool:
-    if settings.API_TOKEN and len(str(settings.API_TOKEN).strip()) >= 16:
+    if get_runtime_setting('API_TOKEN') and len(str(get_runtime_setting('API_TOKEN')).strip()) >= 16:
         return False
 
-    result, message = settings.update_setting("API_TOKEN", settings.API_TOKEN or "")
+    result, message = get_runtime_settings().update(
+        "API_TOKEN", get_runtime_setting('API_TOKEN') or ""
+    )
     if result is False:
         raise click.ClickException(message or "初始化 API_TOKEN 失败")
     return result is True
@@ -635,10 +692,10 @@ def _spawn_backend_process(*, safe: bool = False) -> subprocess.Popen:
         "MOVIEPILOT_DISABLE_CONSOLE_LOG": "1",
         "MOVIEPILOT_STDIO_LOG_FILE": str(BACKEND_STDIO_LOG_FILE),
         "MOVIEPILOT_STDIO_LOG_MAX_BYTES": str(
-            max(int(settings.LOG_MAX_FILE_SIZE or 0), 1) * 1024 * 1024
+            max(int(get_runtime_setting('LOG_MAX_FILE_SIZE') or 0), 1) * 1024 * 1024
         ),
         "MOVIEPILOT_STDIO_LOG_BACKUP_COUNT": str(
-            max(int(settings.LOG_BACKUP_COUNT or 0), 0)
+            max(int(get_runtime_setting('LOG_BACKUP_COUNT') or 0), 0)
         ),
     }
     if safe:
@@ -685,7 +742,7 @@ def _spawn_frontend_process(backend_port: int) -> subprocess.Popen:
         env={
             **os.environ,
             "PORT": str(backend_port),
-            "NGINX_PORT": str(settings.NGINX_PORT),
+            "NGINX_PORT": str(get_runtime_setting('NGINX_PORT')),
         },
     )
 
@@ -740,9 +797,9 @@ def _start_backend_service(timeout: int, safe: bool = False) -> Dict[str, Any]:
     runtime = {
         "pid": process.pid,
         "create_time": ps_process.create_time(),
-        "host": settings.HOST,
-        "port": settings.PORT,
-        "api_token": settings.API_TOKEN,
+        "host": get_runtime_setting('HOST'),
+        "port": get_runtime_setting('PORT'),
+        "api_token": get_runtime_setting('API_TOKEN'),
         "started_at": int(time.time()),
         "python": sys.executable,
         "stdio_log": str(BACKEND_STDIO_LOG_FILE),
@@ -766,8 +823,8 @@ def _start_frontend_service(timeout: int, backend_port: int) -> Dict[str, Any]:
     runtime = {
         "pid": process.pid,
         "create_time": ps_process.create_time(),
-        "host": settings.HOST,
-        "port": settings.NGINX_PORT,
+        "host": get_runtime_setting('HOST'),
+        "port": get_runtime_setting('NGINX_PORT'),
         "backend_port": backend_port,
         "started_at": int(time.time()),
         "node": str(_frontend_node_binary()),
@@ -826,17 +883,90 @@ def _stop_frontend_service(timeout: int, force: bool) -> Dict[str, Any]:
 
 
 def _installed_frontend_version() -> Optional[str]:
-    if not FRONTEND_VERSION_FILE.exists():
-        return None
-    try:
-        return FRONTEND_VERSION_FILE.read_text(encoding="utf-8", errors="replace").strip() or None
-    except OSError:
-        return None
+    return get_frontend_version(fallback_to_declared=False)
 
 
 @click.group(context_settings=CONTEXT_SETTINGS)
 def cli() -> None:
     """MoviePilot 本地 CLI"""
+
+
+def _format_backup_artifact(artifact: BackupArtifact) -> str:
+    """将制品信息格式化为不含数据库凭据的单行 CLI 输出。"""
+    return "\t".join(
+        (
+            artifact.name,
+            artifact.db_type,
+            artifact.created_at.isoformat(),
+            str(artifact.size),
+            str(artifact.path),
+        )
+    )
+
+
+@cli.group(context_settings=CONTEXT_SETTINGS)
+def database() -> None:
+    """创建、列举、校验和离线还原本地数据库备份"""
+
+
+@database.command("backup", context_settings=CONTEXT_SETTINGS)
+def database_backup() -> None:
+    """创建并验证一个在线数据库备份"""
+    try:
+        artifact = build_database_governance().create_backup()
+    except Exception as error:
+        raise click.ClickException(f"数据库备份失败：{error}") from error
+    click.echo("name\tdb_type\tcreated_at\tsize\tpath")
+    click.echo(_format_backup_artifact(artifact))
+
+
+@database.command("list", context_settings=CONTEXT_SETTINGS)
+def database_list() -> None:
+    """列出当前受管目录中的正式数据库备份文件"""
+    try:
+        artifacts = build_database_governance().list_backups()
+    except Exception as error:
+        raise click.ClickException(f"数据库备份列表读取失败：{error}") from error
+    if not artifacts:
+        click.echo("暂无数据库备份")
+        return
+    click.echo("name\tdb_type\tcreated_at\tsize\tpath")
+    for artifact in artifacts:
+        click.echo(_format_backup_artifact(artifact))
+
+
+@database.command("verify", context_settings=CONTEXT_SETTINGS)
+@click.argument("name")
+def database_verify(name: str) -> None:
+    """按文件名重新校验一个数据库备份"""
+    try:
+        result = build_database_governance().verify_backup(name)
+    except Exception as error:
+        raise click.ClickException(f"数据库备份校验失败：{error}") from error
+    if not result.valid:
+        detail = f"：{result.detail}" if result.detail else ""
+        raise click.ClickException(f"数据库备份校验未通过（{result.method}）{detail}")
+    click.echo(
+        f"数据库备份校验通过：name={name} method={result.method}"
+    )
+
+
+@database.command("restore", context_settings=CONTEXT_SETTINGS)
+@click.argument("name")
+@click.option(
+    "--confirm",
+    is_flag=True,
+    help="确认 MoviePilot 已停止，并允许覆盖当前数据库",
+)
+def database_restore(name: str, confirm: bool) -> None:
+    """在 MoviePilot 停止运行时还原一个数据库备份"""
+    if not confirm:
+        raise click.ClickException("离线还原必须使用 --confirm 明确确认")
+    try:
+        artifact = build_database_governance().restore_backup(name)
+    except Exception as error:
+        raise click.ClickException(f"数据库还原失败：{error}") from error
+    click.echo(f"数据库还原完成：{artifact.name}")
 
 
 @cli.command(context_settings=CONTEXT_SETTINGS)
@@ -863,7 +993,9 @@ def start(timeout: int, safe: bool) -> None:
         raise
 
     backend_health = backend_result.get("health") or {}
-    backend_version = ((backend_health.get("data") or {}) if isinstance(backend_health, dict) else {}).get("BACKEND_VERSION", APP_VERSION)
+    backend_version = ((backend_health.get("data") or {}) if isinstance(backend_health, dict) else {}).get(
+        "BACKEND_VERSION", get_app_version()
+    )
     frontend_version = ((frontend_result.get("health") or {}) if isinstance(frontend_result.get("health"), dict) else {}).get("version") or _installed_frontend_version() or "unknown"
 
     click.echo("MoviePilot 已启动" if backend_result.get("started") or frontend_result.get("started") else "MoviePilot 已在运行")
@@ -930,13 +1062,13 @@ def status() -> None:
         data = (backend_health or {}).get("data") or {}
         click.echo("  running (unmanaged)")
         click.echo(f"  URL: {_backend_base_url()}")
-        click.echo(f"  Version: {data.get('BACKEND_VERSION', APP_VERSION)}")
+        click.echo(f"  Version: {data.get('BACKEND_VERSION', get_app_version())}")
     else:
         data = (backend_health or {}).get("data") or {}
         click.echo(f"  {'running' if backend_state == 'running' else 'starting'}")
         click.echo(f"  PID: {backend_process.pid}")
         click.echo(f"  URL: {_backend_base_url(backend_runtime)}")
-        click.echo(f"  Version: {data.get('BACKEND_VERSION', APP_VERSION)}")
+        click.echo(f"  Version: {data.get('BACKEND_VERSION', get_app_version())}")
         click.echo(f"  App Log: {BACKEND_APP_LOG_FILE}")
         click.echo(f"  Stdout Log: {BACKEND_STDIO_LOG_FILE}")
 
@@ -989,7 +1121,7 @@ def logs(lines: int, follow: bool, stdio: bool, frontend_log: bool) -> None:
 @click.option("--deep", is_flag=True, help="执行可能较慢的深度检查")
 def doctor(json_output: bool, fix: bool, deep: bool) -> None:
     """离线诊断本地 MoviePilot 运行环境，插件日志告警不影响整体状态"""
-    from app.doctor import run_doctor
+    from app.doctor import run_doctor  # pylint: disable=no-name-in-module
     from app.doctor.formatters import format_json_report, format_text_report
 
     report = run_doctor(fix=fix, deep=deep)
@@ -1008,8 +1140,9 @@ def config() -> None:
 @config.command("path", context_settings=CONTEXT_SETTINGS)
 def config_path() -> None:
     """显示配置路径"""
-    click.echo(f"Config Dir: {settings.CONFIG_PATH}")
-    click.echo(f"Env File: {settings.CONFIG_PATH / 'app.env'}")
+    config_path = get_runtime_setting('CONFIG_PATH')
+    click.echo(f"Config Dir: {config_path}")
+    click.echo(f"Env File: {config_path / 'app.env'}")
     click.echo(f"Frontend Dir: {FRONTEND_DIR}")
 
 
@@ -1017,7 +1150,7 @@ def config_path() -> None:
 @click.option("--show-secrets", is_flag=True, help="显示敏感配置原文")
 def config_list(show_secrets: bool) -> None:
     """列出当前配置"""
-    values = settings.model_dump()
+    values = get_runtime_settings().snapshot()
     for key in sorted(values):
         click.echo(f"{key}={_format_value(_mask_value(key, values[key], show_secrets))}")
 
@@ -1027,9 +1160,9 @@ def config_list(show_secrets: bool) -> None:
 def config_get(key: str) -> None:
     """读取单个配置项"""
     setting_fields = Settings.model_fields.keys()
-    if key not in setting_fields and not hasattr(settings, key):
+    if key not in setting_fields and not get_runtime_settings().contains(key):
         raise click.ClickException(f"配置项不存在：{key}")
-    click.echo(_format_value(getattr(settings, key)))
+    click.echo(_format_value(get_runtime_settings().get(key)))
 
 
 @config.command("set", context_settings=CONTEXT_SETTINGS)
@@ -1037,7 +1170,7 @@ def config_get(key: str) -> None:
 @click.argument("value")
 def config_set(key: str, value: str) -> None:
     """写入单个配置项"""
-    result, message = settings.update_setting(key, value)
+    result, message = get_runtime_settings().update(key, value)
     if result is False:
         raise click.ClickException(message or f"配置项更新失败：{key}")
     if result is None:
@@ -1065,7 +1198,7 @@ def config_keys(pattern: Optional[str], show_current: bool, show_secrets: bool) 
         if pattern and pattern.lower() not in key.lower():
             continue
         default_value = _field_default(field)
-        current_value = getattr(settings, key, default_value)
+        current_value = get_runtime_settings().get(key, default_value)
         rows.append(
             (
                 key,
@@ -1097,12 +1230,12 @@ def config_describe(key: str, show_secrets: bool) -> None:
         raise click.ClickException(f"配置项不存在：{key}")
 
     default_value = _field_default(field)
-    current_value = getattr(settings, key, default_value)
+    current_value = get_runtime_settings().get(key, default_value)
     click.echo(f"Key: {key}")
     click.echo(f"Type: {_annotation_name(field.annotation)}")
     click.echo(f"Default: {_format_value(_mask_value(key, default_value, show_secrets))}")
     click.echo(f"Current: {_format_value(_mask_value(key, current_value, show_secrets))}")
-    click.echo(f"Env File: {settings.CONFIG_PATH / 'app.env'}")
+    click.echo(f"Env File: {get_runtime_setting('CONFIG_PATH') / 'app.env'}")
 
 
 @cli.group(context_settings=CONTEXT_SETTINGS)
@@ -1177,12 +1310,14 @@ def scheduler_run(job_id: str) -> None:
 @cli.command(context_settings=CONTEXT_SETTINGS)
 def version() -> None:
     """显示版本信息"""
-    click.echo(f"MoviePilot CLI: {APP_VERSION}")
+    click.echo(f"MoviePilot CLI: {get_app_version()}")
 
     healthy_backend, payload = _backend_health(runtime=_backend_runtime())
     if healthy_backend:
         data = (payload or {}).get("data") or {}
-        click.echo(f"Backend Service: {data.get('BACKEND_VERSION', APP_VERSION)}")
+        click.echo(
+            f"Backend Service: {data.get('BACKEND_VERSION', get_app_version())}"
+        )
     else:
         click.echo("Backend Service: not running")
 

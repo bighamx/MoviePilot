@@ -3,7 +3,9 @@ from typing import Union, Tuple
 
 from pywebpush import webpush, WebPushException
 
-from app.runtime.config import global_vars, settings
+from app.runtime.settings import get_runtime_setting
+from app.runtime.webpush import webpush_registry
+
 from app.runtime.log import logger
 from app.modules import _ModuleBase, _MessageBase
 from app.schemas.message import Message
@@ -83,7 +85,7 @@ class WebPushModule(_ModuleBase, _MessageBase):
                 else:
                     caption = message.text
                     content = ""
-                for sub in global_vars.get_subscriptions():
+                for sub in webpush_registry.list():
                     logger.debug(f"给 {sub} 发送WebPush：{caption} {content}")
                     try:
                         endpoint = sub.get("endpoint")
@@ -100,9 +102,9 @@ class WebPushModule(_ModuleBase, _MessageBase):
                                 "body": content,
                                 "url": message.link or "/?shotcut=message"
                             }),
-                            vapid_private_key=settings.VAPID.get("privateKey"),
+                            vapid_private_key=get_runtime_setting('VAPID').get("privateKey"),
                             vapid_claims={
-                                "sub": settings.VAPID.get("subject")
+                                "sub": get_runtime_setting('VAPID').get("subject")
                             },
                             **webpush_options,
                         )
@@ -114,7 +116,7 @@ class WebPushModule(_ModuleBase, _MessageBase):
                             "status",
                             None,
                         )
-                        if status_code in {404, 410} and global_vars.remove_subscription(sub):
+                        if status_code in {404, 410} and webpush_registry.remove(sub):
                             logger.info(f"已移除失效WebPush订阅: {sub.get('endpoint')}")
 
             except Exception as msg_e:

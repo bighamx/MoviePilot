@@ -2,11 +2,12 @@ import asyncio
 import base64
 import json
 import re
-from typing import Tuple, List, Optional
+from typing import Any, Tuple, List, Optional
 from urllib.parse import urlparse
 
-from app.runtime.config import settings
-from app.application.configuration import get_configured_system_config as SystemConfigOper
+from app.runtime.settings import get_runtime_setting
+
+from app.application.configuration import get_configured_system_config
 from app.runtime.log import logger
 from app.schemas.types import MediaType
 from app.adapters.network.http import RequestUtils, AsyncRequestUtils
@@ -71,7 +72,8 @@ class MTorrentSpider:
         return cls._size
 
     def __init__(self, indexer: dict):
-        self.systemconfig = SystemConfigOper()
+        """使用站点配置初始化 M-Team API 请求上下文。"""
+        self.systemconfig = get_configured_system_config()
         if indexer:
             self._indexerid = indexer.get('id')
             self._url = indexer.get('domain')
@@ -79,7 +81,7 @@ class MTorrentSpider:
             self._searchurl = self._searchurl % self._domain
             self._name = indexer.get('name')
             if indexer.get('proxy'):
-                self._proxy = settings.PROXY
+                self._proxy = get_runtime_setting('PROXY')
             self._cookie = indexer.get('cookie')
             self._ua = indexer.get('ua')
             self._apikey = indexer.get('apikey')
@@ -199,6 +201,17 @@ class MTorrentSpider:
                         torrent["freedate"] = time_tools.format_timestamp(end_date)
             torrents.append(torrent)
         return torrents
+
+    def __process_response(self, res: Any) -> Tuple[bool, List[dict[str, Any]]]:
+        """统一判定搜索响应状态并投影 M-Team 种子结果。"""
+        if res and res.status_code == 200:
+            results = res.json().get('data', {}).get("data") or []
+            return False, self.__parse_result(results)
+        if res is not None:
+            logger.warn(f"{self._name} 搜索失败，错误码：{res.status_code}")
+            return True, []
+        logger.warn(f"{self._name} 搜索失败，无法连接 {self._domain}")
+        return True, []
 
     def search(self, keyword: str, mtype: MediaType = None, page: Optional[int] = 0) -> Tuple[bool, List[dict]]:
         """

@@ -1,8 +1,11 @@
 import asyncio
+import inspect
 import json
 import threading
 from abc import ABCMeta, abstractmethod
+from concurrent.futures import Future as ConcurrentFuture
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import Context, copy_context
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional, Protocol
@@ -16,13 +19,14 @@ from app.agent.policy.sanitizer import (
     summarize_result,
 )
 from app.agent.tools.tags import ToolTag
-from app.chain import ChainBase
-from app.runtime.config import settings
+from app.application.agent import AgentDataContext
 from app.application.messaging.agent import matches_channel_admin
-from app.runtime.extensions.service_config import ServiceConfigHelper
+from app.application.notification import get_notification_configs
+from app.chain.base import ChainBase
 from app.runtime.log import logger
+from app.runtime.settings import get_runtime_setting
 from app.schemas.message import Message
-from app.schemas.types import NotificationChannel, MessageType
+from app.schemas.types import MessageType, NotificationChannel
 
 if TYPE_CHECKING:
     from app.agent.callback import StreamingHandler as _StreamingHandlerProtocol
@@ -164,33 +168,130 @@ _blocking_semaphores = {
     for bucket, limit in _BLOCKING_BUCKET_LIMITS.items()
 }
 _blocking_executors: dict[str, ThreadPoolExecutor] = {}
-_blocking_executor_lock = threading.Lock()
+_blocking_retiring_executors: set[ThreadPoolExecutor] = set()
+_blocking_futures: dict[ConcurrentFuture[Any], ThreadPoolExecutor] = {}
+_blocking_executor_lock = threading.RLock()
+_blocking_executor_accepting = True
 
 
-def _get_blocking_executor(bucket: str) -> ThreadPoolExecutor:
-    """按桶懒加载线程池，避免在导入阶段创建过多 worker。"""
+def _discard_blocking_future(future: ConcurrentFuture[Any]) -> None:
+    """在同步调用到达终态后撤销 Future 与 retiring executor owner。"""
     with _blocking_executor_lock:
+        executor = _blocking_futures.pop(future, None)
+        if executor is None or executor not in _blocking_retiring_executors:
+            return
+        if executor not in _blocking_futures.values():
+            _blocking_retiring_executors.discard(executor)
+
+
+def _submit_blocking_call(
+    bucket: str,
+    bound_call: Callable[[], Any],
+) -> ConcurrentFuture[Any]:
+    """在提交门禁内原子取得 executor、提交调用并登记 Future owner。"""
+    context = copy_context()
+    with _blocking_executor_lock:
+        if not _blocking_executor_accepting:
+            raise RuntimeError("Agent 工具阻塞执行器正在关闭，不能再提交新任务")
         executor = _blocking_executors.get(bucket)
-        if executor:
-            return executor
+        if executor is None:
+            limit = _BLOCKING_BUCKET_LIMITS[bucket]
+            executor = ThreadPoolExecutor(
+                max_workers=limit,
+                thread_name_prefix=f"agent-tool-{bucket}",
+            )
+            _blocking_executors[bucket] = executor
+        # 长期 worker 保持空底层上下文，每个任务只在自己的调用快照内运行。
+        future = Context().run(executor.submit, context.run, bound_call)
+        _blocking_futures[future] = executor
+        future.add_done_callback(_discard_blocking_future)
+        return future
 
-        limit = _BLOCKING_BUCKET_LIMITS[bucket]
-        executor = ThreadPoolExecutor(
-            max_workers=limit,
-            thread_name_prefix=f"agent-tool-{bucket}",
-        )
-        _blocking_executors[bucket] = executor
-        return executor
 
-
-def shutdown_blocking_executors(*, wait: bool = True, cancel_futures: bool = False) -> None:
-    """关闭 Agent 工具阻塞线程池，释放长期运行进程或测试环境中的 worker。"""
+def _retire_blocking_executors(*, cancel_futures: bool) -> tuple[ThreadPoolExecutor, ...]:
+    """撤销活动 executor 的提交资格，并保留其运行 Future 对应的 owner。"""
     with _blocking_executor_lock:
-        executors = list(_blocking_executors.values())
+        executors = tuple(_blocking_executors.values())
         _blocking_executors.clear()
-
+        _blocking_retiring_executors.update(executors)
     for executor in executors:
-        executor.shutdown(wait=wait, cancel_futures=cancel_futures)
+        executor.shutdown(wait=False, cancel_futures=cancel_futures)
+    with _blocking_executor_lock:
+        owned_executors = set(_blocking_futures.values())
+        _blocking_retiring_executors.intersection_update(owned_executors)
+    return executors
+
+
+def begin_blocking_executor_shutdown(*, cancel_futures: bool = True) -> None:
+    """原子封住新阻塞工具提交，并请求取消尚未开始的同步调用。"""
+    global _blocking_executor_accepting
+    with _blocking_executor_lock:
+        _blocking_executor_accepting = False
+    _retire_blocking_executors(cancel_futures=cancel_futures)
+
+
+def reopen_blocking_executors() -> bool:
+    """仅在旧 Future 和 executor 全部收敛后重新开放测试生命周期。"""
+    global _blocking_executor_accepting
+    with _blocking_executor_lock:
+        if _blocking_futures or _blocking_retiring_executors:
+            return False
+        _blocking_executor_accepting = True
+        return True
+
+
+async def close_blocking_executors(
+    *,
+    timeout_seconds: float,
+    cancel_futures: bool = True,
+) -> bool:
+    """有限等待全部阻塞工具 Future，超时保留 Future 与 executor owner。"""
+    begin_blocking_executor_shutdown(cancel_futures=cancel_futures)
+    with _blocking_executor_lock:
+        futures = tuple(_blocking_futures)
+    wrapped_futures = tuple(asyncio.wrap_future(future) for future in futures)
+    if wrapped_futures:
+        done, pending = await asyncio.wait(
+            wrapped_futures,
+            timeout=max(0.0, timeout_seconds),
+        )
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
+        for pending_future in pending:
+            pending_future.add_done_callback(
+                lambda completed: completed.exception()
+                if not completed.cancelled()
+                else None
+            )
+
+    with _blocking_executor_lock:
+        unfinished = tuple(
+            future for future in _blocking_futures if not future.done()
+        )
+        retiring_count = len(_blocking_retiring_executors)
+    if unfinished:
+        logger.error(
+            "Agent 阻塞工具未在 %.1f 秒内收敛：futures=%d，executors=%d",
+            max(0.0, timeout_seconds),
+            len(unfinished),
+            retiring_count,
+        )
+        return False
+    return True
+
+
+def shutdown_blocking_executors(
+    *,
+    wait: bool = True,
+    cancel_futures: bool = False,
+) -> bool:
+    """同步清理测试 owner；非等待模式下保留尚未收敛的 executor 句柄。"""
+    executors = _retire_blocking_executors(cancel_futures=cancel_futures)
+    for executor in executors:
+        if wait:
+            executor.shutdown(wait=True, cancel_futures=cancel_futures)
+    with _blocking_executor_lock:
+        return not _blocking_futures and not _blocking_retiring_executors
 
 
 class ToolExecutionTimeoutError(TimeoutError):
@@ -200,7 +301,7 @@ class ToolExecutionTimeoutError(TimeoutError):
 def _get_tool_timeout_seconds() -> Optional[float]:
     """读取工具执行超时时间，配置为 0 或负数时表示不限制。"""
     try:
-        timeout = float(settings.LLM_TOOL_TIMEOUT or 0)
+        timeout = float(get_runtime_setting('LLM_TOOL_TIMEOUT') or 0)
     except (TypeError, ValueError):
         timeout = 0
     return timeout if timeout > 0 else None
@@ -222,7 +323,7 @@ async def run_agent_blocking(
 
     await semaphore.acquire()
     try:
-        future = _get_blocking_executor(bucket_name).submit(bound_call)
+        future = _submit_blocking_call(bucket_name, bound_call)
     except Exception:
         semaphore.release()
         raise
@@ -256,16 +357,32 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
     _stream_handler: Optional[_StreamingHandlerProtocol] = PrivateAttr(default=None)
     _require_admin: bool = PrivateAttr(default=False)
     _agent_context: dict = PrivateAttr(default_factory=dict)
+    _data: Optional[AgentDataContext] = PrivateAttr(default=None)
 
-    def __init__(self, session_id: str, user_id: str, **kwargs):
+    def __init__(
+        self,
+        session_id: str,
+        user_id: str,
+        data: Optional[AgentDataContext] = None,
+        **kwargs,
+    ):
+        """保存会话身份及组合根注入的 Agent 数据上下文。"""
         super().__init__(**kwargs)
         self._session_id = session_id
         self._user_id = user_id
+        self._data = data
         # require_admin 在各工具子类以 pydantic 字段声明，pydantic v2 不在类对象上暴露字段值
         # （getattr(cls, ...) 取不到），必须经实例读取——super().__init__() 已按字段默认填充实例；
         # getattr 兜底兼容未声明该字段的工具，缺省按非管理员（False）处理。
         self._require_admin = getattr(self, "require_admin", False)
         self.tags = self._build_tool_tags()
+
+    @property
+    def data(self) -> AgentDataContext:
+        """返回工具数据上下文；未装配时稳定失败而非回退全局 locator。"""
+        if self._data is None:
+            raise RuntimeError("Agent 工具数据上下文尚未注入")
+        return self._data
 
     @staticmethod
     def _normalize_tag_values(tags: Optional[Any]) -> set[str]:
@@ -313,7 +430,7 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
 
         # 发送工具执行过程消息（流式传输且非最后终结工具时）
         if self._stream_handler and self._stream_handler.is_streaming and not self.return_direct:
-            if settings.AI_AGENT_VERBOSE:
+            if get_runtime_setting('AI_AGENT_VERBOSE'):
                 if self._stream_handler.is_auto_flushing:
                     # 渠道支持编辑：工具消息追加到 buffer，由定时刷新推送
                     if tool_message:
@@ -377,7 +494,7 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
         except ToolExecutionTimeoutError as e:
             error_message = summarize_error(e)
             logger.warning(error_message)
-            result = error_message
+            raise
         except Exception as e:
             error_message = f"工具执行异常: {summarize_error(e)}"
             logger.error(f"Tool {self.name} execution failed: {summarize_error(e)}")
@@ -415,6 +532,7 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
         except asyncio.TimeoutError as err:
             raise ToolExecutionTimeoutError(
                 f"工具 {self.name} 执行超时（超过 {timeout:g} 秒），已停止等待结果。"
+                "若工具包含外部写操作，操作可能仍在继续，请先确认实际状态再重试。"
             ) from err
 
     @staticmethod
@@ -512,7 +630,7 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
         :return: 普通用户允许读写的本地目录列表
         """
         roots = [
-            settings.CONFIG_PATH / "agent",
+            get_runtime_setting('CONFIG_PATH') / "agent",
         ]
         resolved_roots = []
         for root in roots:
@@ -617,7 +735,7 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
             return False
 
         try:
-            configs = ServiceConfigHelper.get_notification_configs()
+            configs = get_notification_configs(include_disabled=True)
             for config in configs:
                 if config.name == self._source and config.config:
                     return matches_channel_admin(
@@ -643,7 +761,9 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
             self._channel == NotificationChannel.WebAgent.value
             and callable(callback)
         ):
-            callback(message)
+            callback_result = callback(message)
+            if inspect.isawaitable(callback_result):
+                await callback_result
             return
 
         if not self._channel or not self._source:
@@ -654,7 +774,7 @@ class MoviePilotTool(BaseTool, metaclass=ABCMeta):
                     "userid": None,
                     "username": message.username
                     or self._username
-                    or settings.SUPERUSER,
+                    or get_runtime_setting('SUPERUSER'),
                     "original_message_id": None,
                     "original_chat_id": None,
                 }

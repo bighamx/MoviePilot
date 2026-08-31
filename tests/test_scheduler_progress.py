@@ -1,16 +1,31 @@
 import asyncio
 import threading
+from collections.abc import Generator
 from uuid import uuid4
 
 import pytest
 
-from app.runtime.config import global_vars
-from app.scheduler import Scheduler
+from app.runtime.loop import main_loop_registry
+from app.scheduler.facade import Scheduler
+from app.scheduler.registry import ExecutionRegistry
+
+
+@pytest.fixture(autouse=True)
+def _restore_main_loop_registry() -> Generator[None, None, None]:
+    """隔离并恢复主循环登记，避免前序兼容层假循环改变投递路径。"""
+    previous = main_loop_registry.current
+    main_loop_registry.replace_compat(None)
+    try:
+        yield
+    finally:
+        main_loop_registry.replace_compat(previous)
 
 
 def _build_scheduler(job_id, func):
     """构造不启动 APScheduler 的定时服务测试对象。"""
     scheduler = object.__new__(Scheduler)
+    scheduler._scheduler = None
+    scheduler._event = threading.Event()
     scheduler._lock = threading.RLock()
     scheduler._jobs = {
         job_id: {
@@ -20,6 +35,8 @@ def _build_scheduler(job_id, func):
             "running": False,
         }
     }
+    scheduler._lifecycle_state = "running"
+    scheduler._registry = ExecutionRegistry(scheduler._lock)
     return scheduler
 
 
@@ -62,7 +79,7 @@ def test_scheduler_failure_preserves_last_progress(monkeypatch):
     scheduler = _build_scheduler(job_id, task)
     monkeypatch.setattr(
         scheduler,
-        "_Scheduler__handle_job_error",
+        "_handle_job_error",
         lambda **kwargs: None,
     )
 
@@ -105,7 +122,7 @@ def test_scheduler_runs_async_job_without_running_global_loop(monkeypatch):
 
     scheduler = _build_scheduler(job_id, task)
     target_loop = asyncio.new_event_loop()
-    monkeypatch.setattr(global_vars, "CURRENT_EVENT_LOOP", target_loop)
+    main_loop_registry.replace_compat(target_loop)
 
     try:
         scheduler.start(job_id)
@@ -129,11 +146,20 @@ def test_scheduler_runs_async_job_from_current_event_loop(monkeypatch):
     async def run_task():
         """从已运行的事件循环启动定时服务。"""
         scheduler.start(job_id)
-        await asyncio.sleep(0)
+
+        async def wait_until_finished() -> None:
+            """等待任务及其异步进度句柄全部收敛。"""
+            while (
+                    scheduler._registry.handles()
+                    or scheduler._registry.is_active(job_id)
+            ):
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_until_finished(), timeout=1)
 
     scheduler = _build_scheduler(job_id, task)
     target_loop = asyncio.new_event_loop()
-    monkeypatch.setattr(global_vars, "CURRENT_EVENT_LOOP", target_loop)
+    main_loop_registry.replace_compat(target_loop)
 
     try:
         asyncio.run(run_task())
@@ -155,9 +181,9 @@ def test_scheduler_records_cancelled_async_job_as_failed():
         raise asyncio.CancelledError
 
     async def run_task():
-        job = scheduler._Scheduler__prepare_job(job_id)
+        job = scheduler._prepare_job(job_id)
         with pytest.raises(asyncio.CancelledError):
-            await scheduler._Scheduler__run_coro_job(task(), job_id, job)
+            await scheduler._run_coro_job(task, job_id, job)
 
     scheduler = _build_scheduler(job_id, task)
     asyncio.run(run_task())
@@ -169,11 +195,43 @@ def test_scheduler_records_cancelled_async_job_as_failed():
     assert progress.error == "任务已取消"
 
 
+def test_scheduler_stop_async_cancels_owned_async_jobs():
+    """Scheduler 关停应取消并等待自身登记的异步作业。"""
+    job_id = f"test-owned-task-{uuid4()}"
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def task():
+        """等待关停信号，验证任务确实由 Scheduler 持有。"""
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    scheduler = _build_scheduler(job_id, task)
+
+    async def run_task():
+        """在当前事件循环启动并收口异步作业。"""
+        scheduler.start(job_id)
+        await started.wait()
+        assert len(scheduler._registry.handles()) == 1
+        await scheduler.stop_async()
+
+    asyncio.run(run_task())
+
+    assert cancelled.is_set()
+    assert scheduler._registry.handles() == ()
+
+
 def test_scheduler_returns_none_for_unknown_job():
     """未注册且无历史进度的定时服务应返回空。"""
     job_id = f"test-unknown-{uuid4()}"
     scheduler = object.__new__(Scheduler)
     scheduler._lock = threading.RLock()
     scheduler._jobs = {}
+    scheduler._lifecycle_state = "running"
+    scheduler._registry = ExecutionRegistry(scheduler._lock)
 
     assert scheduler.get_progress(job_id) is None

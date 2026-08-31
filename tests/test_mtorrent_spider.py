@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import asyncio
+# pylint: disable=no-name-in-module
 
 import pytest
 
@@ -35,7 +36,7 @@ def _build_indexer() -> dict:
 @pytest.fixture()
 def mteam_spider(monkeypatch):
     """构造不依赖真实数据库配置的 MTorrentSpider。"""
-    monkeypatch.setattr(mtorrent_module, "SystemConfigOper", lambda: None)
+    monkeypatch.setattr(mtorrent_module, "get_configured_system_config", lambda: None)
     return MTorrentSpider(_build_indexer())
 
 

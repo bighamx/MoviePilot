@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from dataclasses import replace
 from datetime import datetime
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -17,6 +18,7 @@ from app.application.messaging.agent import (
 from app.application.messaging.interaction import InteractionContext
 from app.chain.message import MessageChain
 from app.runtime.config import settings
+from app.runtime.loop import main_loop_registry
 from app.schemas.types import NotificationChannel
 
 
@@ -174,6 +176,10 @@ class TestAgentInteraction(unittest.TestCase):
 
     def test_agent_interaction_callback_routes_selected_value_back_to_agent(self):
         chain = MessageChain()
+        chain.runtime_config = replace(
+            chain.runtime_config,
+            ai_agent_enable=True,
+        )
         request = agent_interaction_manager.create_request(
             session_id="session-choice",
             user_id="10001",
@@ -188,7 +194,10 @@ class TestAgentInteraction(unittest.TestCase):
             ],
         )
 
-        with patch.object(settings, "AI_AGENT_ENABLE", True), patch.object(
+        loop = Mock(**{"is_running.return_value": True, "is_closed.return_value": False})
+        with patch.object(main_loop_registry, "require", return_value=loop), patch.object(
+            settings, "AI_AGENT_ENABLE", True
+        ), patch.object(
             chain.messagehelper, "put"
         ) as message_put, patch.object(
             chain.messageoper, "add"

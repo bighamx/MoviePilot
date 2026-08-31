@@ -48,17 +48,26 @@ SkillCatalogProvider = Callable[[], SkillCatalogPort]
 _skill_catalog_provider: Optional[SkillCatalogProvider] = None
 
 
-def register_skill_catalog_provider(provider: SkillCatalogProvider) -> None:
-    """由启动组合根注册 Agent 技能目录实现，避免消息层依赖 Agent 具体模块。"""
+def register_skill_catalog_provider(
+    provider: Optional[SkillCatalogProvider],
+) -> Optional[SkillCatalogProvider]:
+    """注册技能目录 provider，并返回先前 provider 供失败回滚。"""
     global _skill_catalog_provider
+    previous = _skill_catalog_provider
     _skill_catalog_provider = provider
+    return previous
+
+
+def reset_skill_catalog_provider() -> None:
+    """清除技能目录 provider，避免跨 lifespan 持有旧 Agent 实现。"""
+    register_skill_catalog_provider(None)
 
 
 def _resolve_skill_catalog() -> SkillCatalogPort:
     """解析已注入的技能目录；缺少组合根装配时给出明确错误。"""
     if _skill_catalog_provider is None:
         raise RuntimeError(
-            "技能目录服务未注册：请先导入 app.startup.agent_initializer "
+            "技能目录服务未注册：请先导入 app.startup.initializers.agent "
             "完成组合根装配"
         )
     return _skill_catalog_provider()
@@ -268,6 +277,27 @@ class SkillInteractionHandler:
             original_message_id: Optional[Union[str, int]] = None,
             original_chat_id: Optional[str] = None,
     ) -> bool:
+        """处理 /skills 回调并保持消息链公开 ABI。"""
+        return self._handle_callback_interaction(
+            callback_data,
+            channel,
+            source,
+            userid,
+            username,
+            original_message_id,
+            original_chat_id,
+        )
+
+    def _handle_callback_interaction(
+            self,
+            callback_data: str,
+            channel: NotificationChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+            original_message_id: Optional[Union[str, int]] = None,
+            original_chat_id: Optional[str] = None,
+    ) -> bool:
         """
         处理按钮交互，并在同一条消息上刷新当前视图。
         """
@@ -418,6 +448,17 @@ class SkillInteractionHandler:
         return True
 
     def handle_text_interaction(
+            self,
+            channel: NotificationChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+            text: str,
+    ) -> bool:
+        """处理 /skills 文本交互并保持消息链公开 ABI。"""
+        return self._handle_text_interaction(channel, source, userid, username, text)
+
+    def _handle_text_interaction(
             self,
             channel: NotificationChannel,
             source: str,

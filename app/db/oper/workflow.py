@@ -1,6 +1,7 @@
-from typing import List, Mapping, Tuple, Optional, Any
+from typing import Any, List, Mapping, Optional, Tuple
 
 from sqlalchemy import delete as sqlalchemy_delete
+from sqlalchemy.orm import Session
 
 from app.db.base import DbOper
 from app.db.models.workflow import Workflow
@@ -16,8 +17,8 @@ class WorkflowOper(DbOper):
         新增工作流
         """
         wf = Workflow(**kwargs)
-        if not wf.get_by_name(self._db, kwargs.get("name")):
-            wf.create(self._db)
+        if not self.get_by_name(kwargs.get("name")):
+            self._stage_create(wf)
             return True, "新增工作流成功"
         return False, "工作流已存在"
 
@@ -25,7 +26,7 @@ class WorkflowOper(DbOper):
         """
         查询单个工作流
         """
-        return Workflow.get(self._db, wid)
+        return self._execute_sync_query(lambda session: Workflow.get(session, wid))
 
     def stage_state(self, workflow_id: int, state: str) -> bool:
         """暂存工作流状态变更，不由模型方法自行提交。"""
@@ -59,49 +60,63 @@ class WorkflowOper(DbOper):
         """
         异步查询单个工作流
         """
-        return await Workflow.async_get(self._db, wid)
+        return await self._execute_async_query(
+            lambda session: Workflow.async_get(session, wid)
+        )
 
     def list(self) -> List[Workflow]:
         """
         获取所有工作流列表
         """
-        return Workflow.list(self._db)
+        return self._execute_sync_query(lambda session: Workflow.list(session))
 
     async def async_list(self) -> List[Workflow]:
         """
         异步获取所有工作流列表
         """
-        return await Workflow.async_list(self._db)
+        return await self._execute_async_query(
+            lambda session: Workflow.async_list(session)
+        )
 
     def list_enabled(self) -> List[Workflow]:
         """
         获取启用的工作流列表
         """
-        return Workflow.get_enabled_workflows(self._db)
+        return self._execute_sync_query(
+            lambda session: Workflow.get_enabled_workflows(session)
+        )
 
     def get_timer_triggered_workflows(self) -> List[Workflow]:
         """
         获取定时触发的工作流列表
         """
-        return Workflow.get_timer_triggered_workflows(self._db)
+        return self._execute_sync_query(
+            lambda session: Workflow.get_timer_triggered_workflows(session)
+        )
 
     def get_event_triggered_workflows(self) -> List[Workflow]:
         """
         获取事件触发的工作流列表
         """
-        return Workflow.get_event_triggered_workflows(self._db)
+        return self._execute_sync_query(
+            lambda session: Workflow.get_event_triggered_workflows(session)
+        )
 
     def get_by_name(self, name: str) -> Workflow:
         """
         按名称获取工作流
         """
-        return Workflow.get_by_name(self._db, name)
+        return self._execute_sync_query(
+            lambda session: Workflow.get_by_name(session, name)
+        )
 
     async def async_get_by_name(self, name: str) -> Optional[Workflow]:
         """
         异步按名称获取工作流
         """
-        return await Workflow.async_get_by_name(self._db, name)
+        return await self._execute_async_query(
+            lambda session: Workflow.async_get_by_name(session, name)
+        )
 
     async def stage_create(self, payload: Mapping[str, Any]) -> Workflow:
         """暂存新工作流，不在操作器内提交事务。"""
@@ -128,28 +143,34 @@ class WorkflowOper(DbOper):
             workflow.run_count = 0
         return workflow
 
-    def start(self, wid: int) -> bool:
-        """
-        启动
-        """
+    def stage_start(self, wid: int) -> bool:
+        """在调用方持有的会话中暂存运行中状态。"""
+        if not isinstance(self._db, Session):
+            raise RuntimeError("工作流暂存写入需要调用方提供同步 Session")
         return Workflow.start(self._db, wid)
 
-    def success(self, wid: int, result: Optional[str] = None) -> bool:
-        """
-        成功
-        """
+    def stage_success(self, wid: int, result: Optional[str] = None) -> bool:
+        """在调用方持有的会话中暂存成功状态。"""
+        if not isinstance(self._db, Session):
+            raise RuntimeError("工作流暂存写入需要调用方提供同步 Session")
         return Workflow.success(self._db, wid, result)
 
-    def fail(self, wid: int, result: str) -> bool:
-        """
-        失败
-        """
+    def stage_fail(self, wid: int, result: str) -> bool:
+        """在调用方持有的会话中暂存失败状态。"""
+        if not isinstance(self._db, Session):
+            raise RuntimeError("工作流暂存写入需要调用方提供同步 Session")
         return Workflow.fail(self._db, wid, result)
 
-    def step(self, wid: int, action_id: str, context: dict, execution_state: Optional[dict] = None) -> bool:
-        """
-        步进
-        """
+    def stage_step(
+            self,
+            wid: int,
+            action_id: str,
+            context: dict[str, Any],
+            execution_state: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """在调用方持有的会话中暂存动作进度。"""
+        if not isinstance(self._db, Session):
+            raise RuntimeError("工作流暂存写入需要调用方提供同步 Session")
         return Workflow.update_current_action(
             self._db,
             wid,
@@ -158,8 +179,12 @@ class WorkflowOper(DbOper):
             execution_state
         )
 
-    def reset(self, wid: int, reset_count: bool = False) -> bool:
-        """
-        重置
-        """
+    def stage_execution_reset(
+            self,
+            wid: int,
+            reset_count: bool = False,
+    ) -> bool:
+        """在调用方持有的会话中暂存执行状态重置。"""
+        if not isinstance(self._db, Session):
+            raise RuntimeError("工作流暂存写入需要调用方提供同步 Session")
         return Workflow.reset(self._db, wid, reset_count=reset_count)

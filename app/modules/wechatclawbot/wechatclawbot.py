@@ -17,7 +17,9 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
 from app.runtime.cache import FileCache
-from app.runtime.config import settings
+from app.runtime.settings import get_runtime_setting
+
+from app.application.messaging.ingress import forward_message_to_host
 from app.domain.context import Context, MediaInfo
 from app.domain.metainfo import MetaInfo
 from app.runtime.log import logger
@@ -1438,11 +1440,12 @@ class WechatClawBot:
     _default_base_url = "https://ilinkai.weixin.qq.com"
     _qrcode_ttl_seconds = 240
     _active_target_ttl_seconds = 24 * 60 * 60
+    _poll_join_timeout_seconds = 5
 
     @classmethod
-    def _build_cache_key(cls, config_name: str) -> str:
-        """根据配置名称构建缓存键。"""
-        safe_name = hashlib.md5(str(config_name or "wechatclawbot").encode("utf-8")).hexdigest()[:12]
+    def _build_cache_key(cls, identity: str) -> str:
+        """根据稳定渠道身份构建缓存键。"""
+        safe_name = hashlib.md5(str(identity or "wechatclawbot").encode("utf-8")).hexdigest()[:12]
         return f"__wechatclawbot_state_{safe_name}__"
 
     def __init__(
@@ -1452,11 +1455,13 @@ class WechatClawBot:
         WECHATCLAWBOT_ADMINS: Optional[str] = None,
         WECHATCLAWBOT_POLL_TIMEOUT: Optional[int] = None,
         name: Optional[str] = None,
+        identity: Optional[str] = None,
         auto_start_polling: bool = True,
         **kwargs,
     ):
         """初始化微信 ClawBot 实例及相关参数。"""
         self._config_name = name or "wechatclawbot"
+        self._identity = str(identity or self._config_name)
         self._base_url = (WECHATCLAWBOT_BASE_URL or self._default_base_url).rstrip("/")
         self._default_target = (WECHATCLAWBOT_DEFAULT_TARGET or "").strip() or None
         self._auto_start_polling = bool(auto_start_polling)
@@ -1469,21 +1474,24 @@ class WechatClawBot:
             self._poll_timeout = max(10, int(WECHATCLAWBOT_POLL_TIMEOUT or 25))
         except Exception:
             self._poll_timeout = 25
-        self._cache_key = self._build_cache_key(self._config_name)
+        self._cache_key = self._build_cache_key(self._identity)
+        self._legacy_cache_key = self._build_cache_key(self._config_name)
         self._filecache = FileCache()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._poll_thread: Optional[threading.Thread] = None
         self._state = self._load_state()
-        self._message_endpoint = (
-            f"http://127.0.0.1:{settings.PORT}/api/v1/message?token={settings.API_TOKEN}&source={quote(self._config_name, safe='')}"
-        )
         if self._state.get("bot_token") and self._auto_start_polling:
             self._start_polling()
 
     def _load_state(self) -> Dict[str, Any]:
         """从文件缓存加载登录状态。"""
         content = self._filecache.get(self._cache_key)
+        if not content and self._legacy_cache_key != self._cache_key:
+            content = self._filecache.get(self._legacy_cache_key)
+            if content:
+                self._filecache.set(self._cache_key, content)
+                self._filecache.delete(self._legacy_cache_key)
         if not content:
             return {
                 "bot_token": None,
@@ -1685,14 +1693,14 @@ class WechatClawBot:
             except Exception:
                 return None
         if image_url.startswith("/"):
-            image_url = settings.MP_DOMAIN(image_url)
+            image_url = get_runtime_setting('MP_DOMAIN')(image_url)
         if not image_url.lower().startswith("http"):
             return None
         try:
             resp = RequestUtils(
                 timeout=20,
-                proxies=settings.PROXY,
-                ua=settings.USER_AGENT,
+                proxies=get_runtime_setting('PROXY'),
+                ua=get_runtime_setting('USER_AGENT'),
             ).get_res(image_url)
             if resp and resp.status_code == 200 and resp.content:
                 content_type = (resp.headers.get("Content-Type") or "").lower()
@@ -1706,12 +1714,21 @@ class WechatClawBot:
         """获取当前登录状态。"""
         return bool(self._state.get("bot_token"))
 
-    def stop(self) -> None:
-        """停止消息轮询。"""
+    def stop(self) -> bool:
+        """停止消息轮询，并保留超时线程 owner 供后续重试。"""
         self._stop_event.set()
-        if self._poll_thread and self._poll_thread.is_alive():
-            self._poll_thread.join(timeout=5)
+        poll_thread = self._poll_thread
+        if (
+            poll_thread
+            and poll_thread.is_alive()
+            and poll_thread is not threading.current_thread()
+        ):
+            poll_thread.join(timeout=self._poll_join_timeout_seconds)
+        if poll_thread and poll_thread.is_alive():
+            logger.error("微信 ClawBot 消息轮询线程未在关闭预算内退出")
+            return False
         self._poll_thread = None
+        return True
 
     def _start_polling(self) -> None:
         """启动消息轮询线程。"""
@@ -1749,33 +1766,18 @@ class WechatClawBot:
                         username=message.username,
                         context_token=message.context_token,
                     )
-                    response = None
                     try:
-                        response = RequestUtils(timeout=15).post_res(
-                            self._message_endpoint,
-                            json=message.to_message_payload(),
-                        )
-                        if response is None:
-                            logger.error(
-                                f"转发微信 ClawBot 消息失败：message_id={message.message_id}, "
-                                "本地消息入口无响应"
-                            )
-                        elif response.status_code != 200:
+                        if not self._forward_to_message_chain(
+                            message.to_message_payload()
+                        ):
                             logger.error(
                                 "转发微信 ClawBot 消息失败："
-                                f"message_id={message.message_id}, status={response.status_code}, "
-                                f"body={self._short_text(response.text)}"
+                                f"message_id={message.message_id}"
                             )
                     except Exception as err:
                         logger.error(
                             f"转发微信 ClawBot 消息失败：message_id={message.message_id}, error={err}"
                         )
-                    finally:
-                        if response is not None:
-                            try:
-                                response.close()
-                            except Exception:
-                                pass
                 consecutive_failures = 0
             except Exception as err:
                 consecutive_failures += 1
@@ -1786,6 +1788,10 @@ class WechatClawBot:
                     self._clear_login_state()
                     break
                 self._stop_event.wait(delay)
+
+    def _forward_to_message_chain(self, payload: dict) -> bool:
+        """把 WeChatClawBot 轮询消息同步转交统一消息入口。"""
+        return forward_message_to_host(payload, self._config_name)
 
     def _build_known_targets(self) -> List[Dict[str, Any]]:
         known_targets = self._state.get("known_targets") or {}
@@ -1920,6 +1926,33 @@ class WechatClawBot:
         if cleanup_old:
             cache.delete(source_key)
         return True, f"已将微信 ClawBot 登录缓存从 {source_name} 迁移到 {target_name}"
+
+    @classmethod
+    def reconcile_cached_states(cls, previous: list[dict], current: list[dict]) -> Dict[str, Any]:
+        """按稳定身份迁移改名缓存，并清理已删除渠道的登录状态。"""
+        cache = FileCache()
+        old_by_id = {str(item.get("id")): item for item in previous if item.get("id")}
+        current_ids = {str(item.get("id")) for item in current if item.get("id")}
+        for item in current:
+            if item.get("type") != "wechatclawbot":
+                continue
+            identity = str(item.get("id") or item.get("name") or "").strip()
+            old = old_by_id.get(identity)
+            if old and old.get("name") and old.get("name") != item.get("name"):
+                legacy_key = cls._build_cache_key(str(old["name"]))
+                target_key = cls._build_cache_key(identity)
+                if not cache.exists(target_key) and cache.exists(legacy_key):
+                    content = cache.get(legacy_key)
+                    if content:
+                        cache.set(target_key, content)
+                cache.delete(legacy_key)
+        for item in previous:
+            if item.get("type") != "wechatclawbot" or str(item.get("id")) in current_ids:
+                continue
+            for identity in (item.get("id"), item.get("name")):
+                if identity:
+                    cache.delete(cls._build_cache_key(str(identity)))
+        return {"success": True, "message": "通知渠道缓存已同步"}
 
     @staticmethod
     def _decode_ref_payload(ref: str, kind: str) -> Optional[Dict[str, Any]]:

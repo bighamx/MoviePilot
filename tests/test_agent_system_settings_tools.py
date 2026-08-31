@@ -16,11 +16,26 @@ from app.schemas.types import SystemConfigKey
 
 
 class TestAgentSystemSettingsTools(unittest.TestCase):
+    def test_query_system_settings_accepts_injected_reader(self):
+        """Agent 配置工具通过窄端口读取授权字段，无需自行构造数据库 Oper。"""
+        reader = MagicMock()
+        reader.get.return_value = [{"name": "qb", "enabled": True}]
+        tool = QuerySystemSettingsTool(
+            session_id="session-injected",
+            user_id="10001",
+            system_config=reader,
+        )
+
+        payload = json.loads(asyncio.run(tool.run(setting_key="Downloaders")))
+
+        self.assertTrue(payload["success"])
+        reader.get.assert_called_once_with(SystemConfigKey.Downloaders)
+
     def test_query_system_settings_returns_exact_systemconfig_value(self):
         tool = QuerySystemSettingsTool(session_id="session-1", user_id="10001")
 
         with patch(
-            "app.agent.tools.impl.query_system_settings.SystemConfigOper"
+            "app.agent.tools.impl.query_system_settings.get_configured_system_config"
         ) as system_config_oper:
             system_config_oper.return_value.get.return_value = [{"name": "qb", "enabled": True}]
             result = asyncio.run(tool.run(setting_key="Downloaders"))
@@ -39,7 +54,7 @@ class TestAgentSystemSettingsTools(unittest.TestCase):
         tool = QuerySystemSettingsTool(session_id="session-1", user_id="10001")
 
         with patch(
-            "app.agent.tools.impl.query_system_settings.SystemConfigOper"
+            "app.agent.tools.impl.query_system_settings.get_configured_system_config"
         ) as system_config_oper:
             system_config_oper.return_value.get.return_value = [
                 {
@@ -69,7 +84,7 @@ class TestAgentSystemSettingsTools(unittest.TestCase):
         tool.set_agent_context({"is_admin": True})
 
         with patch(
-            "app.agent.tools.impl.query_system_settings.SystemConfigOper"
+            "app.agent.tools.impl.query_system_settings.get_configured_system_config"
         ) as system_config_oper:
             system_config_oper.return_value.get.return_value = [
                 {"name": "site-a", "apikey": "site-api-key"}
@@ -141,7 +156,7 @@ class TestAgentSystemSettingsTools(unittest.TestCase):
         tool = QuerySystemSettingsTool(session_id="session-1", user_id="10001")
 
         with patch(
-            "app.agent.tools.impl.query_system_settings.SystemConfigOper"
+            "app.agent.tools.impl.query_system_settings.get_configured_system_config"
         ) as system_config_oper:
             system_config_oper.return_value.get.return_value = []
             result = asyncio.run(tool.run(group="systemconfig"))
@@ -216,7 +231,7 @@ class TestAgentSystemSettingsTools(unittest.TestCase):
         config_oper.async_set = AsyncMock(return_value=True)
 
         with patch(
-            "app.agent.tools.impl.update_system_settings.SystemConfigOper",
+            "app.agent.tools.impl.update_system_settings.get_configured_system_config",
             return_value=config_oper,
         ), patch(
             "app.agent.tools.impl.update_system_settings.eventmanager.async_send_event",
@@ -249,7 +264,7 @@ class TestAgentSystemSettingsTools(unittest.TestCase):
         config_oper.async_set = AsyncMock(return_value=True)
 
         with patch(
-            "app.agent.tools.impl.update_system_settings.SystemConfigOper",
+            "app.agent.tools.impl.update_system_settings.get_configured_system_config",
             return_value=config_oper,
         ), patch(
             "app.agent.tools.impl.update_system_settings.eventmanager.async_send_event",
@@ -282,7 +297,7 @@ class TestAgentSystemSettingsTools(unittest.TestCase):
         config_oper.async_set = AsyncMock(return_value=True)
 
         with patch(
-            "app.agent.tools.impl.update_system_settings.SystemConfigOper",
+            "app.agent.tools.impl.update_system_settings.get_configured_system_config",
             return_value=config_oper,
         ), patch(
             "app.agent.tools.impl.update_system_settings.eventmanager.async_send_event",

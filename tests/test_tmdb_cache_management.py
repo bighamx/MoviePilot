@@ -1,12 +1,13 @@
 import asyncio
 import inspect
 import pickle
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 from app.api.endpoints import tmdb as tmdb_endpoint
 from app.api.deps import get_current_active_superuser_async
-from app.modules.themoviedb import tmdb_cache as tmdb_cache_module
-from app.modules.themoviedb.tmdb_cache import TmdbCache
+from app.modules.themoviedb import cache as tmdb_cache_module
+from app.modules.themoviedb.cache import TmdbCache
 from app.schemas.types import MediaType, SystemConfigKey
 
 
@@ -282,7 +283,11 @@ def test_tmdb_cache_endpoint_returns_management_statistics(monkeypatch):
         "get_configured_system_config",
         lambda: type("SystemConfigStub", (), {"get": get_system_config})(),
     )
-    monkeypatch.setattr(tmdb_endpoint.settings, "MEDIA_RECOGNIZE_SHARE", True)
+    monkeypatch.setattr(
+        tmdb_endpoint,
+        "get_api_runtime_config_snapshot",
+        lambda: SimpleNamespace(media_recognize_share=True),
+    )
 
     response = asyncio.run(tmdb_endpoint.tmdb_recognition_cache(None))
 

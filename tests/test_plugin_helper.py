@@ -1,5 +1,6 @@
 import asyncio
 import io
+import os
 import stat
 import sys
 import tempfile
@@ -8,16 +9,44 @@ import time
 import zipfile
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
-
 from packaging.requirements import Requirement
 from packaging.version import Version
 
+from app.adapters.external.plugin import client as plugin_client_module
+from app.adapters.external.plugin.client import (
+    PluginMarketTransport,
+    PluginPackageSourceClient,
+)
+from app.adapters.system.plugin.health import PluginRuntimeHealth
+from app.adapters.system.plugin.package import PluginPackageManager
 
 PLUGIN_ID = "DemoPlugin"
 REPO_URL = "https://github.com/demo/MoviePilot-Plugins"
+
+
+def _package_owner(
+    transport, *, plugin_root: Path | None = None
+) -> PluginPackageManager:
+    """按生产组合方式为安装测试构造系统包 owner。"""
+    return PluginPackageManager(
+        source=PluginPackageSourceClient(transport),
+        plugin_root=plugin_root,
+    )
+
+
+def _patch_catalog_settings(monkeypatch, **values) -> None:
+    """通过只读端口注入插件目录测试需要的部署配置。"""
+    from app.runtime.extensions.plugin import catalog as catalog_module
+
+    settings = SimpleNamespace(**values)
+    monkeypatch.setattr(
+        catalog_module,
+        "get_runtime_setting",
+        lambda key: getattr(settings, key),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -26,18 +55,48 @@ def _configure_plugin_catalog_factory(monkeypatch):
     from app.adapters.external.plugin.client import PluginMarketClient
     from app.application.plugin.catalog import PluginCatalogService
     from app.foundation.version import compare_version
-    from app.runtime.extensions import plugin_manager as manager_module
+    from app.runtime.extensions.plugin import manager as manager_module
+    from app.runtime.extensions.plugin.storage import get_plugin_storage
+    from app.schemas.types import SystemConfigKey
+    original_runtime_setting = plugin_client_module.get_runtime_setting
 
-    def build_catalog(manager):
+    class _SettingsStub(SimpleNamespace):
+        """允许存量用例覆盖尚未显式声明的配置键。"""
+
+        def __getattr__(self, _key):
+            return None
+
+    market_settings = _SettingsStub(
+        VERSION_FLAG="v3",
+        ROOT_PATH=original_runtime_setting("ROOT_PATH"),
+        TEMP_PATH=original_runtime_setting("TEMP_PATH"),
+        CONFIG_PATH=original_runtime_setting("CONFIG_PATH"),
+        PACKAGE_CACHE_PATH=original_runtime_setting("PACKAGE_CACHE_PATH"),
+        PIP_PROXY=original_runtime_setting("PIP_PROXY"),
+        PROXY_HOST=original_runtime_setting("PROXY_HOST"),
+        REPO_GITHUB_HEADERS=original_runtime_setting("REPO_GITHUB_HEADERS"),
+        PLUGIN_LOCAL_REPO_PATHS="",
+    )
+    monkeypatch.setattr(
+        plugin_client_module,
+        "get_runtime_setting",
+        lambda key, default=None: (
+            getattr(market_settings, key)
+            if hasattr(market_settings, key)
+            else original_runtime_setting(key, default)
+        ),
+    )
+
+    def build_catalog(plugin_mapper):
         """按生产组合方式连接目录服务，但保留测试可替换的依赖。"""
         client = PluginMarketClient()
         return PluginCatalogService(
             market_loader=client.get_plugins,
             async_market_loader=client.async_get_plugins,
-            installed_plugins_provider=lambda: manager_module.get_plugin_storage().read(
-                manager_module.SystemConfigKey.UserInstalledPlugins
+            installed_plugins_provider=lambda: get_plugin_storage().read(
+                SystemConfigKey.UserInstalledPlugins
             ) or [],
-            plugin_mapper=manager._process_plugin_info,
+            plugin_mapper=plugin_mapper,
             is_local_repo=PluginMarketClient.is_local_repo_url,
             version_compare=compare_version,
             warning=manager_module.logger.warning,
@@ -53,6 +112,8 @@ class _FakeResponse:
     def __init__(self, status_code: int, payload: dict | None = None):
         self.status_code = status_code
         self._payload = payload or {}
+        self.reason = self._payload.get("message", "")
+        self.text = self.reason
 
     def json(self):
         """返回构造时注入的 JSON payload。"""
@@ -102,12 +163,24 @@ def _build_release_zip_member(name: str, *, symlink: bool = False) -> bytes:
     return buffer.getvalue()
 
 
+def _create_fake_uv(root: Path) -> Path:
+    """创建仅供命令构造测试定位的 uv 可执行文件。"""
+    uv_bin = root / "venv" / "bin" / "uv"
+    uv_bin.parent.mkdir(parents=True, exist_ok=True)
+    uv_bin.write_text("", encoding="utf-8")
+    return uv_bin
+
+
 def _patch_release_install_settings(monkeypatch, tmp_path: Path) -> None:
     """隔离 release 安装根目录，并阻止测试误触真实根路径。"""
-    monkeypatch.setattr("app.adapters.external.market.settings", SimpleNamespace(
+    values = SimpleNamespace(
         ROOT_PATH=tmp_path,
         REPO_GITHUB_HEADERS=lambda repo=None: {},
-    ))
+    )
+    monkeypatch.setattr(
+        "app.adapters.system.plugin.package.get_runtime_setting",
+        lambda key: getattr(values, key),
+    )
 
     original_mkdir = Path.mkdir
     safe_root = tmp_path.resolve()
@@ -128,11 +201,10 @@ def _patch_sync_remote_install(helper, monkeypatch, meta: dict,
     """隔离同步远端插件安装流程，只观察 release 与文件列表准备路径选择。"""
     calls = []
     monkeypatch.setattr(helper, "get_plugin_package_version", lambda *_args: "v2")
-    monkeypatch.setattr(helper, "_PluginHelper__get_plugin_meta", lambda *_args: meta)
-    monkeypatch.setattr(helper, "_PluginHelper__backup_plugin", lambda _pid: None)
-    monkeypatch.setattr(helper, "_PluginHelper__remove_old_plugin", lambda _pid: calls.append("remove"))
-    monkeypatch.setattr(helper, "_PluginHelper__install_dependencies_if_required", lambda _pid: (False, True, ""))
-    monkeypatch.setattr(helper, "refresh_persistent_plugin_backup", lambda _pid: calls.append("refresh"))
+    monkeypatch.setattr(helper, "_PluginPackageManager__get_plugin_meta", lambda *_args: meta)
+    monkeypatch.setattr(helper, "_PluginPackageManager__backup_plugin", lambda _pid: None)
+    monkeypatch.setattr(helper, "_PluginPackageManager__remove_old_plugin", lambda _pid: calls.append("remove"))
+    monkeypatch.setattr(helper, "_PluginPackageManager__install_dependencies_if_required", lambda _pid: (False, True, ""))
 
     def fake_release(_pid, _user_repo, _release_tag):
         calls.append("release")
@@ -142,8 +214,8 @@ def _patch_sync_remote_install(helper, monkeypatch, meta: dict,
         calls.append("filelist")
         return filelist_result
 
-    monkeypatch.setattr(helper, "_PluginHelper__install_from_release", fake_release)
-    monkeypatch.setattr(helper, "_PluginHelper__prepare_content_via_filelist_sync", fake_filelist)
+    monkeypatch.setattr(helper, "_PluginPackageManager__install_from_release", fake_release)
+    monkeypatch.setattr(helper, "_PluginPackageManager__prepare_content_via_filelist_sync", fake_filelist)
     return calls
 
 
@@ -181,13 +253,16 @@ def _patch_async_remote_install(helper, monkeypatch, meta: dict,
         return None
 
     monkeypatch.setattr(helper, "async_get_plugin_package_version", fake_package_version)
-    monkeypatch.setattr(helper, "_PluginHelper__async_get_plugin_meta", fake_meta)
-    monkeypatch.setattr(helper, "_PluginHelper__async_backup_plugin", fake_backup)
-    monkeypatch.setattr(helper, "_PluginHelper__async_remove_old_plugin", fake_remove)
-    monkeypatch.setattr(helper, "_PluginHelper__async_install_dependencies_if_required", fake_dependencies)
-    monkeypatch.setattr(helper, "_PluginHelper__async_install_from_release", fake_release)
-    monkeypatch.setattr(helper, "_PluginHelper__prepare_content_via_filelist_async", fake_filelist)
-    monkeypatch.setattr("app.adapters.external.market.asyncio.to_thread", fake_to_thread)
+    monkeypatch.setattr(helper, "_PluginPackageManager__async_get_plugin_meta", fake_meta)
+    monkeypatch.setattr(helper, "_PluginPackageManager__async_backup_plugin", fake_backup)
+    monkeypatch.setattr(helper, "_PluginPackageManager__async_remove_old_plugin", fake_remove)
+    monkeypatch.setattr(helper, "_PluginPackageManager__async_install_dependencies_if_required", fake_dependencies)
+    monkeypatch.setattr(helper, "_PluginPackageManager__async_install_from_release", fake_release)
+    monkeypatch.setattr(helper, "_PluginPackageManager__prepare_content_via_filelist_async", fake_filelist)
+    monkeypatch.setattr(
+        "app.adapters.system.plugin.package._await_thread_operation",
+        fake_to_thread,
+    )
     return calls
 
 
@@ -221,16 +296,21 @@ class TestPluginHelper:
         """
         try:
             from app.runtime.cache import fresh
-            from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
         url = "https://raw.githubusercontent.com/user/repo/main/package.json"
 
-        assert url == PluginHelper._PluginHelper__append_cache_buster(url)
-        with patch("app.adapters.external.market.time.time_ns", return_value=1234567890):
+        append_cache_buster = (
+            PluginMarketTransport._PluginMarketTransport__append_cache_buster
+        )
+        assert url == append_cache_buster(url)
+        with patch(
+            "app.adapters.external.plugin.client.time.time_ns",
+            return_value=1234567890,
+        ):
             with fresh(True):
-                refreshed_url = PluginHelper._PluginHelper__append_cache_buster(url)
+                refreshed_url = append_cache_buster(url)
 
         assert "https://raw.githubusercontent.com/user/repo/main/package.json?_refresh=1234567890" == refreshed_url
 
@@ -243,7 +323,9 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        success, message = PluginHelper.check_plugin_system_version({"version": "1.0.0"})
+        success, message = PluginHelper.check_plugin_system_version(
+            {"version": "1.0.0"}
+        )
 
         assert success
         assert "" == message
@@ -252,13 +334,16 @@ class TestPluginHelper:
         """
         插件声明的主系统版本范围不满足当前版本时拒绝安装。
         """
-        try:
-            from app.adapters.external.market import PluginHelper
-        except ModuleNotFoundError as exc:
-            pytest.skip(f"missing dependency: {exc}")
+        from app.adapters.external.market import PluginHelper
 
-        with patch.object(PluginHelper, "get_current_system_version", return_value=Version("2.12.2")):
-            success, message = PluginHelper.check_plugin_system_version({"system_version": ">=2.13.0"})
+        with patch.object(
+            PluginMarketTransport,
+            "get_current_system_version",
+            return_value=Version("2.12.2"),
+        ):
+            success, message = PluginHelper.check_plugin_system_version(
+                {"system_version": ">=2.13.0"}
+            )
 
         assert not success
         assert "MoviePilot 版本 >=2.13.0" in message
@@ -267,13 +352,16 @@ class TestPluginHelper:
         """
         兼容带 v 前缀的版本范围，降低插件索引维护成本。
         """
-        try:
-            from app.adapters.external.market import PluginHelper
-        except ModuleNotFoundError as exc:
-            pytest.skip(f"missing dependency: {exc}")
+        from app.adapters.external.market import PluginHelper
 
-        with patch.object(PluginHelper, "get_current_system_version", return_value=Version("2.12.2")):
-            success, message = PluginHelper.check_plugin_system_version({"system_version": ">=v2.12.0"})
+        with patch.object(
+            PluginMarketTransport,
+            "get_current_system_version",
+            return_value=Version("2.12.2"),
+        ):
+            success, message = PluginHelper.check_plugin_system_version(
+                {"system_version": ">=v2.12.0"}
+            )
 
         assert success
         assert "" == message
@@ -282,11 +370,6 @@ class TestPluginHelper:
         """
         release 版本列表只暴露符合插件 tag 规范且存在同名 zip 资产的版本。
         """
-        try:
-            from app.adapters.external.market import PluginHelper
-        except ModuleNotFoundError as exc:
-            pytest.skip(f"missing dependency: {exc}")
-
         payload = [
             {
                 "tag_name": "DemoPlugin_v1.2.3",
@@ -306,14 +389,14 @@ class TestPluginHelper:
                 "assets": [{"name": "otherplugin_v9.9.9.zip", "id": 3}],
             },
         ]
-        helper = PluginHelper()
+        transport = PluginMarketTransport()
         monkeypatch.setattr(
-            helper,
-            "_PluginHelper__request_with_fallback",
+            transport,
+            "_PluginMarketTransport__request_with_fallback",
             lambda *_args, **_kwargs: _FakeTextResponse(200, payload),
         )
 
-        releases = helper.get_plugin_release_versions(PLUGIN_ID, REPO_URL)
+        releases = transport.get_plugin_release_versions(PLUGIN_ID, REPO_URL)
 
         assert releases == [
             {
@@ -331,8 +414,8 @@ class TestPluginHelper:
         插件市场强制刷新时 Release 列表请求也要绕过 GitHub 镜像或代理缓存。
         """
         try:
+            from app.adapters.external.plugin.client import PluginMarketTransport
             from app.runtime.cache import fresh
-            from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -342,13 +425,20 @@ class TestPluginHelper:
             requested_urls.append(url)
             return _FakeTextResponse(200, [])
 
-        helper = PluginHelper()
-        helper.get_plugin_release_versions.cache_clear()
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", fake_request)
+        transport = PluginMarketTransport()
+        transport._get_plugin_repo_releases.cache_clear()
+        monkeypatch.setattr(
+            transport,
+            "_PluginMarketTransport__request_with_fallback",
+            fake_request,
+        )
 
-        with patch("app.adapters.external.market.time.time_ns", return_value=1234567890):
+        with patch(
+            "app.adapters.external.plugin.client.time.time_ns",
+            return_value=1234567890,
+        ):
             with fresh(True):
-                helper.get_plugin_release_versions(PLUGIN_ID, REPO_URL)
+                transport.get_plugin_release_versions(PLUGIN_ID, REPO_URL)
 
         assert requested_urls == [
             "https://api.github.com/repos/demo/MoviePilot-Plugins/releases?per_page=100&page=1&_refresh=1234567890"
@@ -359,7 +449,7 @@ class TestPluginHelper:
         多插件共用 Release 列表时需要分页，避免目标插件历史发行版被第一页之外的数据遮蔽。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.external.plugin.client import PluginMarketTransport
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -380,11 +470,15 @@ class TestPluginHelper:
             requested_pages.append(page)
             return _FakeTextResponse(200, payload_by_page[page])
 
-        helper = PluginHelper()
-        helper.get_plugin_release_versions.cache_clear()
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", fake_request)
+        transport = PluginMarketTransport()
+        transport._get_plugin_repo_releases.cache_clear()
+        monkeypatch.setattr(
+            transport,
+            "_PluginMarketTransport__request_with_fallback",
+            fake_request,
+        )
 
-        releases = helper.get_plugin_release_versions(PLUGIN_ID, REPO_URL)
+        releases = transport.get_plugin_release_versions(PLUGIN_ID, REPO_URL)
 
         assert requested_pages == ["1", "2"]
         assert [item["version"] for item in releases] == ["1.2.0"]
@@ -394,7 +488,7 @@ class TestPluginHelper:
         同一仓库的不同插件共享 GitHub Release 分页结果，避免按插件 ID 重复请求。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.external.plugin.client import PluginMarketTransport
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -415,12 +509,16 @@ class TestPluginHelper:
             request_count += 1
             return _FakeTextResponse(200, payload)
 
-        helper = PluginHelper()
-        helper.get_plugin_release_versions.cache_clear()
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", fake_request)
+        transport = PluginMarketTransport()
+        transport._get_plugin_repo_releases.cache_clear()
+        monkeypatch.setattr(
+            transport,
+            "_PluginMarketTransport__request_with_fallback",
+            fake_request,
+        )
 
-        demo_releases = helper.get_plugin_release_versions("DemoPlugin", REPO_URL)
-        other_releases = helper.get_plugin_release_versions("OtherPlugin", REPO_URL)
+        demo_releases = transport.get_plugin_release_versions("DemoPlugin", REPO_URL)
+        other_releases = transport.get_plugin_release_versions("OtherPlugin", REPO_URL)
 
         assert request_count == 1
         assert [item["version"] for item in demo_releases] == ["1.2.3"]
@@ -431,8 +529,8 @@ class TestPluginHelper:
         同一仓库的并发强制刷新共享一个请求任务，避免缓存失效瞬间放大 GitHub 请求。
         """
         try:
+            from app.adapters.external.plugin.client import PluginMarketTransport
             from app.runtime.cache import async_fresh
-            from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -455,13 +553,17 @@ class TestPluginHelper:
             return _FakeTextResponse(200, payload)
 
         async def run_test():
-            helper = PluginHelper()
-            await helper.async_get_plugin_release_versions.cache_clear()
-            monkeypatch.setattr(helper, "_PluginHelper__async_request_with_fallback", fake_request)
+            transport = PluginMarketTransport()
+            await transport._async_get_plugin_repo_releases.cache_clear()
+            monkeypatch.setattr(
+                transport,
+                "_PluginMarketTransport__async_request_with_fallback",
+                fake_request,
+            )
             async with async_fresh(True):
                 return await asyncio.gather(
-                    helper.async_get_plugin_release_versions("DemoPlugin", REPO_URL),
-                    helper.async_get_plugin_release_versions("OtherPlugin", REPO_URL),
+                    transport.async_get_plugin_release_versions("DemoPlugin", REPO_URL),
+                    transport.async_get_plugin_release_versions("OtherPlugin", REPO_URL),
                 )
 
         demo_releases, other_releases = asyncio.run(run_test())
@@ -473,8 +575,8 @@ class TestPluginHelper:
     def test_async_forced_release_refresh_does_not_reuse_normal_read_task(self, monkeypatch):
         """强刷等待在途普通读取后再请求，最终缓存必须保留强刷结果。"""
         try:
+            from app.adapters.external.plugin.client import PluginMarketTransport
             from app.runtime.cache import async_fresh
-            from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -500,22 +602,26 @@ class TestPluginHelper:
             return _FakeTextResponse(200, fresh_payload)
 
         async def run_test():
-            helper = PluginHelper()
-            await helper.async_get_plugin_release_versions.cache_clear()
-            monkeypatch.setattr(helper, "_PluginHelper__async_request_with_fallback", fake_request)
+            transport = PluginMarketTransport()
+            await transport._async_get_plugin_repo_releases.cache_clear()
+            monkeypatch.setattr(
+                transport,
+                "_PluginMarketTransport__async_request_with_fallback",
+                fake_request,
+            )
             normal_task = asyncio.create_task(
-                helper.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
+                transport.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
             )
             await first_request_started.wait()
             async with async_fresh(True):
                 force_task = asyncio.create_task(
-                    helper.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
+                    transport.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
                 )
                 await asyncio.sleep(0.01)
                 request_count_before_normal_finished = request_count
             release_first_request.set()
             normal_result, force_result = await asyncio.gather(normal_task, force_task)
-            cached_result = await helper.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
+            cached_result = await transport.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
             return request_count_before_normal_finished, normal_result, force_result, cached_result
 
         request_count_before_normal_finished, normal_result, force_result, cached_result = asyncio.run(run_test())
@@ -526,11 +632,64 @@ class TestPluginHelper:
         assert [item["version"] for item in cached_result] == ["1.2.3"]
         assert request_count == 2
 
+    def test_async_release_read_follows_host_task_shutdown(self, monkeypatch):
+        """被 shield 的仓库级请求仍须登记 owner，并随宿主关停取消。"""
+        try:
+            from app.adapters.external.plugin.client import PluginMarketTransport
+            from app.runtime.tasks import TaskRegistry
+        except ModuleNotFoundError as exc:
+            pytest.skip(f"missing dependency: {exc}")
+
+        async def run_test():
+            """阻塞仓库读取后关闭登记器，返回 owner 与取消收敛状态。"""
+            transport = PluginMarketTransport()
+            registry = TaskRegistry()
+            started = asyncio.Event()
+            cancelled = asyncio.Event()
+
+            async def fake_request(*_args, **_kwargs):
+                """保持网络读取运行，直到登记器发出取消。"""
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.set()
+                    raise
+
+            await transport._async_get_plugin_repo_releases.cache_clear()
+            monkeypatch.setattr(
+                transport,
+                "_PluginMarketTransport__async_request_with_fallback",
+                fake_request,
+            )
+            monkeypatch.setattr(
+                plugin_client_module,
+                "get_task_registry",
+                lambda: registry,
+            )
+            caller = asyncio.create_task(
+                transport.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
+            )
+            await started.wait()
+            owners = tuple(record.owner for record in registry.records)
+            converged = await registry.shutdown(timeout_seconds=1.0)
+            results = await asyncio.gather(caller, return_exceptions=True)
+            await asyncio.sleep(0)
+            return owners, converged, cancelled.is_set(), results, transport._release_tasks
+
+        owners, converged, cancelled, results, release_tasks = asyncio.run(run_test())
+
+        assert owners == ("plugin.market.release_read",)
+        assert converged is True
+        assert cancelled is True
+        assert isinstance(results[0], asyncio.CancelledError)
+        assert release_tasks == {}
+
     def test_async_normal_release_read_does_not_wait_for_pending_force_refresh(self, monkeypatch):
         """普通读取遇到后台强刷时仍优先返回已有缓存，避免页面响应被强刷阻塞。"""
         try:
+            from app.adapters.external.plugin.client import PluginMarketTransport
             from app.runtime.cache import async_fresh
-            from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -556,23 +715,27 @@ class TestPluginHelper:
             return _FakeTextResponse(200, fresh_payload)
 
         async def run_test():
-            helper = PluginHelper()
-            await helper.async_get_plugin_release_versions.cache_clear()
-            monkeypatch.setattr(helper, "_PluginHelper__async_request_with_fallback", fake_request)
-            initial = await helper.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
+            transport = PluginMarketTransport()
+            await transport._async_get_plugin_repo_releases.cache_clear()
+            monkeypatch.setattr(
+                transport,
+                "_PluginMarketTransport__async_request_with_fallback",
+                fake_request,
+            )
+            initial = await transport.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
             async with async_fresh(True):
                 force_task = asyncio.create_task(
-                    helper.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
+                    transport.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
                 )
             await force_request_started.wait()
             normal_task = asyncio.create_task(
-                helper.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
+                transport.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
             )
             normal_before_force_finished = await asyncio.wait_for(normal_task, timeout=1)
             force_done_before_normal_finished = force_task.done()
             release_force_request.set()
             force_result = await force_task
-            cached_result = await helper.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
+            cached_result = await transport.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
             return (
                 initial,
                 force_done_before_normal_finished,
@@ -599,7 +762,7 @@ class TestPluginHelper:
     def test_async_has_plugin_release_cache_reflects_repository_cache(self, monkeypatch):
         """Release 缓存探针只判断仓库级缓存是否已经存在，不触发网络请求。"""
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.external.plugin.client import PluginMarketTransport
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -615,12 +778,16 @@ class TestPluginHelper:
             return _FakeTextResponse(200, payload)
 
         async def run_test():
-            helper = PluginHelper()
-            await helper.async_get_plugin_release_versions.cache_clear()
-            monkeypatch.setattr(helper, "_PluginHelper__async_request_with_fallback", fake_request)
-            before = await helper.async_has_plugin_release_cache(REPO_URL)
-            await helper.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
-            after = await helper.async_has_plugin_release_cache(REPO_URL)
+            transport = PluginMarketTransport()
+            await transport._async_get_plugin_repo_releases.cache_clear()
+            monkeypatch.setattr(
+                transport,
+                "_PluginMarketTransport__async_request_with_fallback",
+                fake_request,
+            )
+            before = await transport.async_has_plugin_release_cache(REPO_URL)
+            await transport.async_get_plugin_release_versions("DemoPlugin", REPO_URL)
+            after = await transport.async_has_plugin_release_cache(REPO_URL)
             return before, after
 
         before, after = asyncio.run(run_test())
@@ -632,8 +799,8 @@ class TestPluginHelper:
     def test_failed_forced_release_refresh_preserves_cached_repository_payload(self, monkeypatch):
         """GitHub 强刷失败时不以空值覆盖该仓库已有 Release 缓存。"""
         try:
+            from app.adapters.external.plugin.client import PluginMarketTransport
             from app.runtime.cache import fresh
-            from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -646,14 +813,18 @@ class TestPluginHelper:
         def fake_request(*_args, **_kwargs):
             return responses.pop(0)
 
-        helper = PluginHelper()
-        helper.get_plugin_release_versions.cache_clear()
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", fake_request)
+        transport = PluginMarketTransport()
+        transport._get_plugin_repo_releases.cache_clear()
+        monkeypatch.setattr(
+            transport,
+            "_PluginMarketTransport__request_with_fallback",
+            fake_request,
+        )
 
-        initial = helper.get_plugin_release_versions("DemoPlugin", REPO_URL)
+        initial = transport.get_plugin_release_versions("DemoPlugin", REPO_URL)
         with fresh(True):
-            failed_refresh = helper.get_plugin_release_versions("DemoPlugin", REPO_URL)
-        cached = helper.get_plugin_release_versions("DemoPlugin", REPO_URL)
+            failed_refresh = transport.get_plugin_release_versions("DemoPlugin", REPO_URL)
+        cached = transport.get_plugin_release_versions("DemoPlugin", REPO_URL)
 
         assert [item["version"] for item in initial] == ["1.2.3"]
         assert failed_refresh == []
@@ -665,8 +836,7 @@ class TestPluginHelper:
         插件市场 labels 为列表时应转换为字符串，避免响应模型序列化异常。
         """
         try:
-            from app.runtime.extensions.plugin_manager import PluginManager
-            from app.adapters.external.market import PluginHelper
+            from app.runtime.extensions.plugin.manager import PluginManager
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -680,18 +850,22 @@ class TestPluginHelper:
             }
         }
         plugin_manager = PluginManager()
-        monkeypatch.setattr(plugin_manager, "_plugins", {})
-        monkeypatch.setattr(plugin_manager, "_running_plugins", {})
-        monkeypatch.setattr("app.runtime.extensions.plugin_manager.settings", SimpleNamespace(VERSION_FLAG="v2"))
+        plugin_manager.plugins.clear()
+        plugin_manager.running_plugins.clear()
+        _patch_catalog_settings(monkeypatch, VERSION_FLAG="v2")
         monkeypatch.setattr(
-            "app.runtime.extensions.plugin_manager.get_plugin_storage",
-            lambda: SimpleNamespace(read=lambda _key: []),
+            "app.runtime.extensions.plugin.storage._plugin_storage",
+            SimpleNamespace(read=lambda _key: []),
         )
         monkeypatch.setattr(
-            "app.runtime.extensions.plugin_manager._site_auth_level_provider",
+            "app.runtime.extensions.plugin.manager._site_auth_level_provider",
             lambda: 1,
         )
-        monkeypatch.setattr(PluginHelper, "get_plugins", lambda _self, *_args: market_plugins)
+        monkeypatch.setattr(
+            PluginMarketTransport,
+            "get_plugins",
+            lambda _self, *_args: market_plugins,
+        )
 
         plugins = plugin_manager.get_plugins_from_market(REPO_URL)
 
@@ -705,8 +879,7 @@ class TestPluginHelper:
         package.v2.json 中的 v2 原生插件，并过滤掉未声明任何版本兼容的 v1 插件。
         """
         try:
-            from app.runtime.extensions.plugin_manager import PluginManager
-            from app.adapters.external.market import PluginHelper
+            from app.runtime.extensions.plugin.manager import PluginManager
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -740,22 +913,27 @@ class TestPluginHelper:
             return base_plugins
 
         plugin_manager = PluginManager()
-        monkeypatch.setattr(plugin_manager, "_plugins", {})
-        monkeypatch.setattr(plugin_manager, "_running_plugins", {})
-        monkeypatch.setattr(
-            "app.runtime.extensions.plugin_manager.settings",
-            SimpleNamespace(VERSION_FLAG="v3", PLUGIN_MARKET=REPO_URL),
-        )
-        monkeypatch.setattr("app.adapters.external.market.settings", SimpleNamespace(VERSION_FLAG="v3"))
-        monkeypatch.setattr(
-            "app.runtime.extensions.plugin_manager.get_plugin_storage",
-            lambda: SimpleNamespace(read=lambda _key: []),
+        plugin_manager.plugins.clear()
+        plugin_manager.running_plugins.clear()
+        _patch_catalog_settings(
+            monkeypatch,
+            VERSION_FLAG="v3",
+            PLUGIN_MARKET=REPO_URL,
         )
         monkeypatch.setattr(
-            "app.runtime.extensions.plugin_manager._site_auth_level_provider",
+            plugin_client_module,
+            "get_runtime_setting",
+            lambda key, default=None: "v3" if key == "VERSION_FLAG" else default,
+        )
+        monkeypatch.setattr(
+            "app.runtime.extensions.plugin.storage._plugin_storage",
+            SimpleNamespace(read=lambda _key: []),
+        )
+        monkeypatch.setattr(
+            "app.runtime.extensions.plugin.manager._site_auth_level_provider",
             lambda: 1,
         )
-        monkeypatch.setattr(PluginHelper, "get_plugins", fake_get_plugins)
+        monkeypatch.setattr(PluginMarketTransport, "get_plugins", fake_get_plugins)
 
         plugins = plugin_manager.get_online_plugins(force=False)
         plugin_ids = {p.id for p in plugins}
@@ -770,11 +948,6 @@ class TestPluginHelper:
         """
         V3 安装链路应能解析 v2 兼容插件：package.v2.json 命中返回 v2，package.json 声明 v2 返回基础版本。
         """
-        try:
-            from app.adapters.external.market import PluginHelper
-        except ModuleNotFoundError as exc:
-            pytest.skip(f"missing dependency: {exc}")
-
         base_plugins = {
             "V2FlagPlugin": {"name": "V2Flag", "version": "1.0.0", "v2": True},
             "RejectedSharedPlugin": {
@@ -794,63 +967,59 @@ class TestPluginHelper:
             },
         }
 
-        def fake_get_plugins(_self, _repo_url, package_version=None):
+        def fake_get_plugins(_repo_url, package_version=None):
             if package_version == "v3":
                 return {}
             if package_version == "v2":
                 return v2_native_plugins
             return base_plugins
 
-        monkeypatch.setattr("app.adapters.external.market.settings", SimpleNamespace(VERSION_FLAG="v3"))
-        helper = PluginHelper.__new__(PluginHelper)
-        monkeypatch.setattr(PluginHelper, "get_plugins", fake_get_plugins)
+        monkeypatch.setattr(
+            plugin_client_module,
+            "get_runtime_setting",
+            lambda key, default=None: "v3" if key == "VERSION_FLAG" else default,
+        )
+        transport = PluginMarketTransport()
+        monkeypatch.setattr(transport, "get_plugins", fake_get_plugins)
 
-        assert helper.get_plugin_package_version("V2NativePlugin", REPO_URL) == "v2"
-        assert helper.get_plugin_package_version("V2FlagPlugin", REPO_URL) == ""
-        assert helper.get_plugin_package_version("RejectedV2Plugin", REPO_URL) is None
-        assert helper.get_plugin_package_version("RejectedSharedPlugin", REPO_URL) is None
-        assert helper.get_plugin_package_version("LegacyPlugin", REPO_URL) is None
+        assert transport.get_plugin_package_version("V2NativePlugin", REPO_URL) == "v2"
+        assert transport.get_plugin_package_version("V2FlagPlugin", REPO_URL) == ""
+        assert transport.get_plugin_package_version("RejectedV2Plugin", REPO_URL) is None
+        assert transport.get_plugin_package_version("RejectedSharedPlugin", REPO_URL) is None
+        assert transport.get_plugin_package_version("LegacyPlugin", REPO_URL) is None
 
     def test_explicit_v2_resolution_still_respects_v3_false(self, monkeypatch) -> None:
         """V3 显式解析 V2 索引时也不得绕过专用副本的排除标志。"""
-        try:
-            from app.adapters.external.market import PluginHelper
-        except ModuleNotFoundError as exc:
-            pytest.skip(f"missing dependency: {exc}")
-
         monkeypatch.setattr(
-            "app.adapters.external.market.settings",
-            SimpleNamespace(VERSION_FLAG="v3"),
+            plugin_client_module,
+            "get_runtime_setting",
+            lambda key, default=None: "v3" if key == "VERSION_FLAG" else default,
         )
-        helper = PluginHelper.__new__(PluginHelper)
+        transport = PluginMarketTransport()
         monkeypatch.setattr(
-            PluginHelper,
+            transport,
             "get_plugins",
-            lambda _self, _repo, package_version=None: {
+            lambda _repo, package_version=None: {
                 "DefaultV2": {"version": "1.0.0"},
                 "V3Copied": {"version": "1.0.0", "v3": False},
             } if package_version == "v2" else {},
         )
 
-        assert helper.get_plugin_package_version(
+        assert transport.get_plugin_package_version(
             "DefaultV2", REPO_URL, package_version="v2"
         ) == "v2"
-        assert helper.get_plugin_package_version(
+        assert transport.get_plugin_package_version(
             "V3Copied", REPO_URL, package_version="v2"
         ) is None
 
     def test_async_resolution_matches_v2_default_compatibility(self, monkeypatch) -> None:
         """异步安装解析应默认接纳 V2，并排除显式 v3:false 的旧实现。"""
-        try:
-            from app.adapters.external.market import PluginHelper
-        except ModuleNotFoundError as exc:
-            pytest.skip(f"missing dependency: {exc}")
-
         monkeypatch.setattr(
-            "app.adapters.external.market.settings",
-            SimpleNamespace(VERSION_FLAG="v3"),
+            plugin_client_module,
+            "get_runtime_setting",
+            lambda key, default=None: "v3" if key == "VERSION_FLAG" else default,
         )
-        helper = PluginHelper.__new__(PluginHelper)
+        transport = PluginMarketTransport()
 
         async def fake_get_plugins(_repo, package_version=None):
             """按索引版本返回异步解析测试数据。"""
@@ -863,15 +1032,15 @@ class TestPluginHelper:
                 }
             return {"SharedV2": {"version": "1.0.0", "v2": True}}
 
-        monkeypatch.setattr(helper, "async_get_plugins", fake_get_plugins)
+        monkeypatch.setattr(transport, "async_get_plugins", fake_get_plugins)
 
-        assert asyncio.run(helper.async_get_plugin_package_version(
+        assert asyncio.run(transport.async_get_plugin_package_version(
             "DefaultV2", REPO_URL
         )) == "v2"
-        assert asyncio.run(helper.async_get_plugin_package_version(
+        assert asyncio.run(transport.async_get_plugin_package_version(
             "SharedV2", REPO_URL
         )) == ""
-        assert asyncio.run(helper.async_get_plugin_package_version(
+        assert asyncio.run(transport.async_get_plugin_package_version(
             "V3Copied", REPO_URL
         )) is None
 
@@ -898,18 +1067,41 @@ class TestPluginHelper:
         )
         assert not PluginHelper.is_package_plugin_compatible({}, "")
 
+    def test_free_threaded_package_compatibility_honors_explicit_v3t_false(
+        self,
+        monkeypatch,
+    ) -> None:
+        """V3t 只把 package 中明确的 v3t:false 视为运行时不兼容。"""
+        from app.adapters.external.market import PluginHelper
+
+        monkeypatch.setattr(plugin_client_module, "is_free_threaded_runtime", lambda: True)
+        monkeypatch.setattr(
+            plugin_client_module,
+            "get_runtime_setting",
+            lambda key, default=None: "v3" if key == "VERSION_FLAG" else default,
+        )
+
+        assert PluginHelper.is_package_plugin_compatible({}, "v3")
+        assert PluginHelper.is_package_plugin_compatible({"v3t": True}, "v3")
+        assert not PluginHelper.is_package_plugin_compatible(
+            {"v3t": False}, "v3"
+        )
+
     def test_get_online_plugins_force_keeps_release_cache_scoped(self, monkeypatch):
         """
         全市场刷新不清理 Release 缓存，Release 接口按请求仓库协调刷新两类数据。
         """
         try:
-            from app.runtime.extensions.plugin_manager import PluginManager
-            from app.adapters.external.market import PluginHelper
+            from app.runtime.extensions.plugin.manager import PluginManager
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
         clear_calls = []
-        monkeypatch.setattr("app.runtime.extensions.plugin_manager.settings.PLUGIN_MARKET", "https://github.com/demo/plugins")
+        _patch_catalog_settings(
+            monkeypatch,
+            PLUGIN_MARKET="https://github.com/demo/plugins",
+            VERSION_FLAG="v3",
+        )
         monkeypatch.setattr(PluginManager, "get_plugins_from_market", lambda *_args, **_kwargs: [])
 
         PluginManager().get_online_plugins(force=True)
@@ -919,7 +1111,7 @@ class TestPluginHelper:
     def test_async_get_online_plugins_force_keeps_release_cache_scoped(self, monkeypatch):
         """异步全市场刷新同样不得清理其他仓库的 Release 缓存。"""
         try:
-            from app.runtime.extensions.plugin_manager import PluginManager
+            from app.runtime.extensions.plugin.manager import PluginManager
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -931,7 +1123,11 @@ class TestPluginHelper:
         async def fake_market(*_args, **_kwargs):
             return []
 
-        monkeypatch.setattr("app.runtime.extensions.plugin_manager.settings.PLUGIN_MARKET", "https://github.com/demo/plugins")
+        _patch_catalog_settings(
+            monkeypatch,
+            PLUGIN_MARKET="https://github.com/demo/plugins",
+            VERSION_FLAG="v3",
+        )
         monkeypatch.setattr(PluginManager, "async_get_plugins_from_market", fake_market)
 
         asyncio.run(PluginManager().async_get_online_plugins(force=True))
@@ -941,7 +1137,7 @@ class TestPluginHelper:
     def test_get_local_plugin_version_reads_only_requested_installed_plugin(self, monkeypatch):
         """单插件版本查询不构建全部本地插件信息。"""
         try:
-            from app.runtime.extensions.plugin_manager import PluginManager
+            from app.runtime.extensions.plugin.manager import PluginManager
             from app.schemas.types import SystemConfigKey
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
@@ -950,10 +1146,11 @@ class TestPluginHelper:
             plugin_version = "1.2.0"
 
         plugin_manager = PluginManager()
-        monkeypatch.setattr(plugin_manager, "_plugins", {"DemoPlugin": DemoPlugin})
+        plugin_manager.plugins.clear()
+        plugin_manager.plugins["DemoPlugin"] = DemoPlugin
         monkeypatch.setattr(
-            "app.runtime.extensions.plugin_manager.get_plugin_storage",
-            lambda: SimpleNamespace(
+            "app.runtime.extensions.plugin.storage._plugin_storage",
+            SimpleNamespace(
                 read=lambda key: ["DemoPlugin"]
                 if key == SystemConfigKey.UserInstalledPlugins
                 else None
@@ -973,18 +1170,22 @@ class TestPluginHelper:
             pytest.skip(f"missing dependency: {exc}")
 
         plugin_info = {"system_version": ">=2.13.0"}
-        with patch.object(PluginHelper, "get_current_system_version", return_value=Version("2.12.2")):
+        with patch.object(
+            PluginMarketTransport,
+            "get_current_system_version",
+            return_value=Version("2.12.2"),
+        ):
             annotated = PluginHelper.annotate_plugin_system_version(plugin_info)
 
         assert not annotated["system_version_compatible"]
         assert "当前版本" in annotated["system_version_message"]
 
-    def test_pip_install_keeps_modules_imported_during_install(self):
+    def test_uv_install_keeps_modules_imported_during_install(self):
         """
         验证依赖安装窗口内被其他任务导入的运行态模块不会被误删。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -1001,20 +1202,20 @@ class TestPluginHelper:
             with tempfile.TemporaryDirectory() as temp_dir:
                 requirements_file = Path(temp_dir) / "requirements.txt"
                 requirements_file.write_text("demo-package\n", encoding="utf-8")
-                with patch("app.adapters.external.market.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
-                    success, message = PluginHelper.pip_install_with_fallback(requirements_file)
+                with patch("app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
+                    success, message = PluginRuntimeHealth.install_packages_with_fallback(requirements_file)
 
             assert success
             assert "ok" == message
             for module_name in module_names:
                 assert module_name in sys.modules
 
-    def test_pip_install_builds_uv_strategy_without_proxy_argument(self):
+    def test_uv_install_builds_uv_strategy_without_proxy_argument(self):
         """
         插件依赖安装优先使用 uv 时，传输代理只进入子进程环境。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -1032,17 +1233,26 @@ class TestPluginHelper:
             uv_bin.parent.mkdir(parents=True)
             uv_bin.write_text("", encoding="utf-8")
 
-            with patch("app.adapters.system.package._find_uv", return_value=uv_bin), \
-                    patch.object(PluginHelper, "_PluginHelper__get_protected_runtime_packages", return_value={}), \
+            with patch("app.adapters.system.package.find_uv", return_value=uv_bin), \
+                    patch.object(PluginRuntimeHealth, "_PluginRuntimeHealth__get_protected_runtime_packages", return_value={}), \
                     patch.object(
-                        PluginHelper,
-                        "_PluginHelper__run_runtime_healthcheck",
-                        return_value={"pip check": (True, "ok"), "核心依赖导入检查": (True, "ok")},
+                        PluginRuntimeHealth,
+                        "_PluginRuntimeHealth__run_runtime_healthcheck",
+                        return_value={"uv check": (True, "ok"), "核心依赖导入检查": (True, "ok")},
                     ), \
-                    patch("app.adapters.external.market.SystemUtils.execute_with_subprocess", side_effect=fake_execute), \
-                    patch("app.adapters.external.market.settings.PROXY_HOST", "http://proxy.example:7890"), \
-                    patch("app.adapters.external.market.settings.PIP_PROXY", "https://user:pass@mirror.example/simple"):
-                success, message = PluginHelper.pip_install_with_fallback(req)
+                    patch("app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess", side_effect=fake_execute), \
+                    patch(
+                        "app.adapters.system.plugin.health.get_runtime_setting",
+                        side_effect=lambda key: {
+                            "ROOT_PATH": root,
+                            "TEMP_PATH": root / "temp",
+                            "CONFIG_PATH": root / "config",
+                            "PACKAGE_CACHE_PATH": root / "cache",
+                            "PROXY_HOST": "http://proxy.example:7890",
+                            "PIP_PROXY": "https://user:pass@mirror.example/simple",
+                        }.get(key),
+                    ):
+                success, message = PluginRuntimeHealth.install_packages_with_fallback(req)
 
         assert success
         assert message == "ok"
@@ -1053,12 +1263,81 @@ class TestPluginHelper:
         assert env["HTTPS_PROXY"] == "http://proxy.example:7890"
         assert "user:pass" not in " ".join(safe_command)
 
-    def test_pip_install_serializes_concurrent_calls(self):
+    def test_uv_install_keeps_multiple_original_manifests_in_one_command(self):
+        """批量恢复必须让 uv 直接读取每个插件的原始生效清单。"""
+        try:
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
+        except ModuleNotFoundError as exc:
+            pytest.skip(f"missing dependency: {exc}")
+
+        seen_commands = []
+
+        def fake_execute(command, env=None, safe_command=None):
+            seen_commands.append(command)
+            return True, "ok"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            modern = root / "modern" / "pyproject.toml"
+            modern.parent.mkdir()
+            modern.write_text(
+                """
+[project]
+name = "modern"
+version = "1.0.0"
+dependencies = ["demo>=2"]
+
+[[tool.uv.index]]
+name = "private"
+url = "https://packages.example/simple"
+explicit = true
+
+[tool.uv.sources]
+demo = { index = "private" }
+""",
+                encoding="utf-8",
+            )
+            legacy = root / "legacy" / "requirements.txt"
+            legacy.parent.mkdir()
+            legacy.write_text(
+                "--extra-index-url https://legacy.example/simple\nother\n",
+                encoding="utf-8",
+            )
+            uv_bin = _create_fake_uv(root)
+
+            with patch("app.adapters.system.package.find_uv", return_value=uv_bin), \
+                    patch.object(PluginRuntimeHealth, "_PluginRuntimeHealth__get_installed_packages", return_value={}), \
+                    patch.object(PluginRuntimeHealth, "_PluginRuntimeHealth__get_protected_runtime_packages", return_value={}), \
+                    patch.object(
+                        PluginRuntimeHealth,
+                        "_PluginRuntimeHealth__run_runtime_healthcheck",
+                        return_value={"uv check": (True, "ok"), "核心依赖导入检查": (True, "ok")},
+                    ), \
+                    patch("app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
+                success, message = PluginRuntimeHealth.install_packages_with_fallback(
+                    [modern, legacy]
+                )
+
+        assert success
+        assert message == "ok"
+        install_command = next(
+            command for command in seen_commands
+            if command[:3] == [str(uv_bin), "pip", "install"]
+        )
+        requirement_positions = [
+            index for index, value in enumerate(install_command) if value == "-r"
+        ]
+        assert [install_command[index + 1] for index in requirement_positions] == [
+            str(modern),
+            str(legacy),
+        ]
+
+    def test_uv_install_serializes_concurrent_calls(self):
         """
-        验证多个依赖安装请求会复用同一把锁串行执行 pip。
+        验证多个依赖安装请求会复用同一把锁串行执行 uv。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -1082,7 +1361,7 @@ class TestPluginHelper:
         def worker(requirements_file: Path):
             try:
                 start_event.wait()
-                PluginHelper.pip_install_with_fallback(requirements_file)
+                PluginRuntimeHealth.install_packages_with_fallback(requirements_file)
             except Exception as err:  # pragma: no cover - 仅用于并发测试失败诊断
                 errors.append(err)
 
@@ -1097,7 +1376,7 @@ class TestPluginHelper:
                 threading.Thread(target=worker, args=(requirements_file,))
                 for requirements_file in requirements_files
             ]
-            with patch("app.adapters.external.market.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
+            with patch("app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
                 for thread in threads:
                     thread.start()
                 start_event.set()
@@ -1112,7 +1391,7 @@ class TestPluginHelper:
         验证仅主程序依赖链上的包会被纳入保护集合。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -1128,28 +1407,28 @@ class TestPluginHelper:
         }
 
         with patch.object(
-                PluginHelper,
-                "_PluginHelper__parse_project_requirement_roots",
+                PluginRuntimeHealth,
+                "_PluginRuntimeHealth__parse_project_requirement_roots",
                 return_value={"passlib": set()}
         ):
             with patch.object(
-                    PluginHelper,
-                    "_PluginHelper__get_installed_distribution_requirements",
+                    PluginRuntimeHealth,
+                    "_PluginRuntimeHealth__get_installed_distribution_requirements",
                     return_value=requirement_graph
             ):
-                protected_packages = PluginHelper._PluginHelper__get_protected_runtime_packages(installed_packages)
+                protected_packages = PluginRuntimeHealth._PluginRuntimeHealth__get_protected_runtime_packages(installed_packages)
 
         assert {
             "passlib": Version("1.7.4"),
             "bcrypt": Version("4.0.1"),
         } == protected_packages
 
-    def test_pip_install_rejects_conflicting_runtime_dependency(self):
+    def test_uv_install_rejects_conflicting_runtime_dependency(self):
         """
-        验证插件如果试图覆盖主程序核心依赖，会在真正执行 pip 前被直接拒绝。
+        验证插件如果试图覆盖主程序核心依赖，会在真正执行安装前被直接拒绝。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -1157,235 +1436,376 @@ class TestPluginHelper:
             requirements_file = Path(temp_dir) / "requirements.txt"
             requirements_file.write_text("fastapi<0.1\n", encoding="utf-8")
             with patch.object(
-                    PluginHelper,
-                    "_PluginHelper__get_protected_runtime_packages",
+                    PluginRuntimeHealth,
+                    "_PluginRuntimeHealth__get_protected_runtime_packages",
                     return_value={"fastapi": Version("0.115.14")}
             ):
-                success, message = PluginHelper.pip_install_with_fallback(requirements_file)
+                success, message = PluginRuntimeHealth.install_packages_with_fallback(requirements_file)
 
         assert not success
         assert "主程序核心依赖" in message
         assert "fastapi" in message
 
-    def test_pip_install_allows_changing_non_runtime_dependency(self):
+    @pytest.mark.parametrize(
+        ("runtime_group", "installed_package", "installed_version", "requirement"),
+        [
+            ("runtime-standard", "lxml", "6.1.2", "lxml>=7.1"),
+            ("runtime-free-threaded", "psycopg", "3.3.4", "psycopg>=3.4"),
+        ],
+    )
+    def test_uv_install_rejects_runtime_profile_root_upgrade(
+            self,
+            runtime_group,
+            installed_package,
+            installed_version,
+            requirement,
+    ):
+        """插件不得升级当前解释器 profile 中经过 ABI/GIL 验证的根包。"""
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            requirements_file = Path(temp_dir) / "requirements.txt"
+            requirements_file.write_text(f"{requirement}\n", encoding="utf-8")
+            with patch(
+                    "app.runtime.dependencies.profile.runtime_dependency_group",
+                    return_value=runtime_group,
+            ):
+                success, message = PluginRuntimeHealth._PluginRuntimeHealth__validate_runtime_dependency_conflicts(
+                    requirements_file,
+                    {installed_package: Version(installed_version)},
+                )
+
+        assert not success
+        assert "主程序核心依赖" in message
+        assert installed_package in message
+
+    def test_runtime_healthcheck_preserves_plugin_upgrade_semantics(self, tmp_path):
+        """运行环境诊断不应把允许的插件依赖升级强制还原到宿主锁版本。"""
+
+        uv_bin = tmp_path / "uv"
+        with patch("app.adapters.system.plugin.health.find_uv", return_value=uv_bin):
+            command = PluginRuntimeHealth._PluginRuntimeHealth__build_runtime_uv_check_command()
+
+        assert command == [
+            str(uv_bin),
+            "pip",
+            "check",
+            "--python",
+            sys.executable,
+        ]
+
+    def test_plugin_runtime_healthcheck_uses_full_capability_probe(self, tmp_path):
+        """共享 venv 发生变更时必须验证 ABI 敏感原生能力。"""
+
+        uv_bin = tmp_path / "uv"
+        commands = []
+
+        def execute(command):
+            commands.append(command)
+            return True, "ok"
+
+        with patch("app.adapters.system.package.find_uv", return_value=uv_bin), patch(
+            "app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess",
+            side_effect=execute,
+        ):
+            PluginRuntimeHealth._PluginRuntimeHealth__run_runtime_healthcheck()
+
+        assert [
+            sys.executable,
+            "-m",
+            "app.doctor.dependencies",
+            "--full",
+        ] in commands
+
+    def test_uv_install_allows_changing_non_runtime_dependency(self):
         """
         验证非主程序依赖即便已安装，插件后续仍可调整其版本约束。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
         seen_install_commands = []
 
-        def fake_execute(cmd, env=None, safe_command=None):
-            if cmd[:4] == [sys.executable, "-m", "pip", "install"]:
-                seen_install_commands.append(cmd)
-                assert "-c" not in cmd
-                return True, "ok"
-            return True, "ok"
-
         with tempfile.TemporaryDirectory() as temp_dir:
-            requirements_file = Path(temp_dir) / "requirements.txt"
+            root = Path(temp_dir)
+            requirements_file = root / "requirements.txt"
             requirements_file.write_text("demo-package>=2\n", encoding="utf-8")
+            uv_bin = _create_fake_uv(root)
+
+            def fake_execute(cmd, env=None, safe_command=None):
+                if cmd[:3] == [str(uv_bin), "pip", "install"]:
+                    seen_install_commands.append(cmd)
+                    assert "-c" not in cmd
+                    return True, "ok"
+                return True, "ok"
+
             with patch.object(
-                    PluginHelper,
-                    "_PluginHelper__get_installed_packages",
+                    PluginRuntimeHealth,
+                    "_PluginRuntimeHealth__get_installed_packages",
                     return_value={"demo_package": Version("1.0")}
             ):
                 with patch.object(
-                        PluginHelper,
-                        "_PluginHelper__get_protected_runtime_packages",
+                        PluginRuntimeHealth,
+                        "_PluginRuntimeHealth__get_protected_runtime_packages",
                         return_value={}
                 ):
-                    with patch("app.adapters.external.market.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
-                        with patch("app.adapters.system.package._find_uv", return_value=None):
-                            success, message = PluginHelper.pip_install_with_fallback(requirements_file)
+                    with patch("app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
+                        with patch("app.adapters.system.package.find_uv", return_value=uv_bin):
+                            success, message = PluginRuntimeHealth.install_packages_with_fallback(requirements_file)
 
         assert success
         assert "ok" == message
         assert 1 == len(seen_install_commands)
 
-    def test_pip_install_uses_runtime_constraints_file(self):
+    def test_uv_install_uses_runtime_constraints_file(self):
         """
         验证插件依赖安装会固定主程序依赖的当前版本，防止共享 venv 被改写。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
         seen_constraints = []
 
-        def fake_execute(cmd, env=None, safe_command=None):
-            if cmd[:4] == [sys.executable, "-m", "pip", "install"]:
-                constraint_index = cmd.index("-c") + 1
-                constraint_file = Path(cmd[constraint_index])
-                seen_constraints.append(constraint_file)
-                assert constraint_file.exists()
-                assert "fastapi==0.115.14" in constraint_file.read_text(encoding="utf-8")
-                return True, "ok"
-            return True, "ok"
-
         with tempfile.TemporaryDirectory() as temp_dir:
-            requirements_file = Path(temp_dir) / "requirements.txt"
+            root = Path(temp_dir)
+            requirements_file = root / "requirements.txt"
             requirements_file.write_text("demo-package\n", encoding="utf-8")
+            uv_bin = _create_fake_uv(root)
+
+            def fake_execute(cmd, env=None, safe_command=None):
+                if cmd[:3] == [str(uv_bin), "pip", "install"]:
+                    constraint_index = cmd.index("-c") + 1
+                    constraint_file = Path(cmd[constraint_index])
+                    seen_constraints.append(constraint_file)
+                    assert constraint_file.exists()
+                    assert "fastapi==0.115.14" in constraint_file.read_text(encoding="utf-8")
+                    return True, "ok"
+                return True, "ok"
+
             with patch.object(
-                    PluginHelper,
-                    "_PluginHelper__get_protected_runtime_packages",
+                    PluginRuntimeHealth,
+                    "_PluginRuntimeHealth__get_protected_runtime_packages",
                     return_value={"fastapi": Version("0.115.14")}
             ):
-                with patch("app.adapters.external.market.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
-                    with patch("app.adapters.system.package._find_uv", return_value=None):
-                        success, message = PluginHelper.pip_install_with_fallback(requirements_file)
+                with patch("app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
+                    with patch("app.adapters.system.package.find_uv", return_value=uv_bin):
+                        success, message = PluginRuntimeHealth.install_packages_with_fallback(requirements_file)
 
         assert success
         assert "ok" == message
         assert 1 == len(seen_constraints)
         assert not seen_constraints[0].exists()
 
-    def test_pip_install_repairs_runtime_when_healthcheck_fails(self):
+    def test_uv_install_repairs_runtime_when_healthcheck_fails(self):
         """
         验证插件依赖安装后若破坏运行环境，会先恢复主程序依赖，再向上层返回失败。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
         repair_commands = []
-        pip_check_count = 0
-        pip_check_cmd = PluginHelper._PluginHelper__build_runtime_pip_command("check")
-
-        def fake_execute(cmd, env=None, safe_command=None):
-            nonlocal pip_check_count
-            if cmd[:4] == [sys.executable, "-m", "pip", "install"]:
-                if "-c" not in cmd:
-                    repair_commands.append(cmd)
-                    return True, "repaired"
-                return True, "installed"
-            if cmd == pip_check_cmd:
-                pip_check_count += 1
-                if pip_check_count == 2:
-                    return False, "broken"
-                return True, "healthy"
-            if len(cmd) >= 3 and cmd[1] == "-c":
-                return True, "probe ok"
-            raise AssertionError(f"unexpected command: {cmd}")
+        uv_check_count = 0
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            requirements_file = Path(temp_dir) / "requirements.txt"
+            root = Path(temp_dir)
+            requirements_file = root / "requirements.txt"
             requirements_file.write_text("demo-package\n", encoding="utf-8")
+            uv_bin = _create_fake_uv(root)
+
+            def fake_execute(cmd, env=None, safe_command=None):
+                nonlocal uv_check_count
+                if cmd[:3] == [str(uv_bin), "pip", "install"]:
+                    if "-c" not in cmd:
+                        repair_commands.append(cmd)
+                        return True, "repaired"
+                    return True, "installed"
+                if cmd[1:3] == ["pip", "check"]:
+                    uv_check_count += 1
+                    if uv_check_count == 2:
+                        return False, "broken"
+                    return True, "healthy"
+                if len(cmd) >= 3 and cmd[1:3] == ["-m", "app.doctor.dependencies"]:
+                    return True, "probe ok"
+                raise AssertionError(f"unexpected command: {cmd}")
+
             with patch.object(
-                    PluginHelper,
-                    "_PluginHelper__get_protected_runtime_packages",
+                    PluginRuntimeHealth,
+                    "_PluginRuntimeHealth__get_protected_runtime_packages",
                     return_value={"fastapi": Version("0.115.14")}
             ):
-                with patch("app.adapters.external.market.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
-                    with patch("app.adapters.system.package._find_uv", return_value=None):
-                        success, message = PluginHelper.pip_install_with_fallback(requirements_file)
+                with patch("app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
+                    with patch("app.adapters.system.package.find_uv", return_value=uv_bin), patch(
+                        "app.adapters.system.package.find_uv", return_value=uv_bin
+                    ):
+                        success, message = PluginRuntimeHealth.install_packages_with_fallback(requirements_file)
 
         assert not success
         assert "已自动恢复主程序依赖" in message
         assert 1 == len(repair_commands)
         assert "runtime-constraints-" in repair_commands[0][-1]
 
-    def test_pip_install_allows_preexisting_healthcheck_failure(self):
+    def test_uv_install_allows_preexisting_healthcheck_failure(self):
         """
         安装前已存在且安装后未新增的环境异常不应归因于本次插件依赖安装。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
         health_snapshots = [
             {
-                "pip check": (False, "existing issue before install"),
+                "uv check": (
+                    False,
+                    "before summary\nThe package `oss2` requires `crcmod>=1.7`, but it's not installed",
+                ),
                 "核心依赖导入检查": (True, "ok"),
             },
             {
-                "pip check": (False, "same issue with different command summary"),
+                "uv check": (
+                    False,
+                    "after summary\nThe package `oss2` requires `crcmod>=1.7`, but it's not installed",
+                ),
                 "核心依赖导入检查": (True, "ok"),
             },
         ]
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            requirements_file = Path(temp_dir) / "requirements.txt"
+            root = Path(temp_dir)
+            requirements_file = root / "requirements.txt"
             requirements_file.write_text("demo-package\n", encoding="utf-8")
-            with patch("app.adapters.system.package._find_uv", return_value=None), \
-                    patch.object(PluginHelper, "_PluginHelper__get_protected_runtime_packages", return_value={}), \
+            uv_bin = _create_fake_uv(root)
+            with patch("app.adapters.system.package.find_uv", return_value=uv_bin), \
+                    patch.object(PluginRuntimeHealth, "_PluginRuntimeHealth__get_protected_runtime_packages", return_value={}), \
                     patch.object(
-                        PluginHelper,
-                        "_PluginHelper__run_runtime_healthcheck",
+                        PluginRuntimeHealth,
+                        "_PluginRuntimeHealth__run_runtime_healthcheck",
                         side_effect=health_snapshots,
                     ), \
-                    patch.object(PluginHelper, "_PluginHelper__repair_main_runtime_dependencies") as repair_mock, \
+                    patch.object(PluginRuntimeHealth, "_PluginRuntimeHealth__repair_main_runtime_dependencies") as repair_mock, \
+                    patch("app.adapters.system.plugin.health.logger.warning") as warning_mock, \
                     patch(
-                        "app.adapters.external.market.SystemUtils.execute_with_subprocess",
+                        "app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess",
                         return_value=(True, "installed"),
                     ):
-                success, message = PluginHelper.pip_install_with_fallback(requirements_file)
+                success, message = PluginRuntimeHealth.install_packages_with_fallback(requirements_file)
 
         assert success
         assert message == "installed"
         repair_mock.assert_not_called()
+        assert not any(
+            "安装前运行环境已存在异常" in str(call.args[0])
+            for call in warning_mock.call_args_list
+        )
 
     def test_preexisting_healthcheck_failure_does_not_hide_new_core_failure(self):
         """
         既有全局依赖异常不能遮蔽本次安装新造成的核心依赖导入失败。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
         health_snapshots = [
             {
-                "pip check": (False, "existing issue"),
+                "uv check": (False, "existing issue"),
                 "核心依赖导入检查": (True, "ok"),
             },
             {
-                "pip check": (False, "existing issue"),
+                "uv check": (False, "existing issue"),
                 "核心依赖导入检查": (False, "import failed"),
             },
             {
-                "pip check": (False, "existing issue"),
+                "uv check": (False, "existing issue"),
                 "核心依赖导入检查": (True, "ok"),
             },
         ]
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            requirements_file = Path(temp_dir) / "requirements.txt"
+            root = Path(temp_dir)
+            requirements_file = root / "requirements.txt"
             requirements_file.write_text("demo-package\n", encoding="utf-8")
-            with patch("app.adapters.system.package._find_uv", return_value=None), \
-                    patch.object(PluginHelper, "_PluginHelper__get_protected_runtime_packages", return_value={}), \
+            uv_bin = _create_fake_uv(root)
+            with patch("app.adapters.system.package.find_uv", return_value=uv_bin), \
+                    patch.object(PluginRuntimeHealth, "_PluginRuntimeHealth__get_protected_runtime_packages", return_value={}), \
                     patch.object(
-                        PluginHelper,
-                        "_PluginHelper__run_runtime_healthcheck",
+                        PluginRuntimeHealth,
+                        "_PluginRuntimeHealth__run_runtime_healthcheck",
                         side_effect=health_snapshots,
                     ), \
                     patch.object(
-                        PluginHelper,
-                        "_PluginHelper__repair_main_runtime_dependencies",
+                        PluginRuntimeHealth,
+                        "_PluginRuntimeHealth__repair_main_runtime_dependencies",
                         return_value=(True, "repaired"),
                     ) as repair_mock, \
                     patch(
-                        "app.adapters.external.market.SystemUtils.execute_with_subprocess",
+                        "app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess",
                         return_value=(True, "installed"),
                     ):
-                success, message = PluginHelper.pip_install_with_fallback(requirements_file)
+                success, message = PluginRuntimeHealth.install_packages_with_fallback(requirements_file)
 
         assert not success
         assert "核心依赖导入检查失败" in message
         repair_mock.assert_called_once()
+
+    def test_preexisting_uv_diagnostic_does_not_hide_new_package_error(self):
+        """既有第三方元数据告警不能遮蔽插件安装新增的依赖错误。"""
+
+        existing_error = "The package `oss2` requires `crcmod>=1.7`, but it's not installed"
+        added_error = "The package `demo` requires `missing>=1`, but it's not installed"
+
+        with patch(
+            "app.adapters.system.plugin.health.runtime_excluded_dependency_pairs",
+            return_value={("oss2", "crcmod")},
+        ):
+            message = PluginRuntimeHealth._PluginRuntimeHealth__runtime_health_regression_message(
+                {"uv check": (False, existing_error)},
+                {"uv check": (False, f"{existing_error}\n{added_error}")},
+            )
+
+        assert added_error in message
+        assert existing_error not in message
+
+    def test_expected_uv_diagnostic_does_not_create_baseline_warning(self):
+        """项目明确排除的传递依赖不得形成插件安装前告警。"""
+
+        expected_error = "The package `oss2` requires `crcmod>=1.7`, but it's not installed"
+        with patch(
+            "app.adapters.system.plugin.health.runtime_excluded_dependency_pairs",
+            return_value={("oss2", "crcmod")},
+        ):
+            message = PluginRuntimeHealth._PluginRuntimeHealth__runtime_health_regression_message(
+                {},
+                {"uv check": (False, expected_error)},
+            )
+
+        assert message == ""
+
+    def test_uv_diagnostic_parser_handles_executor_prefix(self):
+        """执行器把首条错误拼在命令摘要后时仍应识别完整诊断项。"""
+
+        package_error = "The package `demo` requires `missing>=1`, but it's not installed"
+        message = f"命令：uv pip check，执行失败，返回码：1，错误输出：{package_error}"
+
+        issues = PluginRuntimeHealth._PluginRuntimeHealth__runtime_health_error_lines(
+            "uv check",
+            message,
+        )
+
+        assert issues == {package_error}
 
     def test_failed_install_repairs_runtime_before_returning_error(self):
         """
         安装策略失败后如果主运行环境异常，应先恢复主程序依赖再返回失败。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -1400,26 +1820,27 @@ class TestPluginHelper:
             root = Path(temp_dir)
             req = root / "plugin-requirements.txt"
             req.write_text("demo\n", encoding="utf-8")
+            uv_bin = _create_fake_uv(root)
 
-            with patch("app.adapters.system.package._find_uv", return_value=None), \
-                    patch.object(PluginHelper, "_PluginHelper__get_protected_runtime_packages", return_value={}), \
+            with patch("app.adapters.system.package.find_uv", return_value=uv_bin), \
+                    patch.object(PluginRuntimeHealth, "_PluginRuntimeHealth__get_protected_runtime_packages", return_value={}), \
                     patch.object(
-                        PluginHelper,
-                        "_PluginHelper__run_runtime_healthcheck",
+                        PluginRuntimeHealth,
+                        "_PluginRuntimeHealth__run_runtime_healthcheck",
                         side_effect=[
-                            {"pip check": (True, "ok"), "核心依赖导入检查": (True, "ok")},
-                            {"pip check": (False, "broken"), "核心依赖导入检查": (True, "ok")},
-                            {"pip check": (True, "ok"), "核心依赖导入检查": (True, "ok")},
+                            {"uv check": (True, "ok"), "核心依赖导入检查": (True, "ok")},
+                            {"uv check": (False, "broken"), "核心依赖导入检查": (True, "ok")},
+                            {"uv check": (True, "ok"), "核心依赖导入检查": (True, "ok")},
                         ],
                     ), \
                     patch.object(
-                        PluginHelper,
-                        "_PluginHelper__repair_main_runtime_dependencies",
+                        PluginRuntimeHealth,
+                        "_PluginRuntimeHealth__repair_main_runtime_dependencies",
                         side_effect=lambda snapshot_file=None: repair_calls.append(snapshot_file)
                         or (True, "runtime repaired"),
                     ), \
-                    patch("app.adapters.external.market.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
-                success, message = PluginHelper.pip_install_with_fallback(req)
+                    patch("app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
+                success, message = PluginRuntimeHealth.install_packages_with_fallback(req)
 
         assert not success
         assert "partial failure" in message or "恢复" in message
@@ -1430,7 +1851,7 @@ class TestPluginHelper:
         一旦失败策略污染主运行环境并触发恢复，不能继续 fallback 后把安装结果伪装成成功。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -1453,27 +1874,27 @@ class TestPluginHelper:
             uv_bin.parent.mkdir(parents=True)
             uv_bin.write_text("", encoding="utf-8")
 
-            with patch("app.adapters.system.package._find_uv", return_value=uv_bin), \
-                    patch.object(PluginHelper, "_PluginHelper__get_protected_runtime_packages", return_value={}), \
+            with patch("app.adapters.system.package.find_uv", return_value=uv_bin), \
+                    patch.object(PluginRuntimeHealth, "_PluginRuntimeHealth__get_protected_runtime_packages", return_value={}), \
                     patch.object(
-                        PluginHelper,
-                        "_PluginHelper__run_runtime_healthcheck",
+                        PluginRuntimeHealth,
+                        "_PluginRuntimeHealth__run_runtime_healthcheck",
                         side_effect=[
-                            {"pip check": (True, "ok"), "核心依赖导入检查": (True, "ok")},
-                            {"pip check": (False, "broken"), "核心依赖导入检查": (True, "ok")},
-                            {"pip check": (True, "ok"), "核心依赖导入检查": (True, "ok")},
+                            {"uv check": (True, "ok"), "核心依赖导入检查": (True, "ok")},
+                            {"uv check": (False, "broken"), "核心依赖导入检查": (True, "ok")},
+                            {"uv check": (True, "ok"), "核心依赖导入检查": (True, "ok")},
                         ],
                     ), \
                     patch.object(
-                        PluginHelper,
-                        "_PluginHelper__repair_main_runtime_dependencies",
+                        PluginRuntimeHealth,
+                        "_PluginRuntimeHealth__repair_main_runtime_dependencies",
                         side_effect=lambda snapshot_file=None: repair_calls.append(snapshot_file)
                         or (True, "runtime repaired"),
                     ), \
-                    patch("app.adapters.external.market.settings.PIP_PROXY", "https://mirror.example/simple"), \
-                    patch("app.adapters.external.market.settings.PROXY_HOST", "http://proxy.example:7890"), \
-                    patch("app.adapters.external.market.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
-                success, message = PluginHelper.pip_install_with_fallback(req)
+                    patch("app.adapters.system.plugin.health.settings.PIP_PROXY", "https://mirror.example/simple"), \
+                    patch("app.adapters.system.plugin.health.settings.PROXY_HOST", "http://proxy.example:7890"), \
+                    patch("app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
+                success, message = PluginRuntimeHealth.install_packages_with_fallback(req)
 
         assert not success
         assert "resolver failed" in message
@@ -1486,7 +1907,7 @@ class TestPluginHelper:
         主运行环境恢复与插件安装使用同一套 cache、index、proxy 和安全日志语义。
         """
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
@@ -1504,13 +1925,21 @@ class TestPluginHelper:
             uv_bin.parent.mkdir(parents=True)
             uv_bin.write_text("", encoding="utf-8")
 
-            with patch("app.adapters.system.package._find_uv", return_value=uv_bin), \
-                    patch("app.adapters.external.market.settings.CONFIG_DIR", str(root / "config")), \
-                    patch("app.adapters.external.market.settings.PACKAGE_CACHE_ROOT", str(root / "custom-package-cache")), \
-                    patch("app.adapters.external.market.settings.PIP_PROXY", "https://user:pass@mirror.example/simple"), \
-                    patch("app.adapters.external.market.settings.PROXY_HOST", "http://proxy.example:7890"), \
-                    patch("app.adapters.external.market.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
-                success, message = PluginHelper._PluginHelper__repair_main_runtime_dependencies(req)
+            with patch("app.adapters.system.package.find_uv", return_value=uv_bin), \
+                    patch.dict(os.environ, {}, clear=True), \
+                    patch(
+                        "app.adapters.system.plugin.health.get_runtime_setting",
+                        side_effect=lambda key: {
+                            "ROOT_PATH": root,
+                            "TEMP_PATH": root / "temp",
+                            "CONFIG_PATH": root / "config",
+                            "PACKAGE_CACHE_PATH": root / "custom-package-cache",
+                            "PIP_PROXY": "https://user:pass@mirror.example/simple",
+                            "PROXY_HOST": "http://proxy.example:7890",
+                        }.get(key),
+                    ), \
+                    patch("app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess", side_effect=fake_execute):
+                success, message = PluginRuntimeHealth._PluginRuntimeHealth__repair_main_runtime_dependencies(req)
 
         assert success
         assert message == "ok"
@@ -1519,44 +1948,262 @@ class TestPluginHelper:
         assert command[:3] == [str(uv_bin), "pip", "install"]
         assert "--proxy" not in command
         assert env["PACKAGE_CACHE_ROOT"] == str(root / "custom-package-cache")
-        assert env["PIP_CACHE_DIR"] == str(root / "custom-package-cache" / "pip")
         assert env["UV_CACHE_DIR"] == str(root / "custom-package-cache" / "uv")
         assert env["HTTPS_PROXY"] == "http://proxy.example:7890"
         assert "user:pass" not in " ".join(safe_command)
 
-    def test_async_pip_install_runs_in_threadpool(self):
-        """
-        验证异步安装路径会把同步 pip 安装派发到线程池，避免阻塞事件循环。
-        """
+    def test_async_package_install_uses_cancellable_subprocess(self):
+        """异步依赖安装应直接使用可取消的子进程执行器。"""
         try:
-            from app.adapters.external.market import PluginHelper
+            from app.adapters.system.plugin.health import PluginRuntimeHealth
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
-        requirements_file = Path("/tmp/demo-requirements.txt")
-        find_links_dirs = [Path("/tmp/demo-wheels")]
-        calls = []
+        helper = PluginRuntimeHealth()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            requirements_file = Path(temp_dir) / "demo-requirements.txt"
+            requirements_file.write_text("demo-package\n", encoding="utf-8")
+            find_links_dirs = [Path(temp_dir) / "wheels"]
 
-        async def run_install():
-            return await helper._PluginHelper__async_pip_install_with_fallback(
-                requirements_file,
-                find_links_dirs
+            async def run_install():
+                return await helper._PluginRuntimeHealth__async_install_packages_with_fallback(
+                    requirements_file,
+                    find_links_dirs,
+                )
+
+            expected_error = "The package `oss2` requires `crcmod>=1.7`, but it's not installed"
+            health = {
+                "uv check": (False, expected_error),
+                "核心依赖导入检查": (True, "ok"),
+            }
+            strategy = Mock(
+                strategy_name="uv:test",
+                command=["uv", "pip", "install"],
+                env={},
+                safe_log_command=["uv", "pip", "install"],
             )
 
-        async def fake_to_thread(func, *args, **kwargs):
-            calls.append((func, args, kwargs))
-            return True, "ok"
-
-        with patch("app.adapters.external.market.asyncio.to_thread", side_effect=fake_to_thread):
-            success, message = asyncio.run(run_install())
+            with patch.object(
+                    PluginRuntimeHealth,
+                    "_PluginRuntimeHealth__get_installed_packages",
+                    return_value={},
+            ), patch.object(
+                    PluginRuntimeHealth,
+                    "_PluginRuntimeHealth__get_protected_runtime_packages",
+                    return_value={},
+            ), patch.object(
+                    PluginRuntimeHealth,
+                    "_PluginRuntimeHealth__validate_runtime_dependency_conflicts",
+                    return_value=(True, ""),
+            ), patch(
+                    "app.adapters.system.plugin.health.build_package_install_strategies",
+                    return_value=[strategy],
+            ), patch.object(
+                    PluginRuntimeHealth,
+                    "_PluginRuntimeHealth__async_run_runtime_healthcheck",
+                    side_effect=[health, health],
+            ), patch.object(
+                    PluginRuntimeHealth,
+                    "_PluginRuntimeHealth__refresh_import_system",
+            ), patch(
+                    "app.adapters.system.plugin.health.logger.warning",
+            ) as warning_mock, patch(
+                    "app.adapters.system.plugin.health.runtime_excluded_dependency_pairs",
+                    return_value={("oss2", "crcmod")},
+            ), patch(
+                    "app.adapters.system.plugin.health.SystemUtils.execute_with_subprocess_async",
+                    new=AsyncMock(return_value=(True, "ok")),
+            ) as execute_mock:
+                success, message = asyncio.run(run_install())
 
         assert success
         assert "ok" == message
-        assert 1 == len(calls)
-        assert helper.pip_install_with_fallback == calls[0][0]
-        assert (requirements_file, find_links_dirs) == calls[0][1]
-        assert {} == calls[0][2]
+        execute_mock.assert_awaited_once()
+        assert execute_mock.await_args.kwargs["timeout"] == (
+            PluginRuntimeHealth.PLUGIN_DEPENDENCY_INSTALL_TIMEOUT
+        )
+        assert not any(
+            "安装前运行环境已存在异常" in str(call.args[0])
+            for call in warning_mock.call_args_list
+        )
+
+    def test_async_package_install_cancellation_closes_full_lifecycle(self, tmp_path):
+        """取消真实安装进程后必须回收进程树、临时约束和安装锁。"""
+        import psutil
+
+
+        helper = PluginRuntimeHealth()
+        requirements_file = tmp_path / "requirements.txt"
+        requirements_file.write_text("demo-package\n", encoding="utf-8")
+        constraints_file = tmp_path / "runtime-constraints.txt"
+        marker = tmp_path / "install-pids"
+        child_code = "import time; time.sleep(60)"
+        install_code = (
+            "from pathlib import Path; import os, subprocess, time; "
+            f"child = subprocess.Popen([{sys.executable!r}, '-c', {child_code!r}]); "
+            f"Path({str(marker)!r}).write_text(str(os.getpid()) + ':' + str(child.pid)); "
+            "time.sleep(60)"
+        )
+        strategy = Mock(
+            strategy_name="uv:test",
+            command=[sys.executable, "-c", install_code],
+            env=os.environ.copy(),
+            safe_log_command=[sys.executable, "-c", "<install>"],
+        )
+        health = {
+            "uv check": (True, "ok"),
+            "核心依赖导入检查": (True, "ok"),
+        }
+
+        def create_constraints(_protected_packages):
+            constraints_file.write_text("fastapi==0\n", encoding="utf-8")
+            return constraints_file
+
+        async def run_install():
+            task = asyncio.create_task(
+                helper.async_install_packages_with_fallback(requirements_file)
+            )
+            deadline = time.monotonic() + 2
+            while not marker.exists() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert marker.exists()
+
+            pids = [int(value) for value in marker.read_text().split(":")]
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert not constraints_file.exists()
+            assert PluginRuntimeHealth._package_install_lock.acquire(blocking=False)
+            PluginRuntimeHealth._package_install_lock.release()
+            for _ in range(100):
+                alive = []
+                for pid in pids:
+                    try:
+                        process = psutil.Process(pid)
+                        if (
+                            process.is_running()
+                            and process.status() != psutil.STATUS_ZOMBIE
+                        ):
+                            alive.append(pid)
+                    except (psutil.Error, OSError):
+                        continue
+                if not alive:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                pytest.fail(f"安装进程树仍在运行：{alive}")
+
+        with patch.object(
+                PluginRuntimeHealth,
+                "_PluginRuntimeHealth__get_installed_packages",
+                return_value={},
+        ), patch.object(
+                PluginRuntimeHealth,
+                "_PluginRuntimeHealth__get_protected_runtime_packages",
+                return_value={"fastapi": "0"},
+        ), patch.object(
+                PluginRuntimeHealth,
+                "_PluginRuntimeHealth__validate_runtime_dependency_conflicts",
+                return_value=(True, ""),
+        ), patch.object(
+                PluginRuntimeHealth,
+                "_PluginRuntimeHealth__create_runtime_constraints_file",
+                side_effect=create_constraints,
+        ), patch(
+                "app.adapters.system.plugin.health.build_package_install_strategies",
+                return_value=[strategy],
+        ), patch.object(
+                PluginRuntimeHealth,
+                "_PluginRuntimeHealth__async_run_runtime_healthcheck",
+                new=AsyncMock(return_value=health),
+        ):
+            asyncio.run(run_install())
+
+    def test_constraints_created_during_cancellation_are_removed(self, tmp_path):
+        """约束文件创建线程收口后仍须响应取消并删除临时文件。"""
+
+        helper = PluginRuntimeHealth()
+        requirements_file = tmp_path / "requirements.txt"
+        requirements_file.write_text("demo-package\n", encoding="utf-8")
+        constraints_file = tmp_path / "runtime-constraints.txt"
+        created = threading.Event()
+        release = threading.Event()
+
+        def create_constraints(_protected_packages):
+            constraints_file.write_text("fastapi==0\n", encoding="utf-8")
+            created.set()
+            release.wait(timeout=2)
+            return constraints_file
+
+        async def run_install():
+            task = asyncio.create_task(
+                helper.async_install_packages_with_fallback(requirements_file)
+            )
+            assert await asyncio.to_thread(created.wait, 2)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        with patch.object(
+                PluginRuntimeHealth,
+                "_PluginRuntimeHealth__get_installed_packages",
+                return_value={},
+        ), patch.object(
+                PluginRuntimeHealth,
+                "_PluginRuntimeHealth__get_protected_runtime_packages",
+                return_value={"fastapi": "0"},
+        ), patch.object(
+                PluginRuntimeHealth,
+                "_PluginRuntimeHealth__validate_runtime_dependency_conflicts",
+                return_value=(True, ""),
+        ), patch.object(
+                PluginRuntimeHealth,
+                "_PluginRuntimeHealth__create_runtime_constraints_file",
+                side_effect=create_constraints,
+        ):
+            asyncio.run(run_install())
+
+        assert not constraints_file.exists()
+
+    def test_constraints_cleanup_failure_preserves_cancellation(self, tmp_path):
+        """临时文件删除失败只记录日志，不得替换调用方的取消异常。"""
+
+        constraints_file = tmp_path / "runtime-constraints.txt"
+        created = threading.Event()
+        release = threading.Event()
+
+        def create_constraints(_protected_packages):
+            constraints_file.write_text("fastapi==0\n", encoding="utf-8")
+            created.set()
+            release.wait(timeout=2)
+            return constraints_file
+
+        async def run_create():
+            task = asyncio.create_task(
+                PluginRuntimeHealth._PluginRuntimeHealth__async_create_runtime_constraints_file(
+                    {"fastapi": Version("0")}
+                )
+            )
+            assert await asyncio.to_thread(created.wait, 2)
+            task.cancel()
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        with patch.object(
+                PluginRuntimeHealth,
+                "_PluginRuntimeHealth__create_runtime_constraints_file",
+                side_effect=create_constraints,
+        ), patch.object(
+                Path,
+                "unlink",
+                side_effect=PermissionError("locked"),
+        ), patch("app.adapters.system.plugin.health.logger.warning") as warning:
+            asyncio.run(run_create())
+
+        warning.assert_called_once()
 
     def test_install_uses_release_package_when_asset_is_available(self, monkeypatch):
         """
@@ -1567,7 +2214,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_sync_remote_install(
             helper,
             monkeypatch,
@@ -1575,11 +2222,11 @@ class TestPluginHelper:
             (True, ""),
         )
 
-        success, message = helper.install(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
+        success, message = helper.install_raw(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
 
         assert success
         assert "" == message
-        assert ["remove", "release", "refresh"] == calls
+        assert ["remove", "release"] == calls
 
     def test_install_falls_back_to_filelist_when_release_is_missing(self, monkeypatch):
         """
@@ -1590,7 +2237,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_sync_remote_install(
             helper,
             monkeypatch,
@@ -1599,34 +2246,34 @@ class TestPluginHelper:
             (True, ""),
         )
 
-        success, message = helper.install(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
+        success, message = helper.install_raw(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
 
         assert success
         assert "" == message
-        assert ["remove", "release", "remove", "filelist", "refresh"] == calls
+        assert ["remove", "release", "remove", "filelist"] == calls
 
     def test_install_reports_filelist_error_after_release_fallback_fails(self, monkeypatch):
         """
-        release 和文件列表都不可用时返回最终文件列表错误，并在每次写入前后保持目录可回滚。
+        release 和源码目录都不存在时返回稳定业务错误，并在每次写入前后保持目录可回滚。
         """
         try:
             from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_sync_remote_install(
             helper,
             monkeypatch,
             {"release": True, "version": "1.2.3"},
-            (False, "未找到资产文件：demoplugin_v1.2.3.zip"),
-            (False, "获取文件列表失败"),
+            (False, "DemoPlugin_v1.2.3 插件发布包不存在"),
+            (False, "DemoPlugin 插件源码目录不存在"),
         )
 
-        success, message = helper.install(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
+        success, message = helper.install_raw(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
 
         assert not success
-        assert "获取文件列表失败" == message
+        assert "DemoPlugin 插件源码目录不存在" == message
         assert ["remove", "release", "remove", "filelist", "remove"] == calls
 
     def test_install_uses_filelist_when_release_flag_is_disabled(self, monkeypatch):
@@ -1638,7 +2285,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_sync_remote_install(
             helper,
             monkeypatch,
@@ -1647,11 +2294,11 @@ class TestPluginHelper:
             (True, ""),
         )
 
-        success, message = helper.install(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
+        success, message = helper.install_raw(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
 
         assert success
         assert "" == message
-        assert ["remove", "filelist", "refresh"] == calls
+        assert ["remove", "filelist"] == calls
 
     def test_install_rejects_release_without_version(self, monkeypatch):
         """
@@ -1662,7 +2309,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_sync_remote_install(
             helper,
             monkeypatch,
@@ -1670,7 +2317,7 @@ class TestPluginHelper:
             (True, ""),
         )
 
-        success, message = helper.install(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
+        success, message = helper.install_raw(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
 
         assert not success
         assert f"未在插件清单中找到 {PLUGIN_ID} 的版本号" in message
@@ -1685,7 +2332,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_sync_remote_install(
             helper,
             monkeypatch,
@@ -1694,7 +2341,7 @@ class TestPluginHelper:
         )
         monkeypatch.setattr(PluginHelper, "get_current_system_version", lambda: Version("2.0.0"))
 
-        success, message = helper.install(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
+        success, message = helper.install_raw(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
 
         assert not success
         assert "MoviePilot 版本 >=9.0.0" in message
@@ -1709,7 +2356,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_sync_remote_install(
             helper,
             monkeypatch,
@@ -1723,7 +2370,7 @@ class TestPluginHelper:
             lambda *_args: [{"version": "1.2.3", "tag_name": "DemoPlugin_v1.2.3"}],
         )
 
-        success, message = helper.install(
+        success, message = helper.install_raw(
             PLUGIN_ID, REPO_URL, package_version="v2", release_version="1.2.3", force_install=True
         )
 
@@ -1740,7 +2387,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_sync_remote_install(
             helper,
             monkeypatch,
@@ -1755,7 +2402,7 @@ class TestPluginHelper:
             lambda *_args: [{"version": "1.2.0", "tag_name": "DemoPlugin_v1.2.0"}],
         )
 
-        success, message = helper.install(
+        success, message = helper.install_raw(
             PLUGIN_ID, REPO_URL, package_version="v2", release_version="1.2.0", force_install=True
         )
 
@@ -1772,7 +2419,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_sync_remote_install(
             helper,
             monkeypatch,
@@ -1785,7 +2432,7 @@ class TestPluginHelper:
             lambda *_args: [{"version": "1.2.3", "tag_name": "DemoPlugin_v1.2.3"}],
         )
 
-        success, message = helper.install(
+        success, message = helper.install_raw(
             PLUGIN_ID, REPO_URL, package_version="v2", release_version="1.2.0", force_install=True
         )
 
@@ -1802,7 +2449,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        success, message = PluginHelper().install("", REPO_URL)
+        success, message = _package_owner(PluginHelper()).install_raw("", REPO_URL)
 
         assert not success
         assert "参数错误" == message
@@ -1816,7 +2463,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        success, message = PluginHelper().install(PLUGIN_ID, "not-a-repo-url")
+        success, message = _package_owner(PluginHelper()).install_raw(PLUGIN_ID, "not-a-repo-url")
 
         assert not success
         assert "不支持的插件仓库地址格式" == message
@@ -1830,10 +2477,10 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         monkeypatch.setattr(helper, "get_plugin_package_version", lambda *_args: None)
 
-        success, message = helper.install(PLUGIN_ID, REPO_URL)
+        success, message = helper.install_raw(PLUGIN_ID, REPO_URL)
 
         assert not success
         assert f"{PLUGIN_ID} 没有找到适用于当前版本的插件" == message
@@ -1847,17 +2494,16 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         seen_versions = []
         monkeypatch.setattr(helper, "get_plugin_package_version", lambda _pid, _repo, version: seen_versions.append(version) or "")
-        monkeypatch.setattr(helper, "_PluginHelper__get_plugin_meta", lambda *_args: {"release": False, "version": "1.2.3"})
-        monkeypatch.setattr(helper, "_PluginHelper__backup_plugin", lambda _pid: None)
-        monkeypatch.setattr(helper, "_PluginHelper__remove_old_plugin", lambda _pid: None)
-        monkeypatch.setattr(helper, "_PluginHelper__install_dependencies_if_required", lambda _pid: (False, True, ""))
-        monkeypatch.setattr(helper, "refresh_persistent_plugin_backup", lambda _pid: None)
-        monkeypatch.setattr(helper, "_PluginHelper__prepare_content_via_filelist_sync", lambda *_args: (True, ""))
+        monkeypatch.setattr(helper, "_PluginPackageManager__get_plugin_meta", lambda *_args: {"release": False, "version": "1.2.3"})
+        monkeypatch.setattr(helper, "_PluginPackageManager__backup_plugin", lambda _pid: None)
+        monkeypatch.setattr(helper, "_PluginPackageManager__remove_old_plugin", lambda _pid: None)
+        monkeypatch.setattr(helper, "_PluginPackageManager__install_dependencies_if_required", lambda _pid: (False, True, ""))
+        monkeypatch.setattr(helper, "_PluginPackageManager__prepare_content_via_filelist_sync", lambda *_args: (True, ""))
 
-        success, message = helper.install(PLUGIN_ID, REPO_URL, force_install=True)
+        success, message = helper.install_raw(PLUGIN_ID, REPO_URL, force_install=True)
 
         assert success
         assert "" == message
@@ -1882,7 +2528,7 @@ class TestPluginHelper:
         dependency_file.write_text("module.exports = {}\n", encoding="utf-8")
 
         runtime_root = tmp_path / "runtime-plugins"
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         monkeypatch.setattr(
             helper,
             "get_local_plugin_candidate",
@@ -1893,10 +2539,9 @@ class TestPluginHelper:
                 "version": "1.0.0",
             },
         )
-        monkeypatch.setattr("app.adapters.external.market.PLUGIN_DIR", runtime_root)
-        monkeypatch.setattr(helper, "refresh_persistent_plugin_backup", lambda _pid: True)
+        helper._plugin_root = runtime_root
 
-        success, message = helper.install(
+        success, message = helper.install_raw(
             PLUGIN_ID,
             helper.make_local_repo_url(PLUGIN_ID, repo_path, "v2"),
             force_install=True,
@@ -1917,7 +2562,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_sync_remote_install(
             helper,
             monkeypatch,
@@ -1926,11 +2571,11 @@ class TestPluginHelper:
             (True, ""),
         )
 
-        success, message = helper.install(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
+        success, message = helper.install_raw(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
 
         assert success
         assert "" == message
-        assert ["remove", "release", "remove", "filelist", "refresh"] == calls
+        assert ["remove", "release", "remove", "filelist"] == calls
 
     def test_async_install_uses_release_package_when_asset_is_available(self, monkeypatch):
         """
@@ -1941,7 +2586,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_async_remote_install(
             helper,
             monkeypatch,
@@ -1950,13 +2595,12 @@ class TestPluginHelper:
         )
 
         success, message = asyncio.run(
-            helper.async_install(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
+            helper.async_install_raw(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
         )
 
         assert success
         assert "" == message
-        assert calls[:2] == ["remove", "release"]
-        assert calls[2][0] == "to_thread"
+        assert calls == ["remove", "release"]
 
     def test_async_install_falls_back_to_filelist_when_release_is_missing(self, monkeypatch):
         """
@@ -1967,7 +2611,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_async_remote_install(
             helper,
             monkeypatch,
@@ -1977,13 +2621,12 @@ class TestPluginHelper:
         )
 
         success, message = asyncio.run(
-            helper.async_install(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
+            helper.async_install_raw(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
         )
 
         assert success
         assert "" == message
-        assert calls[:4] == ["remove", "release", "remove", "filelist"]
-        assert calls[4][0] == "to_thread"
+        assert calls == ["remove", "release", "remove", "filelist"]
 
     def test_async_install_old_release_version_uses_release_asset_without_filelist_fallback(self, monkeypatch):
         """
@@ -1994,7 +2637,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_async_remote_install(
             helper,
             monkeypatch,
@@ -2010,7 +2653,7 @@ class TestPluginHelper:
         monkeypatch.setattr(helper, "async_get_plugin_release_versions", fake_releases)
 
         success, message = asyncio.run(
-            helper.async_install(
+            helper.async_install_raw(
                 PLUGIN_ID, REPO_URL, package_version="v2", release_version="1.2.0", force_install=True
             )
         )
@@ -2028,7 +2671,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_async_remote_install(
             helper,
             monkeypatch,
@@ -2042,7 +2685,7 @@ class TestPluginHelper:
         monkeypatch.setattr(helper, "async_get_plugin_release_versions", fake_releases)
 
         success, message = asyncio.run(
-            helper.async_install(
+            helper.async_install_raw(
                 PLUGIN_ID, REPO_URL, package_version="v2", release_version="1.2.0", force_install=True
             )
         )
@@ -2053,40 +2696,40 @@ class TestPluginHelper:
 
     def test_async_install_reports_filelist_error_after_release_fallback_fails(self, monkeypatch):
         """
-        异步安装路径在 release 与文件列表都失败时返回文件列表错误，并保持失败清理顺序稳定。
+        异步安装路径在 release 与源码目录都不存在时返回稳定业务错误，并保持失败清理顺序稳定。
         """
         try:
             from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = _patch_async_remote_install(
             helper,
             monkeypatch,
             {"release": True, "version": "1.2.3"},
-            (False, "未找到资产文件：demoplugin_v1.2.3.zip"),
-            (False, "获取文件列表失败"),
+            (False, "DemoPlugin_v1.2.3 插件发布包不存在"),
+            (False, "DemoPlugin 插件源码目录不存在"),
         )
 
         success, message = asyncio.run(
-            helper.async_install(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
+            helper.async_install_raw(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
         )
 
         assert not success
-        assert "获取文件列表失败" == message
+        assert "DemoPlugin 插件源码目录不存在" == message
         assert calls == ["remove", "release", "remove", "filelist", "remove"]
 
-    def test_async_install_release_fallback_uses_lowercase_filelist_pid(self, monkeypatch):
+    def test_async_install_release_fallback_preserves_plugin_id(self, monkeypatch):
         """
-        异步 release 回退文件列表安装时使用小写插件 ID，保持 GitHub 目录查询与同步路径一致。
+        异步 release 回退保留清单中的插件 ID，供文件列表层生成可读错误。
         """
         try:
             from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         filelist_pids = []
         _patch_async_remote_install(
             helper,
@@ -2100,26 +2743,26 @@ class TestPluginHelper:
             filelist_pids.append(pid)
             return True, ""
 
-        monkeypatch.setattr(helper, "_PluginHelper__prepare_content_via_filelist_async", fake_filelist)
+        monkeypatch.setattr(helper, "_PluginPackageManager__prepare_content_via_filelist_async", fake_filelist)
 
         success, message = asyncio.run(
-            helper.async_install(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
+            helper.async_install_raw(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
         )
 
         assert success
         assert "" == message
-        assert ["demoplugin"] == filelist_pids
+        assert ["DemoPlugin"] == filelist_pids
 
-    def test_async_install_non_release_uses_lowercase_filelist_pid(self, monkeypatch):
+    def test_async_install_non_release_preserves_plugin_id(self, monkeypatch):
         """
-        异步文件列表直装使用小写插件 ID，避免大小写插件 ID 影响远端目录匹配。
+        异步文件列表直装保留清单中的插件 ID，路径规范化由文件列表层负责。
         """
         try:
             from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         filelist_pids = []
         _patch_async_remote_install(
             helper,
@@ -2133,15 +2776,15 @@ class TestPluginHelper:
             filelist_pids.append(pid)
             return True, ""
 
-        monkeypatch.setattr(helper, "_PluginHelper__prepare_content_via_filelist_async", fake_filelist)
+        monkeypatch.setattr(helper, "_PluginPackageManager__prepare_content_via_filelist_async", fake_filelist)
 
         success, message = asyncio.run(
-            helper.async_install(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
+            helper.async_install_raw(PLUGIN_ID, REPO_URL, package_version="v2", force_install=True)
         )
 
         assert success
         assert "" == message
-        assert ["demoplugin"] == filelist_pids
+        assert ["DemoPlugin"] == filelist_pids
 
     def test_install_from_release_reports_missing_tag(self, monkeypatch):
         """
@@ -2152,13 +2795,36 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", lambda *_args, **_kwargs: _FakeResponse(404))
+        helper = _package_owner(PluginHelper())
+        monkeypatch.setattr(helper, "_PluginPackageManager__request_with_fallback", lambda *_args, **_kwargs: _FakeResponse(404))
 
-        success, message = helper._PluginHelper__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+        success, message = helper._PluginPackageManager__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
 
         assert not success
-        assert "获取 Release 信息失败：404" == message
+        assert "DemoPlugin_v1.2.3 插件发布包不存在" == message
+
+    def test_get_file_list_reports_missing_plugin_directory(self, monkeypatch):
+        """索引存在但源码目录缺失时不向用户暴露底层 HTTP 404。"""
+        try:
+            from app.adapters.external.market import PluginHelper
+        except ModuleNotFoundError as exc:
+            pytest.skip(f"missing dependency: {exc}")
+
+        helper = _package_owner(PluginHelper())
+        monkeypatch.setattr(
+            helper,
+            "_PluginPackageManager__request_with_fallback",
+            lambda *_args, **_kwargs: _FakeResponse(404),
+        )
+
+        file_list, message = helper._PluginPackageManager__get_file_list(
+            PLUGIN_ID,
+            "demo/repo",
+            "v2",
+        )
+
+        assert file_list is None
+        assert message == "插件源码目录不存在"
 
     def test_install_from_release_reports_missing_asset(self, monkeypatch):
         """
@@ -2169,14 +2835,14 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         monkeypatch.setattr(
             helper,
-            "_PluginHelper__request_with_fallback",
+            "_PluginPackageManager__request_with_fallback",
             lambda *_args, **_kwargs: _FakeResponse(200, {"assets": [{"name": "other.zip", "id": 1}]}),
         )
 
-        success, message = helper._PluginHelper__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+        success, message = helper._PluginPackageManager__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
 
         assert not success
         assert "未找到资产文件：demoplugin_v1.2.3.zip" == message
@@ -2190,14 +2856,14 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         monkeypatch.setattr(
             helper,
-            "_PluginHelper__request_with_fallback",
+            "_PluginPackageManager__request_with_fallback",
             lambda *_args, **_kwargs: _FakeResponse(200, {"assets": [{"name": "demoplugin_v1.2.3.zip"}]}),
         )
 
-        success, message = helper._PluginHelper__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+        success, message = helper._PluginPackageManager__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
 
         assert not success
         assert "资产缺少ID信息" == message
@@ -2218,10 +2884,10 @@ class TestPluginHelper:
                 """模拟响应体不是合法 JSON。"""
                 raise ValueError("bad json")
 
-        helper = PluginHelper()
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", lambda *_args, **_kwargs: BadResponse(200))
+        helper = _package_owner(PluginHelper())
+        monkeypatch.setattr(helper, "_PluginPackageManager__request_with_fallback", lambda *_args, **_kwargs: BadResponse(200))
 
-        success, message = helper._PluginHelper__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+        success, message = helper._PluginPackageManager__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
 
         assert not success
         assert "解析 Release 信息失败" in message
@@ -2235,14 +2901,14 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         responses = iter([
             _FakeResponse(200, {"assets": [{"name": "demoplugin_v1.2.3.zip", "id": 42}]}),
             _FakeResponse(502),
         ])
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", lambda *_args, **_kwargs: next(responses))
+        monkeypatch.setattr(helper, "_PluginPackageManager__request_with_fallback", lambda *_args, **_kwargs: next(responses))
 
-        success, message = helper._PluginHelper__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+        success, message = helper._PluginPackageManager__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
 
         assert not success
         assert "下载资产失败：502" == message
@@ -2267,15 +2933,15 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         responses = iter([
             _FakeResponse(200, {"assets": [{"name": "demoplugin_v1.2.3.zip", "id": 42}]}),
             _FakeContentResponse(200, _build_release_zip_member(member_name, symlink=symlink)),
         ])
         _patch_release_install_settings(monkeypatch, tmp_path)
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", lambda *_args, **_kwargs: next(responses))
+        monkeypatch.setattr(helper, "_PluginPackageManager__request_with_fallback", lambda *_args, **_kwargs: next(responses))
 
-        success, message = helper._PluginHelper__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+        success, message = helper._PluginPackageManager__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
 
         assert not success
         assert "非法 Release 压缩包成员" in message
@@ -2293,7 +2959,9 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(
+            PluginHelper(), plugin_root=tmp_path / "app" / "plugins"
+        )
         release_payload = {"assets": [{"name": "demoplugin_v1.2.3.zip", "id": 42}]}
         zip_content = _build_zip({
             "demoplugin/__init__.py": b"plugin",
@@ -2307,9 +2975,9 @@ class TestPluginHelper:
             ROOT_PATH=tmp_path,
             REPO_GITHUB_HEADERS=lambda repo=None: {},
         ))
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", lambda *_args, **_kwargs: next(responses))
+        monkeypatch.setattr(helper, "_PluginPackageManager__request_with_fallback", lambda *_args, **_kwargs: next(responses))
 
-        success, message = helper._PluginHelper__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+        success, message = helper._PluginPackageManager__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
 
         assert success
         assert "" == message
@@ -2325,7 +2993,9 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(
+            PluginHelper(), plugin_root=tmp_path / "app" / "plugins"
+        )
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as zf:
             zf.writestr("demoplugin/assets/", b"")
@@ -2338,9 +3008,9 @@ class TestPluginHelper:
             ROOT_PATH=tmp_path,
             REPO_GITHUB_HEADERS=lambda repo=None: {},
         ))
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", lambda *_args, **_kwargs: next(responses))
+        monkeypatch.setattr(helper, "_PluginPackageManager__request_with_fallback", lambda *_args, **_kwargs: next(responses))
 
-        success, message = helper._PluginHelper__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+        success, message = helper._PluginPackageManager__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
 
         assert success
         assert "" == message
@@ -2356,14 +3026,14 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         responses = iter([
             _FakeResponse(200, {"assets": [{"name": "demoplugin_v1.2.3.zip", "id": 42}]}),
             _FakeContentResponse(200, _build_zip({})),
         ])
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", lambda *_args, **_kwargs: next(responses))
+        monkeypatch.setattr(helper, "_PluginPackageManager__request_with_fallback", lambda *_args, **_kwargs: next(responses))
 
-        success, message = helper._PluginHelper__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+        success, message = helper._PluginPackageManager__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
 
         assert not success
         assert "压缩包内容为空" == message
@@ -2377,7 +3047,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as zf:
             zf.writestr("demoplugin/assets/", b"")
@@ -2389,9 +3059,9 @@ class TestPluginHelper:
             ROOT_PATH=tmp_path,
             REPO_GITHUB_HEADERS=lambda repo=None: {},
         ))
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", lambda *_args, **_kwargs: next(responses))
+        monkeypatch.setattr(helper, "_PluginPackageManager__request_with_fallback", lambda *_args, **_kwargs: next(responses))
 
-        success, message = helper._PluginHelper__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+        success, message = helper._PluginPackageManager__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
 
         assert not success
         assert "压缩包中无可写入文件" == message
@@ -2405,14 +3075,14 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         responses = iter([
             _FakeResponse(200, {"assets": [{"name": "demoplugin_v1.2.3.zip", "id": 42}]}),
             _FakeContentResponse(200, b"not a zip"),
         ])
-        monkeypatch.setattr(helper, "_PluginHelper__request_with_fallback", lambda *_args, **_kwargs: next(responses))
+        monkeypatch.setattr(helper, "_PluginPackageManager__request_with_fallback", lambda *_args, **_kwargs: next(responses))
 
-        success, message = helper._PluginHelper__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+        success, message = helper._PluginPackageManager__install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
 
         assert not success
         assert "解压 Release 压缩包失败" in message
@@ -2426,13 +3096,13 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = []
-        monkeypatch.setattr(helper, "_PluginHelper__backup_plugin", lambda _pid: "/backup")
-        monkeypatch.setattr(helper, "_PluginHelper__remove_old_plugin", lambda _pid: calls.append("remove"))
-        monkeypatch.setattr(helper, "_PluginHelper__restore_plugin", lambda _pid, _backup: calls.append("restore"))
+        monkeypatch.setattr(helper, "_PluginPackageManager__backup_plugin", lambda _pid: "/backup")
+        monkeypatch.setattr(helper, "_PluginPackageManager__remove_old_plugin", lambda _pid: calls.append("remove"))
+        monkeypatch.setattr(helper, "_PluginPackageManager__restore_plugin", lambda _pid, _backup: calls.append("restore"))
 
-        success, message = helper._PluginHelper__install_flow_sync(
+        success, message = helper._PluginPackageManager__install_flow_sync(
             PLUGIN_ID, False, lambda: (False, "prepare failed")
         )
 
@@ -2449,18 +3119,18 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = []
-        monkeypatch.setattr(helper, "_PluginHelper__backup_plugin", lambda _pid: "/backup")
-        monkeypatch.setattr(helper, "_PluginHelper__remove_old_plugin", lambda _pid: calls.append("remove"))
-        monkeypatch.setattr(helper, "_PluginHelper__restore_plugin", lambda _pid, _backup: calls.append("restore"))
+        monkeypatch.setattr(helper, "_PluginPackageManager__backup_plugin", lambda _pid: "/backup")
+        monkeypatch.setattr(helper, "_PluginPackageManager__remove_old_plugin", lambda _pid: calls.append("remove"))
+        monkeypatch.setattr(helper, "_PluginPackageManager__restore_plugin", lambda _pid, _backup: calls.append("restore"))
         monkeypatch.setattr(
             helper,
-            "_PluginHelper__install_dependencies_if_required",
+            "_PluginPackageManager__install_dependencies_if_required",
             lambda _pid: (True, False, "dependency failed"),
         )
 
-        success, message = helper._PluginHelper__install_flow_sync(
+        success, message = helper._PluginPackageManager__install_flow_sync(
             PLUGIN_ID, False, lambda: (True, "")
         )
 
@@ -2468,66 +3138,134 @@ class TestPluginHelper:
         assert "dependency failed" == message
         assert ["remove", "restore"] == calls
 
-    def test_prepare_content_via_filelist_sync_preinstalls_requirements_and_downloads(self, monkeypatch):
-        """
-        文件列表安装会先尝试 requirements 预安装，再下载插件文件。
-        """
+    def test_install_flow_sync_restores_backup_for_invalid_modern_manifest(self, tmp_path, monkeypatch):
+        """现代清单无效时恢复旧插件目录。"""
+        from app.adapters.external import market as market_module
+
+        plugin_root = tmp_path / "plugins"
+        plugin_dir = plugin_root / PLUGIN_ID.lower()
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "old.txt").write_text("old", encoding="utf-8")
+        monkeypatch.setattr(market_module, "PLUGIN_DIR", plugin_root)
+        monkeypatch.setattr(market_module.settings, "CONFIG_DIR", str(tmp_path))
+
+        def prepare_content():
+            plugin_dir.mkdir(parents=True)
+            (plugin_dir / "pyproject.toml").write_text(
+                "[project]\nname = 'demo'\n",
+                encoding="utf-8",
+            )
+            return True, ""
+
+        success, message = _package_owner(
+            market_module.PluginHelper(), plugin_root=plugin_root
+        )._PluginPackageManager__install_flow_sync(
+            PLUGIN_ID,
+            False,
+            prepare_content,
+        )
+
+        assert not success
+        assert "project.version" in message
+        assert (plugin_dir / "old.txt").read_text(encoding="utf-8") == "old"
+        assert not (plugin_dir / "pyproject.toml").exists()
+
+    def test_install_dependencies_prefers_plugin_pyproject(self, tmp_path, monkeypatch):
+        """同步安装入口只消费双清单中的 pyproject。"""
+        from app.adapters.external import market as market_module
+
+        plugin_root = tmp_path / "plugins"
+        plugin_dir = plugin_root / "demoplugin"
+        plugin_dir.mkdir(parents=True)
+        pyproject_file = plugin_dir / "pyproject.toml"
+        pyproject_file.write_text(
+            '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["modern>=1"]\n',
+            encoding="utf-8",
+        )
+        (plugin_dir / "requirements.txt").write_text("legacy>=1\n", encoding="utf-8")
+        helper = _package_owner(
+            market_module.PluginHelper(), plugin_root=plugin_root
+        )
+        seen = []
+        monkeypatch.setattr(market_module, "PLUGIN_DIR", plugin_root)
+        monkeypatch.setattr(
+            helper,
+            "install_packages_with_fallback",
+            lambda path: seen.append(path) or (True, ""),
+        )
+
+        result = helper._PluginPackageManager__install_dependencies_if_required("DemoPlugin")
+
+        assert result == (True, True, "")
+        assert seen == [pyproject_file]
+
+    def test_async_install_dependencies_prefers_plugin_pyproject(self, tmp_path, monkeypatch):
+        """异步安装入口只消费双清单中的 pyproject。"""
+        from app.adapters.external import market as market_module
+
+        plugin_root = tmp_path / "plugins"
+        plugin_dir = plugin_root / "demoplugin"
+        plugin_dir.mkdir(parents=True)
+        pyproject_file = plugin_dir / "pyproject.toml"
+        pyproject_file.write_text(
+            '[project]\nname = "demo"\nversion = "1.0.0"\ndependencies = ["modern>=1"]\n',
+            encoding="utf-8",
+        )
+        (plugin_dir / "requirements.txt").write_text("legacy>=1\n", encoding="utf-8")
+        helper = _package_owner(
+            market_module.PluginHelper(), plugin_root=plugin_root
+        )
+        seen = []
+
+        async def fake_install(path, _find_links=None):
+            seen.append(path)
+            return True, ""
+
+        monkeypatch.setattr(market_module, "PLUGIN_DIR", plugin_root)
+        monkeypatch.setattr(
+            helper._health,
+            "async_install_packages_with_fallback",
+            fake_install,
+        )
+
+        result = asyncio.run(
+            helper._PluginPackageManager__async_install_dependencies_if_required("DemoPlugin")
+        )
+
+        assert result == (True, True, "")
+        assert seen == [pyproject_file]
+
+    def test_prepare_content_via_filelist_sync_downloads_dependency_manifests_once(self, monkeypatch):
+        """文件列表准备会完整下载内容，依赖由统一安装流程处理。"""
         try:
             from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = []
-        requirements = {"name": "requirements.txt", "download_url": "https://example.com/requirements.txt"}
-        file_list = [requirements, {"name": "__init__.py", "download_url": "https://example.com/__init__.py"}]
-        monkeypatch.setattr(helper, "_PluginHelper__get_file_list", lambda *_args: (file_list, ""))
+        file_list = [
+            {"name": "pyproject.toml", "download_url": "https://example.com/pyproject.toml"},
+            {"name": "requirements.txt", "download_url": "https://example.com/requirements.txt"},
+            {"name": "__init__.py", "download_url": "https://example.com/__init__.py"},
+        ]
+        monkeypatch.setattr(helper, "_PluginPackageManager__get_file_list", lambda *_args: (file_list, ""))
+
+        def fake_download(*args):
+            calls.append(args)
+            return True, ""
+
         monkeypatch.setattr(
             helper,
-            "_PluginHelper__download_and_install_requirements",
-            lambda *_args: calls.append("requirements") or (True, ""),
-        )
-        monkeypatch.setattr(
-            helper,
-            "_PluginHelper__download_files",
-            lambda *_args: calls.append("download") or (True, ""),
+            "_PluginPackageManager__download_files",
+            fake_download,
         )
 
-        success, message = helper._PluginHelper__prepare_content_via_filelist_sync("demoplugin", "demo/repo", "v2")
+        success, message = helper._PluginPackageManager__prepare_content_via_filelist_sync("demoplugin", "demo/repo", "v2")
 
         assert success
         assert "" == message
-        assert ["requirements", "download"] == calls
-
-    def test_prepare_content_via_filelist_sync_continues_when_requirements_preinstall_fails(self, monkeypatch):
-        """
-        requirements 预安装失败不阻断文件下载，最终依赖安装由统一流程兜底。
-        """
-        try:
-            from app.adapters.external.market import PluginHelper
-        except ModuleNotFoundError as exc:
-            pytest.skip(f"missing dependency: {exc}")
-
-        helper = PluginHelper()
-        calls = []
-        file_list = [{"name": "requirements.txt"}, {"name": "__init__.py"}]
-        monkeypatch.setattr(helper, "_PluginHelper__get_file_list", lambda *_args: (file_list, ""))
-        monkeypatch.setattr(
-            helper,
-            "_PluginHelper__download_and_install_requirements",
-            lambda *_args: calls.append("requirements") or (False, "preinstall failed"),
-        )
-        monkeypatch.setattr(
-            helper,
-            "_PluginHelper__download_files",
-            lambda *_args: calls.append("download") or (True, ""),
-        )
-
-        success, message = helper._PluginHelper__prepare_content_via_filelist_sync("demoplugin", "demo/repo", "v2")
-
-        assert success
-        assert "" == message
-        assert ["requirements", "download"] == calls
+        assert calls == [("demoplugin", file_list, "demo/repo", "v2")]
 
     def test_prepare_content_via_filelist_sync_reports_missing_file_list(self, monkeypatch):
         """
@@ -2538,13 +3276,43 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
-        monkeypatch.setattr(helper, "_PluginHelper__get_file_list", lambda *_args: ([], "list failed"))
+        helper = _package_owner(PluginHelper())
+        monkeypatch.setattr(helper, "_PluginPackageManager__get_file_list", lambda *_args: ([], "list failed"))
 
-        success, message = helper._PluginHelper__prepare_content_via_filelist_sync("demoplugin", "demo/repo", "v2")
+        success, message = helper._PluginPackageManager__prepare_content_via_filelist_sync("demoplugin", "demo/repo", "v2")
 
         assert not success
         assert "list failed" == message
+
+    def test_prepare_content_via_filelist_sync_names_missing_plugin(self, monkeypatch):
+        """同步文件列表层规范化路径 ID，并在源码目录缺失时保留原插件 ID。"""
+        try:
+            from app.adapters.external.market import PluginHelper
+        except ModuleNotFoundError as exc:
+            pytest.skip(f"missing dependency: {exc}")
+
+        helper = _package_owner(PluginHelper())
+        requested_ids = []
+
+        def fake_file_list(pid, *_args):
+            requested_ids.append(pid)
+            return None, "插件源码目录不存在"
+
+        monkeypatch.setattr(
+            helper,
+            "_PluginPackageManager__get_file_list",
+            fake_file_list,
+        )
+
+        success, message = helper._PluginPackageManager__prepare_content_via_filelist_sync(
+            PLUGIN_ID,
+            "demo/repo",
+            "v2",
+        )
+
+        assert not success
+        assert message == "DemoPlugin 插件源码目录不存在"
+        assert requested_ids == ["demoplugin"]
 
     def test_prepare_content_via_filelist_sync_returns_download_error(self, monkeypatch):
         """
@@ -2555,51 +3323,47 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
-        monkeypatch.setattr(helper, "_PluginHelper__get_file_list", lambda *_args: ([{"name": "__init__.py"}], ""))
-        monkeypatch.setattr(helper, "_PluginHelper__download_files", lambda *_args: (False, "download failed"))
+        helper = _package_owner(PluginHelper())
+        monkeypatch.setattr(helper, "_PluginPackageManager__get_file_list", lambda *_args: ([{"name": "__init__.py"}], ""))
+        monkeypatch.setattr(helper, "_PluginPackageManager__download_files", lambda *_args: (False, "download failed"))
 
-        success, message = helper._PluginHelper__prepare_content_via_filelist_sync("demoplugin", "demo/repo", "v2")
+        success, message = helper._PluginPackageManager__prepare_content_via_filelist_sync("demoplugin", "demo/repo", "v2")
 
         assert not success
         assert "download failed" == message
 
-    def test_async_prepare_content_via_filelist_preinstalls_requirements_and_downloads(self, monkeypatch):
-        """
-        异步文件列表安装会先尝试 requirements 预安装，再下载插件文件。
-        """
+    def test_async_prepare_content_via_filelist_downloads_dependency_manifests_once(self, monkeypatch):
+        """异步文件列表准备会完整下载内容，依赖由统一安装流程处理。"""
         try:
             from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = []
-        requirements = {"name": "requirements.txt", "download_url": "https://example.com/requirements.txt"}
-        file_list = [requirements, {"name": "__init__.py", "download_url": "https://example.com/__init__.py"}]
+        file_list = [
+            {"name": "pyproject.toml", "download_url": "https://example.com/pyproject.toml"},
+            {"name": "requirements.txt", "download_url": "https://example.com/requirements.txt"},
+            {"name": "__init__.py", "download_url": "https://example.com/__init__.py"},
+        ]
 
         async def fake_file_list(*_args):
             return file_list, ""
 
-        async def fake_requirements(*_args):
-            calls.append("requirements")
+        async def fake_download(*args):
+            calls.append(args)
             return True, ""
 
-        async def fake_download(*_args):
-            calls.append("download")
-            return True, ""
-
-        monkeypatch.setattr(helper, "_PluginHelper__async_get_file_list", fake_file_list)
-        monkeypatch.setattr(helper, "_PluginHelper__async_download_and_install_requirements", fake_requirements)
-        monkeypatch.setattr(helper, "_PluginHelper__async_download_files", fake_download)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_get_file_list", fake_file_list)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_download_files", fake_download)
 
         success, message = asyncio.run(
-            helper._PluginHelper__prepare_content_via_filelist_async("demoplugin", "demo/repo", "v2")
+            helper._PluginPackageManager__prepare_content_via_filelist_async("demoplugin", "demo/repo", "v2")
         )
 
         assert success
         assert "" == message
-        assert ["requirements", "download"] == calls
+        assert calls == [("demoplugin", file_list, "demo/repo", "v2")]
 
     def test_async_prepare_content_via_filelist_reports_missing_file_list(self, monkeypatch):
         """
@@ -2610,19 +3374,51 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
 
         async def fake_file_list(*_args):
             return [], "list failed"
 
-        monkeypatch.setattr(helper, "_PluginHelper__async_get_file_list", fake_file_list)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_get_file_list", fake_file_list)
 
         success, message = asyncio.run(
-            helper._PluginHelper__prepare_content_via_filelist_async("demoplugin", "demo/repo", "v2")
+            helper._PluginPackageManager__prepare_content_via_filelist_async("demoplugin", "demo/repo", "v2")
         )
 
         assert not success
         assert "list failed" == message
+
+    def test_async_prepare_content_via_filelist_names_missing_plugin(self, monkeypatch):
+        """异步文件列表层规范化路径 ID，并在源码目录缺失时保留原插件 ID。"""
+        try:
+            from app.adapters.external.market import PluginHelper
+        except ModuleNotFoundError as exc:
+            pytest.skip(f"missing dependency: {exc}")
+
+        helper = _package_owner(PluginHelper())
+        requested_ids = []
+
+        async def fake_file_list(pid, *_args):
+            requested_ids.append(pid)
+            return None, "插件源码目录不存在"
+
+        monkeypatch.setattr(
+            helper,
+            "_PluginPackageManager__async_get_file_list",
+            fake_file_list,
+        )
+
+        success, message = asyncio.run(
+            helper._PluginPackageManager__prepare_content_via_filelist_async(
+                PLUGIN_ID,
+                "demo/repo",
+                "v2",
+            )
+        )
+
+        assert not success
+        assert message == "DemoPlugin 插件源码目录不存在"
+        assert requested_ids == ["demoplugin"]
 
     def test_async_prepare_content_via_filelist_returns_download_error(self, monkeypatch):
         """
@@ -2633,7 +3429,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
 
         async def fake_file_list(*_args):
             return [{"name": "__init__.py"}], ""
@@ -2641,11 +3437,11 @@ class TestPluginHelper:
         async def fake_download(*_args):
             return False, "download failed"
 
-        monkeypatch.setattr(helper, "_PluginHelper__async_get_file_list", fake_file_list)
-        monkeypatch.setattr(helper, "_PluginHelper__async_download_files", fake_download)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_get_file_list", fake_file_list)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_download_files", fake_download)
 
         success, message = asyncio.run(
-            helper._PluginHelper__prepare_content_via_filelist_async("demoplugin", "demo/repo", "v2")
+            helper._PluginPackageManager__prepare_content_via_filelist_async("demoplugin", "demo/repo", "v2")
         )
 
         assert not success
@@ -2660,7 +3456,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = []
 
         async def backup(_pid):
@@ -2675,11 +3471,11 @@ class TestPluginHelper:
         async def prepare():
             return False, "prepare failed"
 
-        monkeypatch.setattr(helper, "_PluginHelper__async_backup_plugin", backup)
-        monkeypatch.setattr(helper, "_PluginHelper__async_remove_old_plugin", remove)
-        monkeypatch.setattr(helper, "_PluginHelper__async_restore_plugin", restore)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_backup_plugin", backup)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_remove_old_plugin", remove)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_restore_plugin", restore)
 
-        success, message = asyncio.run(helper._PluginHelper__install_flow_async(PLUGIN_ID, False, prepare))
+        success, message = asyncio.run(helper._PluginPackageManager__install_flow_async(PLUGIN_ID, False, prepare))
 
         assert not success
         assert "prepare failed" == message
@@ -2694,7 +3490,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         calls = []
 
         async def backup(_pid):
@@ -2712,12 +3508,12 @@ class TestPluginHelper:
         async def dependencies(_pid):
             return True, False, "dependency failed"
 
-        monkeypatch.setattr(helper, "_PluginHelper__async_backup_plugin", backup)
-        monkeypatch.setattr(helper, "_PluginHelper__async_remove_old_plugin", remove)
-        monkeypatch.setattr(helper, "_PluginHelper__async_restore_plugin", restore)
-        monkeypatch.setattr(helper, "_PluginHelper__async_install_dependencies_if_required", dependencies)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_backup_plugin", backup)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_remove_old_plugin", remove)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_restore_plugin", restore)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_install_dependencies_if_required", dependencies)
 
-        success, message = asyncio.run(helper._PluginHelper__install_flow_async(PLUGIN_ID, False, prepare))
+        success, message = asyncio.run(helper._PluginPackageManager__install_flow_async(PLUGIN_ID, False, prepare))
 
         assert not success
         assert "dependency failed" == message
@@ -2732,15 +3528,15 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
 
         async def fake_request(*_args, **_kwargs):
             return _FakeResponse(200, {"assets": [{"name": "other.zip", "id": 1}]})
 
-        monkeypatch.setattr(helper, "_PluginHelper__async_request_with_fallback", fake_request)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_request_with_fallback", fake_request)
 
         success, message = asyncio.run(
-            helper._PluginHelper__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+            helper._PluginPackageManager__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
         )
 
         assert not success
@@ -2755,19 +3551,48 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
 
         async def fake_request(*_args, **_kwargs):
             return _FakeResponse(404)
 
-        monkeypatch.setattr(helper, "_PluginHelper__async_request_with_fallback", fake_request)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_request_with_fallback", fake_request)
 
         success, message = asyncio.run(
-            helper._PluginHelper__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+            helper._PluginPackageManager__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
         )
 
         assert not success
-        assert "获取 Release 信息失败：404" == message
+        assert "DemoPlugin_v1.2.3 插件发布包不存在" == message
+
+    def test_async_get_file_list_reports_missing_plugin_directory(self, monkeypatch):
+        """异步源码目录读取将 HTTP 404 收敛为稳定业务语义。"""
+        try:
+            from app.adapters.external.market import PluginHelper
+        except ModuleNotFoundError as exc:
+            pytest.skip(f"missing dependency: {exc}")
+
+        helper = _package_owner(PluginHelper())
+
+        async def fake_request(*_args, **_kwargs):
+            return _FakeResponse(404)
+
+        monkeypatch.setattr(
+            helper,
+            "_PluginPackageManager__async_request_with_fallback",
+            fake_request,
+        )
+
+        file_list, message = asyncio.run(
+            helper._PluginPackageManager__async_get_file_list(
+                PLUGIN_ID,
+                "demo/repo",
+                "v2",
+            )
+        )
+
+        assert file_list is None
+        assert message == "插件源码目录不存在"
 
     def test_async_install_from_release_reports_missing_asset_id(self, monkeypatch):
         """
@@ -2778,15 +3603,15 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
 
         async def fake_request(*_args, **_kwargs):
             return _FakeResponse(200, {"assets": [{"name": "demoplugin_v1.2.3.zip"}]})
 
-        monkeypatch.setattr(helper, "_PluginHelper__async_request_with_fallback", fake_request)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_request_with_fallback", fake_request)
 
         success, message = asyncio.run(
-            helper._PluginHelper__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+            helper._PluginPackageManager__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
         )
 
         assert not success
@@ -2801,7 +3626,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         responses = iter([
             _FakeResponse(200, {"assets": [{"name": "demoplugin_v1.2.3.zip", "id": 42}]}),
             _FakeResponse(502),
@@ -2810,10 +3635,10 @@ class TestPluginHelper:
         async def fake_request(*_args, **_kwargs):
             return next(responses)
 
-        monkeypatch.setattr(helper, "_PluginHelper__async_request_with_fallback", fake_request)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_request_with_fallback", fake_request)
 
         success, message = asyncio.run(
-            helper._PluginHelper__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+            helper._PluginPackageManager__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
         )
 
         assert not success
@@ -2839,7 +3664,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         responses = iter([
             _FakeResponse(200, {"assets": [{"name": "demoplugin_v1.2.3.zip", "id": 42}]}),
             _FakeContentResponse(200, _build_release_zip_member(member_name, symlink=symlink)),
@@ -2849,10 +3674,10 @@ class TestPluginHelper:
             return next(responses)
 
         _patch_release_install_settings(monkeypatch, tmp_path)
-        monkeypatch.setattr(helper, "_PluginHelper__async_request_with_fallback", fake_request)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_request_with_fallback", fake_request)
 
         success, message = asyncio.run(
-            helper._PluginHelper__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+            helper._PluginPackageManager__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
         )
 
         assert not success
@@ -2867,12 +3692,13 @@ class TestPluginHelper:
         异步 release zip 带顶层插件目录时剥离该层后写入运行目录。
         """
         try:
-            from app.runtime.config import settings
             from app.adapters.external.market import PluginHelper
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(
+            PluginHelper(), plugin_root=tmp_path / "app" / "plugins"
+        )
         responses = iter([
             _FakeResponse(200, {"assets": [{"name": "demoplugin_v1.2.3.zip", "id": 42}]}),
             _FakeContentResponse(200, _build_zip({"demoplugin/__init__.py": b"plugin"})),
@@ -2885,10 +3711,10 @@ class TestPluginHelper:
             ROOT_PATH=tmp_path,
             REPO_GITHUB_HEADERS=lambda repo=None: {},
         ))
-        monkeypatch.setattr(helper, "_PluginHelper__async_request_with_fallback", fake_request)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_request_with_fallback", fake_request)
 
         success, message = asyncio.run(
-            helper._PluginHelper__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+            helper._PluginPackageManager__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
         )
 
         assert success
@@ -2904,7 +3730,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         responses = iter([
             _FakeResponse(200, {"assets": [{"name": "demoplugin_v1.2.3.zip", "id": 42}]}),
             _FakeContentResponse(200, _build_zip({})),
@@ -2913,10 +3739,10 @@ class TestPluginHelper:
         async def fake_request(*_args, **_kwargs):
             return next(responses)
 
-        monkeypatch.setattr(helper, "_PluginHelper__async_request_with_fallback", fake_request)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_request_with_fallback", fake_request)
 
         success, message = asyncio.run(
-            helper._PluginHelper__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+            helper._PluginPackageManager__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
         )
 
         assert not success
@@ -2931,7 +3757,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        helper = PluginHelper()
+        helper = _package_owner(PluginHelper())
         responses = iter([
             _FakeResponse(200, {"assets": [{"name": "demoplugin_v1.2.3.zip", "id": 42}]}),
             _FakeContentResponse(200, b"not a zip"),
@@ -2940,10 +3766,10 @@ class TestPluginHelper:
         async def fake_request(*_args, **_kwargs):
             return next(responses)
 
-        monkeypatch.setattr(helper, "_PluginHelper__async_request_with_fallback", fake_request)
+        monkeypatch.setattr(helper, "_PluginPackageManager__async_request_with_fallback", fake_request)
 
         success, message = asyncio.run(
-            helper._PluginHelper__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
+            helper._PluginPackageManager__async_install_from_release(PLUGIN_ID, "demo/repo", "DemoPlugin_v1.2.3")
         )
 
         assert not success
@@ -2958,7 +3784,7 @@ class TestPluginHelper:
         except ModuleNotFoundError as exc:
             pytest.skip(f"missing dependency: {exc}")
 
-        success, message = PluginHelper().install("DemoPlugin", "local://OtherPlugin?path=/tmp/plugins")
+        success, message = _package_owner(PluginHelper()).install_raw("DemoPlugin", "local://OtherPlugin?path=/tmp/plugins")
 
         assert not success
         assert "本地插件来源与插件ID不匹配" == message

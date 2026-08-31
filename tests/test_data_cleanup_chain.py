@@ -2,24 +2,24 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.application.database import DatabaseGovernance, configure_database_governance
+from app.application.maintenance import (
+    DataCleanupService,
+    read_cleanup_policy,
+)
 from app.db import Base
-from app.db.models.downloadhistory import DownloadHistory, DownloadFiles
+from app.db.maintenance import DatabaseCleanupRepository
+from app.db.models.downloadhistory import DownloadFiles, DownloadHistory
 from app.db.models.message import Message
 from app.db.models.siteuserdata import SiteUserData
 from app.db.models.transferhistory import TransferHistory
 from app.runtime.config import settings
 from app.scheduler import SchedulerChain
-from app.application.maintenance import (
-    DataCleanupService,
-    configure_cleanup_service_factory,
-    read_cleanup_policy,
-)
-from app.db.maintenance import DatabaseCleanupRepository
 
 
 class DataCleanupChainTest(unittest.TestCase):
@@ -51,13 +51,17 @@ class DataCleanupChainTest(unittest.TestCase):
         return patch.multiple(settings, **defaults)
 
     def _configure_cleanup_service(self):
-        """把当前测试数据库注入清理应用服务，替代旧的 SessionFactory 打桩。"""
-        configure_cleanup_service_factory(
-            lambda: DataCleanupService(
+        """把当前测试数据库注入统一数据库治理门面。"""
+        configure_database_governance(
+            DatabaseGovernance(
+                health=MagicMock(),
+                backup=MagicMock(),
+                cleanup=DataCleanupService(
                 repository=DatabaseCleanupRepository(
                     session_factory=self.SessionFactory,
                 ),
                 policy_reader=read_cleanup_policy,
+                ),
             )
         )
 

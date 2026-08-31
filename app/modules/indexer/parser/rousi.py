@@ -1,20 +1,21 @@
 # -*- coding: utf-8 -*-
 import json
-from urllib.parse import urljoin
 from typing import Optional, Tuple
+from urllib.parse import urljoin
 
-from app.runtime.log import logger
-from app.runtime.config import settings
 from app.adapters.network.http import RequestUtils
 from app.domain import site as site_rules
 from app.foundation import temporal as time_tools
 from app.modules.indexer.parser import SiteParserBase, SiteSchema
+from app.runtime.log import logger
+from app.runtime.settings import get_runtime_setting
 
 
 class RousiSiteUserInfo(SiteParserBase):
     """
-    Rousi.pro 站点解析器
-    使用 API v1 接口，通过 Passkey (Bearer Token) 进行认证
+    Rousi.pro PeerGo 用户数据解析器。
+
+    使用具有 profile:read 权限的个人 API Key 访问兼容资料接口。
     """
     schema = SiteSchema.RousiPro
     request_mode = "apikey"
@@ -22,10 +23,10 @@ class RousiSiteUserInfo(SiteParserBase):
     def _parse_site_page(self, html_text: str):
         """
         配置 API 请求地址和请求头
-        使用 API v1 的 /profile 接口获取用户信息
+        使用 PeerGo MoviePilot 兼容的 /profile 接口获取用户信息。
         """
         self._base_url = f"https://{site_rules.extract_domain(self._site_url)}"
-        self._user_basic_page = "api/v1/profile?include_fields[user]=seeding_leeching_data"
+        self._user_basic_page = "api/v1/profile"
         self._user_basic_params = {}
         self._user_basic_headers = {
             "Content-Type": "application/json",
@@ -83,13 +84,18 @@ class RousiSiteUserInfo(SiteParserBase):
             logger.error(f"{self._site_name} JSON 解析失败")
             return
 
-        if not data or data.get("code") != 0:
-            self.err_msg = data.get("message", "未知错误")
-            logger.warn(f"{self._site_name} API 错误: {self.err_msg}")
+        if not isinstance(data, dict):
+            self.err_msg = "用户数据响应结构无效"
+            logger.warning(f"{self._site_name} API 响应结构无效")
+            return
+
+        if data.get("code") != 0:
+            self.err_msg = str(data.get("message") or "未知错误")
+            logger.warning(f"{self._site_name} API 错误: {self.err_msg}")
             return
 
         user_info = data.get("data")
-        if not user_info:
+        if not isinstance(user_info, dict):
             return
 
         # 基本信息
@@ -98,7 +104,12 @@ class RousiSiteUserInfo(SiteParserBase):
         self.user_level = user_info.get("level_text") or user_info.get("role_text")
 
         # 注册时间：统一格式为 YYYY-MM-DD HH:MM:SS
-        join_at = time_tools.normalize_datetime(user_info.get("registered_at"))
+        registered_at = user_info.get("registered_at")
+        join_at = (
+            time_tools.normalize_datetime(registered_at)
+            if isinstance(registered_at, str)
+            else None
+        )
         if join_at:
             # 确保格式为 YYYY-MM-DD HH:MM:SS (19位)
             if len(join_at) >= 19:
@@ -193,7 +204,7 @@ class RousiSiteUserInfo(SiteParserBase):
             res = RequestUtils(
                 headers=headers,
                 timeout=60,
-                proxies=settings.PROXY if self._proxy else None
+                proxies=get_runtime_setting('PROXY') if self._proxy else None
             ).get_res(
                 url=urljoin(self._base_url, "api/messages"),
                 params=params
@@ -229,7 +240,7 @@ class RousiSiteUserInfo(SiteParserBase):
         RequestUtils(
             headers=headers,
             timeout=60,
-            proxies=settings.PROXY if self._proxy else None
+            proxies=get_runtime_setting('PROXY') if self._proxy else None
         ).post_res(
             url=urljoin(self._base_url, "api/messages/read-all")
         )

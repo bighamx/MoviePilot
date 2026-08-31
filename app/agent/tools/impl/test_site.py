@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 from app.agent.tools.base import MoviePilotTool
 from app.agent.tools.tags import ToolTag
 from app.chain.site import SiteChain
-from app.application.agentdata import SitePort as SiteOper
+from app.domain import site as site_rules
 from app.runtime.log import logger
 
 
@@ -30,15 +30,18 @@ class TestSiteTool(MoviePilotTool):
         site_identifier = kwargs.get("site_identifier")
         return f"测试站点连通性: {site_identifier}"
 
-    @staticmethod
-    def _test_site_sync(site_identifier: int) -> tuple[Optional[str], Optional[str], bool, str]:
+    def _test_site_sync(
+        self,
+        site_identifier: int,
+    ) -> tuple[Optional[str], Optional[str], bool, str]:
         """在同步线程里执行站点联通测试，避免网络请求卡住事件循环。"""
-        site = SiteOper().get(site_identifier)
+        site = self.data.sites.get(site_identifier)
         if not site:
             return None, None, False, f"未找到站点：{site_identifier}，请使用 query_sites 工具查询可用的站点"
 
-        status, message = SiteChain().test(site.domain)
-        return site.name, site.domain, status, message
+        domain = site.domain or site_rules.extract_domain(site.url)
+        status, message = SiteChain().test(domain)
+        return site.name, domain, status, message
 
     async def run(self, site_identifier: int, **kwargs) -> str:
         logger.info(f"执行工具: {self.name}, 参数: site_identifier={site_identifier}")

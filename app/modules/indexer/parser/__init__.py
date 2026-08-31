@@ -6,14 +6,12 @@ from enum import Enum
 from typing import Optional
 from urllib.parse import urljoin, urlsplit
 
-from requests import Session
-
-from app.runtime.config import settings
 from app.adapters.network.cloudflare import under_challenge
-from app.runtime.log import logger
 from app.adapters.network.http import RequestUtils
 from app.domain.site import SiteUtils
 from app.foundation import size as size_tools
+from app.runtime.log import logger
+from app.runtime.settings import get_runtime_setting
 
 
 # 站点框架
@@ -55,7 +53,7 @@ class SiteParserBase(metaclass=ABCMeta):
                  site_cookie: str,
                  apikey: str,
                  token: str,
-                 session: Session = None,
+                 request_utils: Optional[RequestUtils] = None,
                  ua: Optional[str] = None,
                  emulate: bool = False,
                  proxy: bool = None,
@@ -68,7 +66,7 @@ class SiteParserBase(metaclass=ABCMeta):
         :param site_cookie: 站点 Cookie
         :param apikey: 站点 API Key
         :param token: 站点 Token
-        :param session: 可复用的 HTTP 会话
+        :param request_utils: 可复用的统一 HTTP 请求客户端
         :param ua: 请求 User-Agent
         :param emulate: 是否使用浏览器仿真
         :param proxy: 是否使用系统代理
@@ -86,7 +84,7 @@ class SiteParserBase(metaclass=ABCMeta):
         self._base_url = f"{__split_url.scheme}://{__split_url.netloc}"
         self._site_cookie = site_cookie
         self._api_url = api_url
-        self._session = session if session else None
+        self._request_utils = request_utils or RequestUtils(use_session=True)
         self._ua = ua
         self._emulate = emulate
         self._proxy = proxy
@@ -169,7 +167,7 @@ class SiteParserBase(metaclass=ABCMeta):
         self._torrent_seeding_headers = None
 
         # 错误信息
-        self.err_msg = None
+        self.err_msg: Optional[str] = None
 
     def site_schema(self) -> SiteSchema:
         """
@@ -226,7 +224,7 @@ class SiteParserBase(metaclass=ABCMeta):
                     )
                 )
             # 解析用户未读消息
-            if settings.SITE_MESSAGE:
+            if get_runtime_setting('SITE_MESSAGE'):
                 self._pase_unread_msgs()
             # 解析用户上传、下载、分享率等信息
             if self._user_traffic_page:
@@ -344,7 +342,7 @@ class SiteParserBase(metaclass=ABCMeta):
         :return:
         """
         req_headers = None
-        proxies = settings.PROXY if self._proxy else None
+        proxies = get_runtime_setting('PROXY') if self._proxy else None
         if self._ua or headers or self._addition_headers:
 
             if self.request_mode == "apikey":
@@ -367,31 +365,39 @@ class SiteParserBase(metaclass=ABCMeta):
         if self.request_mode == "apikey":
             # 使用apikey请求，通过请求头传递
             cookie = None
-            session = None
+            request_utils = RequestUtils()
         else:
             # 使用cookie请求
             cookie = self._site_cookie
-            session = self._session
+            request_utils = self._request_utils
 
         if method == "post" or params:
             if (req_headers or {}).get("Content-Type") == "application/json":
-                res = RequestUtils(cookies=cookie,
-                                   session=session,
-                                   timeout=60,
-                                   proxies=proxies,
-                                   headers=req_headers).post_res(url=url, json=params or {})
+                res = request_utils.post_res(
+                    url=url,
+                    json=params or {},
+                    cookies=cookie,
+                    timeout=60,
+                    proxies=proxies,
+                    headers=req_headers,
+                )
             else:
-                res = RequestUtils(cookies=cookie,
-                                   session=session,
-                                   timeout=60,
-                                   proxies=proxies,
-                                   headers=req_headers).post_res(url=url, data=params or {})
+                res = request_utils.post_res(
+                    url=url,
+                    data=params or {},
+                    cookies=cookie,
+                    timeout=60,
+                    proxies=proxies,
+                    headers=req_headers,
+                )
         else:
-            res = RequestUtils(cookies=cookie,
-                               session=session,
-                               timeout=60,
-                               proxies=proxies,
-                               headers=req_headers).get_res(url=url)
+            res = request_utils.get_res(
+                url=url,
+                cookies=cookie,
+                timeout=60,
+                proxies=proxies,
+                headers=req_headers,
+            )
         if res is not None and res.status_code in (200, 500, 403):
             if req_headers and "application/json" in str(req_headers.get("Accept")):
                 try:
@@ -406,8 +412,8 @@ class SiteParserBase(metaclass=ABCMeta):
                         f"{self._site_name} 检测到Cloudflare，请更新Cookie和UA")
                     return ""
                 return RequestUtils.get_decoded_html_content(res,
-                                                             settings.ENCODING_DETECTION_PERFORMANCE_MODE,
-                                                             settings.ENCODING_DETECTION_MIN_CONFIDENCE)
+                                                             get_runtime_setting('ENCODING_DETECTION_PERFORMANCE_MODE'),
+                                                             get_runtime_setting('ENCODING_DETECTION_MIN_CONFIDENCE'))
 
         return ""
 
@@ -429,7 +435,7 @@ class SiteParserBase(metaclass=ABCMeta):
         """
         pass
 
-    def _parse_logged_in(self, html_text):
+    def _parse_logged_in(self, html_text: str) -> bool:
         """
         解析用户是否已经登陆
         :param html_text:
@@ -484,9 +490,7 @@ class SiteParserBase(metaclass=ABCMeta):
         """
         关闭会话
         """
-        if self._session:
-            self._session.close()
-            self._session = None
+        self._request_utils.close()
 
     def clear(self):
         """

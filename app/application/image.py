@@ -1,20 +1,130 @@
 import io
+import threading
+from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional, List
+from typing import Any, Callable, List, Optional, Protocol
 
 from PIL import Image
 
-from app.runtime.cache import cached, FileCache, AsyncFileCache
-from app.runtime.config import settings
-from app.runtime.log import logger
-from app.adapters.network.http import RequestUtils, AsyncRequestUtils
-from app.adapters.network.ip import IpUtils
+from app.application.configuration import get_chain_runtime_config_snapshot
 from app.application.security.url import SecurityUtils
 from app.foundation.singleton import Singleton
-
+from app.runtime.cache import AsyncFileCache, FileCache, cached
+from app.runtime.log import logger
 
 WallpaperProvider = Callable[[], Optional[str]]
 WallpaperListProvider = Callable[[int], List[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class _ImageFetchRequest:
+    """冻结同步与异步图片获取共用的缓存键和传输参数。"""
+
+    url: str
+    cache_path: str
+    use_cache: bool
+
+
+class ImageResponsePort(Protocol):
+    """图片应用服务消费的最小 HTTP 响应契约。"""
+
+    status_code: int
+    content: bytes
+    headers: Mapping[str, str]
+
+    def json(self) -> Any:
+        """返回响应 JSON 载荷。"""
+        ...
+
+
+class ImageTransport(Protocol):
+    """图片与壁纸读取所需的同步、异步 GET 端口。"""
+
+    def get(
+        self,
+        url: str,
+        *,
+        options: Mapping[str, Any],
+    ) -> Optional[ImageResponsePort]:
+        """同步读取远端图片或壁纸响应。"""
+        ...
+
+    async def async_get(
+        self,
+        url: str,
+        *,
+        options: Mapping[str, Any],
+    ) -> Optional[ImageResponsePort]:
+        """异步读取远端图片响应。"""
+        ...
+
+
+class InternalAddressPort(Protocol):
+    """判断 URL 是否指向无需代理的内部地址。"""
+
+    def is_internal(self, url: str) -> bool:
+        """返回 URL 是否属于内部地址。"""
+        ...
+
+
+_image_port_lock = threading.Lock()
+_image_transport: Optional[ImageTransport] = None
+_internal_address: Optional[InternalAddressPort] = None
+
+
+def _clear_wallpaper_caches() -> None:
+    """清除依赖外部 provider 或 transport 的壁纸函数缓存。"""
+    for method_name in (
+        "get_tmdb_wallpaper",
+        "get_tmdb_wallpapers",
+        "get_bing_wallpaper",
+        "get_bing_wallpapers",
+        "get_mediaserver_wallpaper",
+        "get_mediaserver_wallpapers",
+        "get_customize_wallpaper",
+        "get_customize_wallpapers",
+    ):
+        cache_clear = getattr(getattr(WallpaperHelper, method_name), "cache_clear", None)
+        if callable(cache_clear):
+            cache_clear()
+
+
+def configure_image_ports(
+    *,
+    transport: ImageTransport,
+    internal_address: InternalAddressPort,
+) -> tuple[Optional[ImageTransport], Optional[InternalAddressPort]]:
+    """由启动组合根装配图片 I/O 端口，并清除旧实现产生的壁纸缓存。"""
+    global _image_transport, _internal_address
+    with _image_port_lock:
+        previous = (_image_transport, _internal_address)
+        _image_transport = transport
+        _internal_address = internal_address
+        _clear_wallpaper_caches()
+    return previous
+
+
+def reset_image_ports(
+    transport: Optional[ImageTransport] = None,
+    internal_address: Optional[InternalAddressPort] = None,
+) -> None:
+    """恢复指定图片端口；省略参数时回到未装配状态并清缓存。"""
+    global _image_transport, _internal_address
+    with _image_port_lock:
+        _image_transport = transport
+        _internal_address = internal_address
+        _clear_wallpaper_caches()
+
+
+def _image_ports_snapshot() -> tuple[ImageTransport, InternalAddressPort]:
+    """读取一致的图片端口快照，未装配时稳定失败。"""
+    with _image_port_lock:
+        transport = _image_transport
+        internal_address = _internal_address
+    if transport is None or internal_address is None:
+        raise RuntimeError("图片网络端口尚未由启动组合根装配")
+    return transport, internal_address
 
 
 def _empty_wallpaper_provider() -> Optional[str]:
@@ -53,6 +163,20 @@ def configure_wallpaper_providers(
     _tmdb_wallpaper_list_provider = tmdb_wallpapers
     _mediaserver_wallpaper_provider = mediaserver_wallpaper
     _mediaserver_wallpaper_list_provider = mediaserver_wallpapers
+    _clear_wallpaper_caches()
+
+
+def reset_wallpaper_providers() -> None:
+    """恢复空壁纸来源并清除旧 lifespan 产生的壁纸缓存。"""
+    global _tmdb_wallpaper_provider
+    global _tmdb_wallpaper_list_provider
+    global _mediaserver_wallpaper_provider
+    global _mediaserver_wallpaper_list_provider
+    _tmdb_wallpaper_provider = _empty_wallpaper_provider
+    _tmdb_wallpaper_list_provider = _empty_wallpaper_list_provider
+    _mediaserver_wallpaper_provider = _empty_wallpaper_provider
+    _mediaserver_wallpaper_list_provider = _empty_wallpaper_list_provider
+    _clear_wallpaper_caches()
 
 
 class WallpaperHelper(metaclass=Singleton):
@@ -64,13 +188,16 @@ class WallpaperHelper(metaclass=Singleton):
         """
         获取登录页面壁纸
         """
-        if settings.WALLPAPER == "bing":
+        wallpaper = get_chain_runtime_config_snapshot().wallpaper
+        if wallpaper == "bing":
             return self.get_bing_wallpaper()
-        elif settings.WALLPAPER == "mediaserver":
+        elif wallpaper == "mediaserver":
             return self.get_mediaserver_wallpaper()
-        elif settings.WALLPAPER == "customize":
+        elif wallpaper == "customize":
             return self.get_customize_wallpaper()
-        elif settings.WALLPAPER == "tmdb":
+        elif wallpaper == "static":
+            return self.get_static_wallpaper()
+        elif wallpaper == "tmdb":
             return self.get_tmdb_wallpaper()
         return ''
 
@@ -78,15 +205,27 @@ class WallpaperHelper(metaclass=Singleton):
         """
         获取登录页面壁纸列表
         """
-        if settings.WALLPAPER == "bing":
+        wallpaper = get_chain_runtime_config_snapshot().wallpaper
+        if wallpaper == "bing":
             return self.get_bing_wallpapers(num)
-        elif settings.WALLPAPER == "mediaserver":
+        elif wallpaper == "mediaserver":
             return self.get_mediaserver_wallpapers(num)
-        elif settings.WALLPAPER == "customize":
+        elif wallpaper == "customize":
             return self.get_customize_wallpapers()
-        elif settings.WALLPAPER == "tmdb":
+        elif wallpaper == "static":
+            return self.get_static_wallpapers()
+        elif wallpaper == "tmdb":
             return self.get_tmdb_wallpapers(num)
         return []
+
+    def get_static_wallpaper(self) -> Optional[str]:
+        """原样返回前端可访问的静态壁纸地址。"""
+        return get_chain_runtime_config_snapshot().wallpaper_image_url
+
+    def get_static_wallpapers(self) -> List[str]:
+        """以单项列表返回静态壁纸，确保前端沿用统一的列表契约。"""
+        wallpaper = self.get_static_wallpaper()
+        return [wallpaper] if wallpaper else []
 
     @cached(maxsize=1, ttl=3600)
     def get_tmdb_wallpaper(self) -> Optional[str]:
@@ -108,7 +247,8 @@ class WallpaperHelper(metaclass=Singleton):
         获取Bing每日壁纸
         """
         url = "https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n=1"
-        resp = RequestUtils(timeout=5).get_res(url)
+        transport, _ = _image_ports_snapshot()
+        resp = transport.get(url, options={"timeout": 5})
         if resp and resp.status_code == 200:
             try:
                 result = resp.json()
@@ -125,7 +265,8 @@ class WallpaperHelper(metaclass=Singleton):
         获取7天的Bing每日壁纸
         """
         url = f"https://cn.bing.com/HPImageArchive.aspx?format=js&idx=0&n={num}"
-        resp = RequestUtils(timeout=5).get_res(url)
+        transport, _ = _image_ports_snapshot()
+        resp = transport.get(url, options={"timeout": 5})
         if resp and resp.status_code == 200:
             try:
                 result = resp.json()
@@ -190,19 +331,24 @@ class WallpaperHelper(metaclass=Singleton):
             return _result
 
         # 判断是否存在自定义壁纸api
-        if settings.CUSTOMIZE_WALLPAPER_API_URL:
+        config = get_chain_runtime_config_snapshot()
+        if config.customize_wallpaper_api_url:
             wallpaper_list = []
-            resp = RequestUtils(timeout=15).get_res(settings.CUSTOMIZE_WALLPAPER_API_URL)
+            transport, _ = _image_ports_snapshot()
+            resp = transport.get(
+                config.customize_wallpaper_api_url,
+                options={"timeout": 15},
+            )
             if resp and resp.status_code == 200:
                 # 如果返回的是图片格式
                 content_type = resp.headers.get('Content-Type')
                 if content_type and content_type.lower().startswith('image/'):
-                    wallpaper_list.append(settings.CUSTOMIZE_WALLPAPER_API_URL)
+                    wallpaper_list.append(config.customize_wallpaper_api_url)
                 else:
                     try:
                         result = resp.json()
                         if isinstance(result, list) or isinstance(result, dict) or isinstance(result, str):
-                            wallpaper_list = find_files_with_suffixes(result, settings.SECURITY_IMAGE_SUFFIXES)
+                            wallpaper_list = find_files_with_suffixes(result, config.security_image_suffixes)
                     except Exception as err:
                         print(str(err))
             return wallpaper_list
@@ -215,8 +361,9 @@ class ImageHelper(metaclass=Singleton):
 
     def __init__(self):
         """按全局图片缓存天数初始化文件缓存。"""
-        _base_path = settings.CACHE_PATH
-        _ttl = settings.GLOBAL_IMAGE_CACHE_DAYS * 24 * 3600
+        config = get_chain_runtime_config_snapshot()
+        _base_path = config.cache_path
+        _ttl = config.global_image_cache_days * 24 * 3600
         self.file_cache = FileCache(base=_base_path, ttl=_ttl)
         self.async_file_cache = AsyncFileCache(base=_base_path, ttl=_ttl)
 
@@ -260,17 +407,58 @@ class ImageHelper(metaclass=Singleton):
     def _get_request_params(url: str, proxy: Optional[bool], cookies: Optional[str | dict]) -> dict:
         """获取参数"""
         referer = "https://movie.douban.com/" if "doubanio.com" in url else None
+        config = get_chain_runtime_config_snapshot()
         if proxy is None:
-            proxies = settings.PROXY if not (referer or IpUtils.is_internal(url)) else None
+            _, internal_address = _image_ports_snapshot()
+            proxies = (
+                config.proxy if not (referer or internal_address.is_internal(url)) else None
+            )
         else:
-            proxies = settings.PROXY if proxy else None
+            proxies = config.proxy if proxy else None
         return {
-            "ua": settings.NORMAL_USER_AGENT,
+            "ua": config.normal_user_agent,
             "proxies": proxies,
             "referer": referer,
             "cookies": cookies,
             "accept_type": "image/avif,image/webp,image/apng,*/*",
         }
+
+    @staticmethod
+    def _fetch_request(
+        url: str,
+        proxy: Optional[bool],
+        use_cache: bool,
+        cookies: Optional[str | dict[str, str]],
+    ) -> Optional[_ImageFetchRequest]:
+        """统一空 URL 拒绝、缓存键和远端传输参数生成。"""
+        if not url:
+            return None
+        return _ImageFetchRequest(
+            url=url,
+            cache_path=ImageHelper._prepare_cache_path(url),
+            use_cache=use_cache,
+        )
+
+    def _cached_image(
+        self, content: Optional[bytes]
+    ) -> Optional[tuple[bytes, str]]:
+        """缓存内容只读取格式头，返回可直接复用的图片结果。"""
+        if not content:
+            return None
+        mime_type = self.get_image_mime_type(content, verify=False)
+        return (content, mime_type) if mime_type else None
+
+    def _fetched_image(
+        self,
+        request: _ImageFetchRequest,
+        response: Optional[ImageResponsePort],
+    ) -> Optional[tuple[bytes, str]]:
+        """统一远端状态码与图片内容校验，拒绝结果不得进入缓存。"""
+        if response is None or response.status_code != 200:
+            logger.warn(f"Failed to fetch image from URL: {request.url}")
+            return None
+        mime_type = self.get_image_mime_type(response.content)
+        return (response.content, mime_type) if mime_type else None
 
     def fetch_image(
         self,
@@ -301,34 +489,29 @@ class ImageHelper(metaclass=Singleton):
 
         网络响应在写入缓存前完整验证一次；缓存命中仅重新识别格式头。
         """
-        if not url:
+        request = ImageHelper._fetch_request(url, proxy, use_cache, cookies)
+        if request is None:
             return None
-
-        cache_path = self._prepare_cache_path(url)
-
-        # 检查缓存
-        if use_cache:
-            content = self.file_cache.get(cache_path, region="images")
-            if content:
-                mime_type = self.get_image_mime_type(content, verify=False)
-                if mime_type:
-                    return content, mime_type
-
-        # 请求远程图片
-        params = self._get_request_params(url, proxy, cookies)
-        response = RequestUtils(**params).get_res(url=url)
-        if response is None or response.status_code != 200:
-            logger.warn(f"Failed to fetch image from URL: {url}")
+        if request.use_cache:
+            cached_result = self._cached_image(
+                self.file_cache.get(request.cache_path, region="images")
+            )
+            if cached_result is not None:
+                return cached_result
+        transport, _ = _image_ports_snapshot()
+        result = self._fetched_image(
+            request,
+            transport.get(
+                request.url,
+                options=ImageHelper._get_request_params(
+                    request.url, proxy, cookies
+                ),
+            ),
+        )
+        if result is None:
             return None
-
-        content = response.content
-        mime_type = self.get_image_mime_type(content)
-        if not mime_type:
-            return None
-
-        # 保存缓存
-        self.file_cache.set(cache_path, content, region="images")
-        return content, mime_type
+        self.file_cache.set(request.cache_path, result[0], region="images")
+        return result
 
     async def async_fetch_image(
         self,
@@ -359,31 +542,28 @@ class ImageHelper(metaclass=Singleton):
 
         网络响应在写入缓存前完整验证一次；缓存命中仅重新识别格式头。
         """
-        if not url:
+        request = ImageHelper._fetch_request(url, proxy, use_cache, cookies)
+        if request is None:
             return None
-
-        cache_path = self._prepare_cache_path(url)
-
-        # 检查缓存
-        if use_cache:
-            content = await self.async_file_cache.get(cache_path, region="images")
-            if content:
-                mime_type = self.get_image_mime_type(content, verify=False)
-                if mime_type:
-                    return content, mime_type
-
-        # 请求远程图片
-        params = self._get_request_params(url, proxy, cookies)
-        response = await AsyncRequestUtils(**params).get_res(url=url)
-        if response is None or response.status_code != 200:
-            logger.warn(f"Failed to fetch image from URL: {url}")
+        if request.use_cache:
+            cached_result = self._cached_image(
+                await self.async_file_cache.get(request.cache_path, region="images")
+            )
+            if cached_result is not None:
+                return cached_result
+        transport, _ = _image_ports_snapshot()
+        result = self._fetched_image(
+            request,
+            await transport.async_get(
+                request.url,
+                options=ImageHelper._get_request_params(
+                    request.url, proxy, cookies
+                ),
+            ),
+        )
+        if result is None:
             return None
-
-        content = response.content
-        mime_type = self.get_image_mime_type(content)
-        if not mime_type:
-            return None
-
-        # 保存缓存
-        await self.async_file_cache.set(cache_path, content, region="images")
-        return content, mime_type
+        await self.async_file_cache.set(
+            request.cache_path, result[0], region="images"
+        )
+        return result

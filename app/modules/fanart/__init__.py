@@ -4,8 +4,10 @@ from typing import Optional, Tuple, Union
 
 from app.runtime.cache import cached
 from app.domain.context import MediaInfo
-from app.runtime.config import settings
+from app.runtime.settings import get_runtime_setting
+
 from app.runtime.log import logger
+from app.runtime.tasks import get_task_registry
 from app.modules import _ModuleBase
 from app.schemas.types import MediaType, ModuleType, OtherModulesType
 from app.adapters.network.http import RequestUtils, AsyncRequestUtils
@@ -306,14 +308,14 @@ class FanartModule(_ModuleBase):
     """
 
     # 代理
-    _proxies: dict = settings.PROXY
+    _proxies: dict = get_runtime_setting('PROXY')
 
     # Fanart Api
     _movie_url: str = (
-        f"https://webservice.fanart.tv/v3/movies/%s?api_key={settings.FANART_API_KEY}"
+        f"https://webservice.fanart.tv/v3/movies/%s?api_key={get_runtime_setting('FANART_API_KEY')}"
     )
     _tv_url: str = (
-        f"https://webservice.fanart.tv/v3/tv/%s?api_key={settings.FANART_API_KEY}"
+        f"https://webservice.fanart.tv/v3/tv/%s?api_key={get_runtime_setting('FANART_API_KEY')}"
     )
 
     def init_module(self) -> None:
@@ -448,7 +450,7 @@ class FanartModule(_ModuleBase):
         """
         获取 Fanart 查询参数
         """
-        if not settings.FANART_ENABLE:
+        if not get_runtime_setting('FANART_ENABLE'):
             return None
         if not mediainfo.tmdb_id and not mediainfo.tvdb_id:
             return None
@@ -529,7 +531,7 @@ class FanartModule(_ModuleBase):
         """
         其他图片，优先环境变量指定语言，再like最多
         """
-        lang_env = settings.FANART_LANG
+        lang_env = get_runtime_setting('FANART_LANG')
         if lang_env:
             langs = [lang.strip() for lang in lang_env.split(",") if lang.strip()]
             for lang in langs:
@@ -579,7 +581,7 @@ class FanartModule(_ModuleBase):
         return cls._FANART_NAME_MAP.get(fanart_name.lower(), fanart_name)
 
     @classmethod
-    @cached(maxsize=settings.CONF.fanart, ttl=settings.CONF.meta, shared_key="get")
+    @cached(maxsize=get_runtime_setting('CONF').fanart, ttl=get_runtime_setting('CONF').meta, shared_key="get")
     def __request_fanart(
         cls, media_type: MediaType, queryid: Union[str, int]
     ) -> Optional[dict]:
@@ -598,7 +600,7 @@ class FanartModule(_ModuleBase):
             return None
 
     @classmethod
-    @cached(maxsize=settings.CONF.fanart, ttl=settings.CONF.meta, shared_key="get")
+    @cached(maxsize=get_runtime_setting('CONF').fanart, ttl=get_runtime_setting('CONF').meta, shared_key="get")
     async def __async_request_fanart(
         cls, media_type: MediaType, queryid: Union[str, int]
     ) -> Optional[dict]:
@@ -624,16 +626,22 @@ class FanartModule(_ModuleBase):
             return cls._movie_url % queryid
         return cls._tv_url % queryid
 
-    def clear_cache(self):
-        """
-        清除缓存
-        """
+    def clear_cache(self) -> None:
+        """清理同步缓存，并由宿主登记运行中事件循环的异步清理。"""
         logger.info(f"开始清除{self.get_name()}缓存 ...")
         self.__request_fanart.cache_clear()
         async_cache_clear = self.__async_request_fanart.cache_clear()
         try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(async_cache_clear)
+            asyncio.get_running_loop()
         except RuntimeError:
             asyncio.run(async_cache_clear)
+        else:
+            try:
+                get_task_registry().create(
+                    async_cache_clear,
+                    owner="module.fanart.cache_clear",
+                )
+            except RuntimeError:
+                # 关停阶段拒绝新 owner 时，同步缓存已清理且登记器会关闭 coroutine。
+                return
         logger.info(f"{self.get_name()}缓存清除完成")

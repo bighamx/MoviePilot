@@ -2,30 +2,28 @@ import math
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from app.chain import ChainBase
-from app.chain.download import DownloadChain
-from app.chain.media import MediaChain
-from app.chain.search import SearchChain
-from app.chain.subscribe import SubscribeChain
 from app.application.directory import DirectoryHelper
 from app.application.messaging.media import (
     PendingMediaInteraction,
     media_interaction_manager,
 )
-from app.application.torrent import TorrentHelper
-from app.application.chain.data import UserPortProxy as UserOper
+from app.application.torrent.download import TorrentHelper
+from app.chain.base import ChainBase
+from app.chain.download import DownloadChain
+from app.chain.media import MediaChain
+from app.chain.search.facade import SearchChain
+from app.chain.subscribe.facade import SubscribeChain
 from app.domain import episode as episode_rules
 from app.domain import title as title_rules
 from app.domain.context import Context, MediaInfo
 from app.domain.meta.metabase import MetaBase
 from app.foundation import url as url_tools
-from app.runtime.config import settings
 from app.runtime.log import logger
 from app.schemas.download import DownloadDirectory
 from app.schemas.file import FileURI
+from app.schemas.media import build_media_key, resolve_media_identity
 from app.schemas.mediaserver import NotExistMediaInfo
 from app.schemas.message import Message
-from app.schemas.media import build_media_key, resolve_media_identity
 from app.schemas.notification import ChannelCapabilityManager
 from app.schemas.system import TransferDirectoryConf
 from app.schemas.types import MediaType, NotificationChannel
@@ -670,7 +668,9 @@ class MediaInteractionChain(ChainBase):
                 return
 
         mp_name = (
-            UserOper().get_name(**{f"{channel.name.lower()}_userid": userid})
+            self.user_repository.find_name_by_bindings(
+                {f"{channel.name.lower()}_userid": userid}
+            )
             if channel
             else None
         )
@@ -683,7 +683,7 @@ class MediaInteractionChain(ChainBase):
             season=request.meta.begin_season,
             channel=channel,
             source=source,
-            userid=userid,
+            userid=str(userid),
             username=mp_name or username,
             best_version=best_version,
         )
@@ -981,7 +981,9 @@ class MediaInteractionChain(ChainBase):
             note = None
 
         mp_name = (
-            UserOper().get_name(**{f"{channel.name.lower()}_userid": userid})
+            self.user_repository.find_name_by_bindings(
+                {f"{channel.name.lower()}_userid": userid}
+            )
             if channel
             else None
         )
@@ -994,7 +996,7 @@ class MediaInteractionChain(ChainBase):
             season=request.meta.begin_season,
             channel=channel,
             source=source,
-            userid=userid,
+            userid=str(userid),
             username=mp_name or username,
             state="R",
             note=note,
@@ -1130,7 +1132,7 @@ class MediaInteractionChain(ChainBase):
                 source=source,
                 title=title,
                 userid=userid,
-                link=settings.MP_DOMAIN("#/resource"),
+                link=self.runtime_config.resource_url,
                 buttons=buttons,
                 original_message_id=original_message_id,
                 original_chat_id=original_chat_id,
@@ -1533,12 +1535,11 @@ class MediaInteractionChain(ChainBase):
             for sea, no_exist in season_map.items()
         ]
 
-    @staticmethod
-    def _should_auto_download(userid: Union[str, int]) -> bool:
+    def _should_auto_download(self, userid: Union[str, int]) -> bool:
         """
         判断当前用户是否命中自动下载名单。
         """
-        auto_download_user = settings.AUTO_DOWNLOAD_USER
+        auto_download_user = self.runtime_config.auto_download_user
         return bool(
             auto_download_user
             and (

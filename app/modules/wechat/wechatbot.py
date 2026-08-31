@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import json
 import pickle
@@ -5,22 +6,22 @@ import re
 import threading
 import time
 import uuid
-import base64
-from typing import Optional, List, Dict, Tuple, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 import websocket
 from Crypto.Cipher import AES
 
-from app.runtime.cache import FileCache
-from app.runtime.config import settings
-from app.domain.context import MediaInfo, Context
-from app.domain.metainfo import MetaInfo
+from app.adapters.network.http import RequestUtils
 from app.application.messaging.agent import matches_channel_admin
+from app.application.messaging.ingress import submit_message_to_host
+from app.domain.context import Context, MediaInfo
+from app.domain.metainfo import MetaInfo
+from app.foundation import size as size_tools
+from app.runtime.cache import FileCache
 from app.runtime.log import logger
+from app.runtime.thread import ThreadHelper
 from app.schemas.message import IncomingMessage
 from app.schemas.types import NotificationChannel
-from app.adapters.network.http import RequestUtils
-from app.foundation import size as size_tools
 
 
 class WeChatBot:
@@ -32,9 +33,10 @@ class WeChatBot:
     """
 
     _default_ws_url = "wss://openws.work.weixin.qq.com"
-    _ds_url = f"http://127.0.0.1:{settings.PORT}/api/v1/message?token={settings.API_TOKEN}"
     _heartbeat_interval = 30
     _ack_timeout = 10
+    _gateway_join_timeout_seconds = 5
+    _heartbeat_join_timeout_seconds = 2
 
     def __init__(self,
                  WECHAT_BOT_ID: Optional[str] = None,
@@ -123,7 +125,8 @@ class WeChatBot:
         self._heartbeat_thread.start()
         logger.info(f"企业微信智能机器人长连接已启动：{self._config_name}")
 
-    def stop(self) -> None:
+    def stop(self) -> bool:
+        """停止网关与心跳线程，并返回两个 owner 是否均已终止。"""
         self._stop_event.set()
         self._authenticated.clear()
         if self._ws_app:
@@ -131,10 +134,27 @@ class WeChatBot:
                 self._ws_app.close()
             except Exception as err:
                 logger.debug(f"关闭企业微信智能机器人连接失败：{err}")
-        if self._ws_thread and self._ws_thread.is_alive():
-            self._ws_thread.join(timeout=5)
-        if self._heartbeat_thread and self._heartbeat_thread.is_alive():
-            self._heartbeat_thread.join(timeout=2)
+        ws_thread = self._ws_thread
+        heartbeat_thread = self._heartbeat_thread
+        if (
+            ws_thread
+            and ws_thread.is_alive()
+            and ws_thread is not threading.current_thread()
+        ):
+            ws_thread.join(timeout=self._gateway_join_timeout_seconds)
+        if (
+            heartbeat_thread
+            and heartbeat_thread.is_alive()
+            and heartbeat_thread is not threading.current_thread()
+        ):
+            heartbeat_thread.join(timeout=self._heartbeat_join_timeout_seconds)
+        converged = not any(
+            thread and thread.is_alive()
+            for thread in (ws_thread, heartbeat_thread)
+        )
+        if not converged:
+            logger.error("企业微信智能机器人线程未在关闭预算内退出")
+        return converged
 
     def get_state(self) -> bool:
         return self._ready and self._authenticated.is_set()
@@ -510,18 +530,13 @@ class WeChatBot:
         )
         self._forward_to_message_chain(payload)
 
-    def _forward_to_message_chain(self, payload: dict) -> None:
-        def _run():
-            try:
-                # 回调
-                RequestUtils(timeout=15).post_res(
-                    f"http://127.0.0.1:{settings.PORT}/api/v1/message?token={settings.API_TOKEN}&source={self._config_name}",
-                    json=payload
-                )
-            except Exception as err:
-                logger.error(f"企业微信智能机器人转发消息失败：{err}")
-
-        threading.Thread(target=_run, daemon=True).start()
+    def _forward_to_message_chain(self, payload: dict) -> bool:
+        """通过受管线程池把企业微信 payload 转交统一消息入口。"""
+        return submit_message_to_host(
+            payload,
+            self._config_name,
+            submit=ThreadHelper().submit,
+        )
 
     @staticmethod
     def _normalize_target(userid: Optional[str], default_chat_id: Optional[str]) -> Tuple[Optional[str], int]:

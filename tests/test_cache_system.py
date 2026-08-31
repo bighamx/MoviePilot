@@ -2,8 +2,10 @@ import asyncio
 import os
 import threading
 import time
-from types import SimpleNamespace
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock
+
+import pytest
 
 from app.adapters.cache.backends import (
     AsyncFileBackend,
@@ -11,15 +13,17 @@ from app.adapters.cache.backends import (
     FileBackend,
     RedisBackend,
 )
+from app.adapters.cache.redis import AsyncRedisHelper, RedisHelper, serialize
 from app.runtime.cache import (
     AsyncFileCache,
     AsyncMemoryBackend,
     FileCache,
     MemoryBackend,
+    TTLCache,
     cached,
 )
 from app.runtime.config import settings
-from app.adapters.cache.redis import AsyncRedisHelper, RedisHelper, serialize
+
 
 def test_file_backend_items_keep_relative_keys_and_bytes(tmp_path):
     """
@@ -38,7 +42,7 @@ def test_clear_package_tool_cache_only_removes_pip_and_uv_old_files(tmp_path, mo
     """
     包安装工具缓存清理只处理 pip/uv 子目录，不接管整个 .cache 或业务缓存。
     """
-    from app.startup.modules_initializer import clear_package_tool_cache
+    from app.startup.initializers.modules import clear_package_tool_cache
 
     old_time = time.time() - 40 * 24 * 3600
     cache_root = tmp_path / ".cache"
@@ -66,7 +70,7 @@ def test_clear_package_tool_cache_disabled_when_days_non_positive(tmp_path, monk
     """
     PACKAGE_CACHE_DAYS 小于等于 0 时不清理包安装缓存。
     """
-    from app.startup.modules_initializer import clear_package_tool_cache
+    from app.startup.initializers.modules import clear_package_tool_cache
 
     old_time = time.time() - 40 * 24 * 3600
     old_pip = tmp_path / ".cache" / "pip" / "old.whl"
@@ -86,7 +90,7 @@ def test_clear_package_tool_cache_isolates_subdir_errors(tmp_path, monkeypatch):
     """
     单个工具缓存目录清理失败，不影响另一个工具缓存目录。
     """
-    from app.startup.modules_initializer import clear_package_tool_cache
+    from app.startup.initializers.modules import clear_package_tool_cache
 
     calls = []
 
@@ -98,7 +102,7 @@ def test_clear_package_tool_cache_isolates_subdir_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "CONFIG_DIR", str(tmp_path))
     monkeypatch.setattr(settings, "PACKAGE_CACHE_ROOT", str(tmp_path / "custom-package-cache"))
     monkeypatch.setattr(settings, "PACKAGE_CACHE_DAYS", 30)
-    monkeypatch.setattr("app.startup.modules_initializer.SystemUtils.clear", fake_clear)
+    monkeypatch.setattr("app.startup.initializers.modules.SystemUtils.clear", fake_clear)
 
     clear_package_tool_cache()
 
@@ -108,7 +112,7 @@ def test_clear_package_tool_cache_uses_package_cache_root(tmp_path, monkeypatch)
     """
     PACKAGE_CACHE_ROOT 用作 pip/uv 清理根目录，不扩大到配置目录下其他缓存。
     """
-    from app.startup.modules_initializer import clear_package_tool_cache
+    from app.startup.initializers.modules import clear_package_tool_cache
 
     old_time = time.time() - 40 * 24 * 3600
     package_cache_root = tmp_path / "custom-package-cache"
@@ -132,7 +136,7 @@ def test_init_modules_does_not_clear_package_tool_cache(monkeypatch):
     """
     包安装缓存清理由通用临时清理入口触发，模块启动路径不直接执行清理。
     """
-    from app.startup import modules_initializer
+    from app.startup.initializers import modules as modules_initializer
 
     called = False
 
@@ -143,18 +147,14 @@ def test_init_modules_does_not_clear_package_tool_cache(monkeypatch):
 
     monkeypatch.setattr(modules_initializer, "clear_package_tool_cache", fail_if_called)
     monkeypatch.setattr(modules_initializer, "init_managed_resources", lambda: None)
-    monkeypatch.setattr(modules_initializer, "DohHelper", lambda: None)
+    monkeypatch.setattr(modules_initializer, "configure_doh_composition", lambda: None)
     monkeypatch.setattr(modules_initializer, "SitesHelper", lambda: None)
-    monkeypatch.setattr(
-        modules_initializer,
-        "ResourceHelper",
-        lambda: SimpleNamespace(check=lambda: False),
-    )
+    monkeypatch.setattr(modules_initializer, "update_resources", lambda: None)
     monkeypatch.setattr(modules_initializer, "user_auth", lambda: None)
     monkeypatch.setattr(modules_initializer, "ModuleManager", lambda: None)
     monkeypatch.setattr(modules_initializer.EventManager, "start", lambda self: None)
-    monkeypatch.setattr(modules_initializer.MoviePilotServerHelper, "init_plugin_report", lambda: None)
-    monkeypatch.setattr(modules_initializer.MoviePilotServerHelper, "init_subscribe_report", lambda: None)
+    monkeypatch.setattr(modules_initializer.MoviePilotServerHelper, "async_init_plugin_report", AsyncMock())
+    monkeypatch.setattr(modules_initializer.MoviePilotServerHelper, "async_init_subscribe_report", AsyncMock())
     monkeypatch.setattr(modules_initializer.MoviePilotServerHelper, "get_user_uuid", lambda: None)
     monkeypatch.setattr(modules_initializer.MoviePilotServerHelper, "get_github_user", lambda: None)
     init_agent = AsyncMock()
@@ -162,7 +162,13 @@ def test_init_modules_does_not_clear_package_tool_cache(monkeypatch):
     monkeypatch.setattr(modules_initializer, "start_frontend", lambda: None)
     monkeypatch.setattr(modules_initializer, "check_auth", lambda: None)
 
-    asyncio.run(modules_initializer.init_modules())
+    async def initialize_modules() -> None:
+        try:
+            await modules_initializer.init_modules()
+        finally:
+            await modules_initializer.stop_database_runtime()
+
+    asyncio.run(initialize_modules())
 
     assert called is False
     init_agent.assert_awaited_once_with()
@@ -303,6 +309,39 @@ def test_cached_zero_ttl_does_not_cache_async_result():
         return await load_value(), await load_value()
 
     assert asyncio.run(run_test()) == (1, 2)
+
+
+def test_cached_ttl_provider_resolves_current_value_for_each_write():
+    """动态 TTL 工厂应在每次写入时读取新快照，而不是在导入期固化。"""
+    state = {"ttl": 10}
+    calls = 0
+
+    @cached(region="sync_dynamic_ttl", ttl_provider=lambda: state["ttl"])
+    def load_value():
+        nonlocal calls
+        calls += 1
+        return calls
+
+    assert load_value() == 1
+    region_cache = MemoryBackend._region_caches[
+        MemoryBackend.get_region("sync_dynamic_ttl")
+    ]
+    started_at = region_cache.timer()
+    region_cache.expire(time=started_at + 11)
+
+    state["ttl"] = 30
+    assert load_value() == 2
+    region_cache.expire(time=started_at + 20)
+    assert load_value() == 2
+
+
+def test_cached_rejects_fixed_and_dynamic_ttl_together():
+    """固定 TTL 与动态 TTL 同时存在时应在装饰阶段明确拒绝。"""
+    with pytest.raises(ValueError, match="不能同时设置"):
+
+        @cached(ttl=10, ttl_provider=lambda: 20)
+        def load_value():
+            return 1
 
 
 def test_cached_empty_ttl_expires_empty_result_sooner_sync():
@@ -677,6 +716,112 @@ def test_redis_helper_pop_uses_atomic_getdel():
 
     assert value == {"challenge": "value"}
     assert calls == ["region:passkey_challenge:key:token"]
+
+
+def test_redis_helper_strict_consume_propagates_backend_failure():
+    """严格领取必须区分 Redis 故障与键不存在，旧 pop 仍保持兼容返回值。"""
+    class FailingClient:
+        """模拟 GETDEL 连接故障。"""
+
+        def getdel(self, _key):
+            """报告 Redis 命令失败。"""
+            raise ConnectionError("redis unavailable")
+
+    helper = RedisHelper()
+    helper.client = FailingClient()
+    try:
+        with pytest.raises(ConnectionError, match="redis unavailable"):
+            helper.consume("token", region="passkey_challenge")
+        assert helper.pop("token", region="passkey_challenge") is None
+    finally:
+        helper.client = None
+
+
+def test_redis_helper_strict_store_requires_backend_acknowledgement():
+    """严格写入不得把 Redis 未确认写入当成成功签发。"""
+    class RejectingClient:
+        """模拟 Redis 拒绝确认 SET。"""
+
+        def set(self, *_args, **_kwargs):
+            """返回未写入状态。"""
+            return False
+
+    helper = RedisHelper()
+    helper.client = RejectingClient()
+    try:
+        with pytest.raises(RuntimeError, match="not acknowledged"):
+            helper.store("token", "challenge", region="passkey_challenge")
+        helper.set("token", "challenge", region="passkey_challenge")
+    finally:
+        helper.client = None
+
+
+def test_memory_atomic_cache_consume_has_single_winner_and_honors_ttl():
+    """内存原子缓存与 Redis 一样只允许一次领取并服从 TTL。"""
+    cache = MemoryBackend(ttl=60)
+    region = "atomic_memory_contract"
+    cache.clear(region=region)
+    cache.store("token", "challenge", region=region)
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(
+            lambda _: cache.consume("token", region=region),
+            range(8),
+        ))
+
+    assert results.count("challenge") == 1
+    assert results.count(None) == 7
+
+    cache.store("expired", "challenge", ttl=0, region=region)
+    assert cache.consume("expired", region=region) is None
+
+
+def test_ttl_cache_legacy_pop_uses_atomic_consume_contract():
+    """插件既有 TTLCache.pop 入口保持可用并获得原子领取语义。"""
+    cache = TTLCache(region="legacy_atomic_pop", maxsize=8, ttl=60)
+    cache.clear()
+    cache.set("token", "challenge")
+
+    def pop_token(_index):
+        """兼容入口不存在时返回空值，便于汇总并发结果。"""
+        try:
+            return cache.pop("token")
+        except KeyError:
+            return None
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(pop_token, range(8)))
+
+    assert results.count("challenge") == 1
+    assert results.count(None) == 7
+
+
+def test_redis_backend_strict_store_and_consume_use_atomic_helper():
+    """Redis 适配器将严格缓存契约完整委托给底层原子实现。"""
+    calls = []
+
+    class FakeHelper:
+        """记录严格 Redis 缓存调用。"""
+
+        def store(self, key, value, ttl=None, region=None, **kwargs):
+            """记录严格写入。"""
+            calls.append(("store", key, value, ttl, region, kwargs))
+
+        def consume(self, key, region=None):
+            """记录原子领取。"""
+            calls.append(("consume", key, region))
+            return "challenge"
+
+    backend = RedisBackend(ttl=60)
+    backend.redis_helper = FakeHelper()
+
+    backend.store("token", "challenge", region="passkey_challenge")
+    assert backend.consume("token", region="passkey_challenge") == "challenge"
+
+    assert calls == [
+        ("store", "token", "challenge", 60, "passkey_challenge", {}),
+        ("consume", "token", "passkey_challenge"),
+    ]
 
 
 def test_async_redis_helper_uses_blocking_pool_settings(monkeypatch):

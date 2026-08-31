@@ -5,7 +5,6 @@
 来的）、统计。查重误判会重复整理或永久漏件——挂载故障那一类问题最终就落在这张表上；
 溯源查错会让「重新整理」把不相干的文件搬走。
 """
-import asyncio
 import time as _time
 
 import pytest
@@ -401,8 +400,11 @@ def test_list_by_title_matches_async_twin(db):
 
     sync_titles = [h.title for h in TransferHistory.list_by_title(
         db.session, "ParallelSearch", count=-1)]
-    async_titles = [h.title for h in asyncio.run(TransferHistory.async_list_by_title(
-        title="ParallelSearch", count=-1))]
+    async_titles = [h.title for h in db.run_async_session(
+        lambda session: TransferHistory.async_list_by_title(
+            session, title="ParallelSearch", count=-1
+        )
+    )]
 
     assert sync_titles == async_titles
 
@@ -415,13 +417,21 @@ def test_count_and_count_by_title_match_async_twins(db):
     db.add(_hist("CountMe", status=True, src="/downloads/c1.mkv", dest="/media/c1.mkv"),
            _hist("CountMe", status=False, src="/downloads/c2.mkv", dest="/media/c2.mkv"))
 
-    assert TransferHistory.count(db.session) == asyncio.run(TransferHistory.async_count())
+    assert TransferHistory.count(db.session) == db.run_async_session(
+        TransferHistory.async_count
+    )
     assert TransferHistory.count(db.session, status=True) == \
-        asyncio.run(TransferHistory.async_count(status=True))
+        db.run_async_session(
+            lambda session: TransferHistory.async_count(session, status=True)
+        )
     assert TransferHistory.count_by_title(db.session, "CountMe") == 2
     assert TransferHistory.count_by_title(db.session, "CountMe", status=False) == 1
     assert TransferHistory.count_by_title(db.session, "CountMe") == \
-        asyncio.run(TransferHistory.async_count_by_title(title="CountMe"))
+        db.run_async_session(
+            lambda session: TransferHistory.async_count_by_title(
+                session, title="CountMe"
+            )
+        )
 
 
 def test_statistic_groups_by_day_within_the_window(db):
@@ -452,7 +462,9 @@ def test_statistic_includes_the_window_start_boundary(db, frozen_now):
     db.add(_hist("窗口起点上", src="/data/bstat.mkv", date=window_start))
 
     rows = dict(TransferHistory.statistic(db.session, days=7))
-    async_rows = dict(asyncio.run(TransferHistory.async_statistic(days=7)))
+    async_rows = dict(db.run_async_session(
+        lambda session: TransferHistory.async_statistic(session, days=7)
+    ))
 
     assert rows.get(boundary_day, 0) == 1
     assert async_rows.get(boundary_day, 0) == 1
@@ -500,6 +512,65 @@ def test_delete_before_is_batched_and_keeps_recent(db):
     assert TransferHistory.delete_before(db.session, before_time="2026-08-01", limit=100) == 0
 
     assert TransferHistory.get_by_src(db.session, "/data/recent.mkv") is not None
+
+
+def test_delete_before_preserves_current_failed_task_history(db):
+    """过期维护不得删除当前失败 pending 映射使用的历史。"""
+    durable = _hist(
+        "durable-old",
+        src="/data/durable-old.mkv",
+        date="2026-01-01 10:00:00",
+        status=False,
+    )
+    durable.transfer_task_id = "task-durable-old"
+    durable.transfer_settlement_revision = 1
+    db.add(durable)
+
+    assert TransferHistory.delete_before(
+        db.session,
+        before_time="2026-08-01",
+        limit=100,
+    ) == 0
+    assert TransferHistory.get_by_transfer_task_id(
+        db.session,
+        task_id="task-durable-old",
+    ) is not None
+
+
+def test_upsert_durable_projection_advances_to_new_same_source_task(db):
+    """同源历史只表达最新任务投影，旧任务重放身份由独立回执持有。"""
+    durable = _hist(
+        "old-task",
+        src="/data/reused.mkv",
+        date="2026-08-01 10:00:00",
+    )
+    durable.transfer_task_id = "old-task"
+    durable.transfer_settlement_revision = 1
+    db.add(durable)
+
+    projected = TransferHistory.upsert_by_transfer_task_id(
+        db.session,
+        task_id="new-task",
+        settlement_revision=1,
+        retain_task_mapping=False,
+        payload={
+            "src": "/data/reused.mkv",
+            "src_storage": "local",
+            "status": True,
+        },
+    )
+
+    assert TransferHistory.get_by_transfer_task_id(
+        db.session,
+        task_id="old-task",
+    ) is None
+    assert TransferHistory.get_by_transfer_task_id(
+        db.session,
+        task_id="new-task",
+    ) is None
+    assert projected is durable
+    assert projected.transfer_task_id is None
+    assert projected.transfer_settlement_revision is None
 
 
 def test_delete_before_keeps_the_row_exactly_at_the_boundary(db):

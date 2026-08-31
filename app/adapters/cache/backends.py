@@ -9,15 +9,16 @@ from anyio import Path as AsyncPath
 
 from app.adapters.cache.redis import AsyncRedisHelper, RedisHelper
 from app.runtime.cache import (
-    AsyncCacheBackend,
-    CacheBackend,
     DEFAULT_CACHE_REGION,
+    AsyncCacheBackend,
+    AtomicCacheBackend,
+    CacheBackend,
     configure_cache_factories,
 )
-from app.runtime.config import settings
+from app.runtime.settings import get_runtime_setting
 
 
-class RedisBackend(CacheBackend):
+class RedisBackend(AtomicCacheBackend):
     """通过同步 Redis 客户端实现缓存后端。"""
 
     def __init__(self, ttl: Optional[int] = None) -> None:
@@ -39,6 +40,29 @@ class RedisBackend(CacheBackend):
             self.redis_helper.delete(key, region=region)
             return
         self.redis_helper.set(key, value, ttl=ttl, region=region, **kwargs)
+
+    def store(
+        self,
+        key: str,
+        value: Any,
+        ttl: Optional[int] = None,
+        region: Optional[str] = DEFAULT_CACHE_REGION,
+        **kwargs: Any,
+    ) -> None:
+        """严格写入 Redis，供安全敏感的一次性状态使用。"""
+        ttl = self.ttl if ttl is None else ttl
+        if ttl is not None and ttl <= 0:
+            self.redis_helper.consume(key, region=region)
+            return
+        self.redis_helper.store(key, value, ttl=ttl, region=region, **kwargs)
+
+    def consume(
+        self,
+        key: str,
+        region: Optional[str] = DEFAULT_CACHE_REGION,
+    ) -> Optional[Any]:
+        """通过 Redis 原子命令严格领取一个缓存值。"""
+        return self.redis_helper.consume(key, region=region)
 
     def exists(
         self,
@@ -330,12 +354,14 @@ class AsyncFileBackend(AsyncCacheBackend):
 def configure_platform_cache() -> None:
     """把配置感知的 Redis 与文件适配器注册到平台缓存工厂。"""
     configure_cache_factories(
-        backend_type_provider=lambda: settings.CACHE_BACKEND_TYPE,
+        backend_type_provider=lambda: get_runtime_setting('CACHE_BACKEND_TYPE'),
         redis_factory=lambda ttl: RedisBackend(ttl=ttl),
         async_redis_factory=lambda ttl: AsyncRedisBackend(ttl=ttl),
-        file_factory=lambda base: FileBackend(base=base or settings.TEMP_PATH),
-        async_file_factory=lambda base: AsyncFileBackend(
-            base=base or settings.TEMP_PATH
+        file_factory=lambda base: FileBackend(
+            base=base or get_runtime_setting('TEMP_PATH')
         ),
-        file_ttl_provider=lambda: settings.TEMP_FILE_DAYS * 24 * 3600,
+        async_file_factory=lambda base: AsyncFileBackend(
+            base=base or get_runtime_setting('TEMP_PATH')
+        ),
+        file_ttl_provider=lambda: get_runtime_setting('TEMP_FILE_DAYS') * 24 * 3600,
     )

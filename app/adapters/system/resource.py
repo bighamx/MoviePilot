@@ -1,15 +1,15 @@
 import json
 import platform
 import sys
+import sysconfig
 from pathlib import Path
 from typing import Callable
 
-from app.runtime.config import settings
-from app.runtime.log import logger
 from app.adapters.network.http import RequestUtils
-from app.foundation.version import compare_version
 from app.adapters.system.host import SystemUtils
-
+from app.foundation.version import compare_version
+from app.runtime.log import logger
+from app.runtime.settings import get_runtime_setting
 
 ResourceVersionProvider = Callable[[], tuple[str, str]]
 
@@ -28,16 +28,22 @@ def configure_resource_version_provider(provider: ResourceVersionProvider) -> No
     _resource_version_provider = provider
 
 
+def reset_resource_version_provider() -> None:
+    """撤销当前 lifespan 的资源版本来源，恢复安全空版本。"""
+    global _resource_version_provider
+    _resource_version_provider = _unavailable_resource_versions
+
+
 class ResourceHelper:
     """
     检测和更新资源包
     """
 
-    _base_dir: Path = settings.ROOT_PATH
+    _base_dir: Path = get_runtime_setting('ROOT_PATH')
     _resource_target = Path("app/application/site")
-    _version_flag = settings.RESOURCE_VERSION_FLAG
+    _version_flag = get_runtime_setting('RESOURCE_VERSION_FLAG')
     _repo = (
-        f"{settings.GITHUB_PROXY}https://raw.githubusercontent.com/"
+        f"{get_runtime_setting('GITHUB_PROXY')}https://raw.githubusercontent.com/"
         f"jxxghp/MoviePilot-Resources/main/package.{_version_flag}.json"
     )
     _files_api = (
@@ -48,13 +54,18 @@ class ResourceHelper:
     @property
     def proxies(self):
         """返回访问 GitHub 资源时应使用的代理配置。"""
-        return None if settings.GITHUB_PROXY else settings.PROXY
+        return (
+            None
+            if get_runtime_setting('GITHUB_PROXY')
+            else get_runtime_setting('PROXY')
+        )
 
     @staticmethod
     def _get_python_version_tag() -> str:
         """返回资源文件名使用的 CPython ABI 标签。"""
         version = sys.version_info
-        return f"cp{version.major}{version.minor}"
+        free_threaded = "t" if sysconfig.get_config_var("Py_GIL_DISABLED") else ""
+        return f"cp{version.major}{version.minor}{free_threaded}"
 
     @staticmethod
     def _get_machine_tag() -> str:
@@ -86,7 +97,7 @@ class ResourceHelper:
         """读取 V3 资源清单。"""
         response = RequestUtils(
             proxies=self.proxies,
-            headers=settings.GITHUB_HEADERS,
+            headers=get_runtime_setting('GITHUB_HEADERS'),
             timeout=10,
         ).get_res(self._repo)
         return response if response and response.status_code == 200 else None
@@ -104,7 +115,7 @@ class ResourceHelper:
         :param indexer_version: 当前已加载的站点索引资源版本；省略时使用组合根注入值
         :return: 是否成功安装了需要由上层处理重启的新资源
         """
-        if not settings.AUTO_UPDATE_RESOURCE:
+        if not get_runtime_setting('AUTO_UPDATE_RESOURCE'):
             return False
         if SystemUtils.is_frozen():
             return False
@@ -159,8 +170,8 @@ class ResourceHelper:
                     if need_updates:
                         # 下载文件信息列表
                         r = RequestUtils(
-                            proxies=settings.PROXY,
-                            headers=settings.GITHUB_HEADERS,
+                            proxies=get_runtime_setting('PROXY'),
+                            headers=get_runtime_setting('GITHUB_HEADERS'),
                             timeout=30,
                         ).get_res(self._files_api)
                         if r and not r.ok:
@@ -186,11 +197,11 @@ class ResourceHelper:
                             if item.get("download_url"):
                                 logger.info(f"开始更新资源文件：{file_name} ...")
                                 download_url = (
-                                    f"{settings.GITHUB_PROXY}{item.get('download_url')}"
+                                    f"{get_runtime_setting('GITHUB_PROXY')}{item.get('download_url')}"
                                 )
                                 res = RequestUtils(
                                     proxies=self.proxies,
-                                    headers=settings.GITHUB_HEADERS,
+                                    headers=get_runtime_setting('GITHUB_HEADERS'),
                                     timeout=180,
                                 ).get_res(download_url)
                                 if not res:

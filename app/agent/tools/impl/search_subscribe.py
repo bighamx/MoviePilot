@@ -1,14 +1,14 @@
 """搜索订阅缺失资源工具"""
 
 import json
-from typing import Optional, Type, List
+from typing import List, Optional, Type
 
 from pydantic import BaseModel, Field
 
 from app.agent.tools.base import MoviePilotTool
 from app.agent.tools.tags import ToolTag
-from app.chain.subscribe import SubscribeChain
-from app.application.agentdata import SubscribePort as SubscribeOper
+from app.application.subscription.mutation import SubscriptionActor
+from app.chain.subscribe.facade import SubscribeChain
 from app.runtime.log import logger
 from app.schemas.types import media_type_to_agent
 
@@ -57,8 +57,8 @@ class SearchSubscribeTool(MoviePilotTool):
 
         try:
             # 先验证订阅是否存在
-            subscribe_oper = SubscribeOper()
-            subscribe = subscribe_oper.get(subscribe_id)
+            repository = self.data.subscriptions
+            subscribe = await repository.async_get(subscribe_id)
 
             if not subscribe:
                 return json.dumps({
@@ -93,7 +93,14 @@ class SearchSubscribeTool(MoviePilotTool):
 
             # 如果提供了 filter_groups 参数，先更新订阅的规则组
             if filter_groups is not None:
-                subscribe_oper.update(subscribe_id, {"filter_groups": filter_groups})
+                async with self.data.subscription_mutation_scope() as mutation:
+                    await mutation.update(
+                        subscribe_id,
+                        {"filter_groups": filter_groups},
+                        SubscriptionActor(name="agent", is_superuser=True),
+                        existing=subscribe,
+                        scene="agent_search",
+                    )
                 logger.info(f"更新订阅 #{subscribe_id} 的规则组为: {filter_groups}")
 
             # 订阅搜索会触发大量同步站点访问，统一走 subscribe 线程池。
@@ -106,7 +113,7 @@ class SearchSubscribeTool(MoviePilotTool):
             )
 
             # 重新获取订阅信息以获取更新后的状态
-            updated_subscribe = subscribe_oper.get(subscribe_id)
+            updated_subscribe = await repository.async_get(subscribe_id)
             if updated_subscribe:
                 subscribe_info.update({
                     "state": updated_subscribe.state,

@@ -2,8 +2,8 @@
 
 主程序 ``tests/conftest.py`` 与各插件仓的极薄 shim（``tests/_bootstrap.py``，仅负责把
 后端定位并加入 ``sys.path``）都委托到这里，使「隔离 CONFIG_DIR / 建表 / 注入插件目录 /
-按目录打 v1·v2 marker / 退出清理」等引导逻辑只在主程序维护一处，所有消费方行为与修复一致。
-其中 :func:`isolate_config_dir` 为主程序与插件仓共用，``prepare_v1/v2_backend`` 与
+按目录打 v1·v2·v3 marker / 退出清理」等引导逻辑只在主程序维护一处，所有消费方行为与修复一致。
+其中 :func:`isolate_config_dir` 为主程序与插件仓共用，``prepare_v1/v2/v3_backend`` 与
 :func:`mark_plugin_generation` 为插件仓专用。
 
 本模块只依赖标准库，``import`` 期不触发 ``app.*``：调用方可安全地「先 import 本模块、
@@ -112,33 +112,29 @@ def isolate_config_dir() -> str:
     return tmp
 
 
-def _prepend_sys_path(path: Path) -> None:
-    """把目录前置到 ``sys.path``（去重），使其内顶层包可被导入。"""
+def _expose_plugin_source(path: Path) -> None:
+    """让插件仓源码通过生产运行时的 ``app.plugins.<id>`` 命名空间导入。"""
+    from importlib import import_module
+
+    plugins_package = import_module("app.plugins")
     value = str(path)
-    if value not in sys.path:
-        sys.path.insert(0, value)
+    if value not in plugins_package.__path__:
+        plugins_package.__path__.insert(0, value)
 
 
 def ensure_sites_stub() -> None:
-    """为 ``app.application.site.sites`` 补最小垫片（仅在缺失时）。
+    """安装确定性的站点资源垫片，隔离本机动态资源及其平台 ABI 差异。
 
-    ``app.application.site.sites`` 由独立仓库动态拉取，CI / 全新环境无该模块，而众多 ``app.chain.*`` /
-    ``app.modules.*`` 在 import 期依赖它。统一补一个最小垫片，省去各测试文件各自打桩；若真实模块
-    已存在（本地已拉取）则用真实模块、不覆盖，不影响真实行为。须在隔离 CONFIG_DIR 之后调用，
-    以免试探性 ``import app.application.site.sites`` 牵入 ``app.runtime.config``、
-    把配置路径定型到真实目录。
+    站点扩展由独立资源仓按平台下发，不属于普通单测的输入。主程序与各代插件测试必须在导入
+    业务模块前覆盖该模块；真实扩展的加载、ABI 与能力由资源专项验收负责。
     """
-    if "app.application.site.sites" in sys.modules:
-        return
-    try:
-        import app.application.site.sites  # noqa: F401  本地已拉取时用真实模块
-    except (ModuleNotFoundError, ImportError):
-        from importlib.util import spec_from_loader
-        from types import ModuleType
-        stub = ModuleType("app.application.site.sites")
-        stub.SitesHelper = _SitesHelperStub
-        stub.__spec__ = spec_from_loader("app.application.site.sites", None)
-        sys.modules["app.application.site.sites"] = stub
+    from importlib.util import spec_from_loader
+    from types import ModuleType
+
+    stub = ModuleType("app.application.site.sites")
+    setattr(stub, "SitesHelper", _SitesHelperStub)
+    stub.__spec__ = spec_from_loader("app.application.site.sites", None)
+    sys.modules["app.application.site.sites"] = stub
 
 
 def ensure_optional_stub(name: str, **attrs) -> None:
@@ -168,7 +164,7 @@ def ensure_optional_stub(name: str, **attrs) -> None:
 
 
 def prepare_backend() -> None:
-    """隔离 CONFIG_DIR、补 sites 垫片并建表（后端须已在 ``sys.path`` 上）。
+    """隔离 CONFIG_DIR、补 sites 垫片、建表并装配测试数据库能力。
 
     主程序中后端即当前包；插件仓由其 ``tests/_bootstrap.py`` shim 在 import 本模块前
     先把后端目录注入 ``sys.path``。顺序固定：先隔离 CONFIG_DIR，再补 ``app.application.site.sites`` 垫片，
@@ -177,18 +173,43 @@ def prepare_backend() -> None:
     """
     isolate_config_dir()
     ensure_sites_stub()
-    from app.startup.database_initializer import init_db
+    from app.startup.initializers.database import init_db
     init_db()
+    from app.db.adapters.transaction import TransactionalWriteRunner
+    from app.db.session import SessionFactory, async_session_scope
+    from app.db.uow import configure_transaction_runners
+
+    transaction_runner = TransactionalWriteRunner(
+        sync_session=SessionFactory,
+        async_session=async_session_scope,
+    )
+    configure_transaction_runners(
+        sync=transaction_runner.sync,
+        async_=transaction_runner.async_,
+    )
+    from app.application.service import configure_service_directory
+
+    # 共享引导不启动真实服务模块；需要具体服务实例的测试应在自身边界显式覆盖该目录。
+    configure_service_directory(
+        configs=lambda _config_key, _conf_type: [],
+        modules=lambda _module_type: [],
+    )
+    from app.db.adapters.configuration import TransactionalUserConfigurationRepository
+    from app.db.oper.systemconfig import SystemConfigOper
+
+    with SessionFactory() as session:
+        SystemConfigOper().load_snapshot(session)
+    TransactionalUserConfigurationRepository(SessionFactory).load_snapshot()
     # 缓存装饰器在测试模块导入时即创建后端，先装配隔离配置对应的适配器。
-    from app.startup.cache_initializer import configure_cache_dependencies
+    from app.startup.initializers.cache import configure_cache_dependencies
     configure_cache_dependencies()
     # 测试与生产使用同一组合入口，确保领域解析器获得隔离库和测试 settings。
-    from app.startup.domain_initializer import configure_domain_dependencies
+    from app.startup.initializers.domain import configure_domain_dependencies
     configure_domain_dependencies()
 
 
 def prepare_v2_backend(plugins_repo: Path) -> None:
-    """v2 插件单测引导：``prepare_backend`` + 把 ``<repo>/plugins.v2`` 注入 ``sys.path``。
+    """v2 插件单测引导：准备后端并暴露 ``<repo>/plugins.v2`` 源码。
 
     与 :func:`prepare_v1_backend` 互斥：v1/v2 存在同名插件包，同一进程同时加载会相互覆盖，
     须在各自独立的 pytest 会话中运行。
@@ -196,11 +217,11 @@ def prepare_v2_backend(plugins_repo: Path) -> None:
     :param plugins_repo: 插件仓根目录（由调用方 shim 传入）
     """
     prepare_backend()
-    _prepend_sys_path(Path(plugins_repo) / "plugins.v2")
+    _expose_plugin_source(Path(plugins_repo) / "plugins.v2")
 
 
 def prepare_v3_backend(plugins_repo: Path) -> None:
-    """v3 插件单测引导：``prepare_backend`` + 把 ``<repo>/plugins.v3`` 注入 ``sys.path``。
+    """v3 插件单测引导：准备后端并暴露 ``<repo>/plugins.v3`` 源码。
 
     v3 插件与旧代插件可能存在同名包，必须在独立 pytest 会话中加载，避免 Python 模块
     缓存把其它代际实现复用到当前测试进程。
@@ -208,16 +229,16 @@ def prepare_v3_backend(plugins_repo: Path) -> None:
     :param plugins_repo: 插件仓根目录（由调用方 shim 传入）
     """
     prepare_backend()
-    _prepend_sys_path(Path(plugins_repo) / "plugins.v3")
+    _expose_plugin_source(Path(plugins_repo) / "plugins.v3")
 
 
 def prepare_v1_backend(plugins_repo: Path) -> None:
-    """v1 插件单测引导：``prepare_backend`` + 把 ``<repo>/plugins`` 注入 ``sys.path``（与 v2 互斥）。
+    """v1 插件单测引导：准备后端并暴露 ``<repo>/plugins`` 源码（与 v2 互斥）。
 
     :param plugins_repo: 插件仓根目录（由调用方 shim 传入）
     """
     prepare_backend()
-    _prepend_sys_path(Path(plugins_repo) / "plugins")
+    _expose_plugin_source(Path(plugins_repo) / "plugins")
 
 
 def mark_plugin_generation(items, pytest_module) -> None:

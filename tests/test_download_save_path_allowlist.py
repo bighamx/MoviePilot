@@ -7,14 +7,21 @@ import pytest
 
 import app.agent.tools.impl.add_download_tasks as add_tasks_module
 import app.agent.tools.impl.update_download_tasks as update_tasks_module
-import app.chain.download as download_module
+import app.chain.download.existence as download_existence
+import app.chain.download.submission as download_submission
+import app.chain.download.subtitle as download_subtitle
 from app.agent.tools.impl.add_download_tasks import AddDownloadTasksTool
 from app.agent.tools.impl.update_download_tasks import UpdateDownloadTasksTool
+from app.application.directory import (
+    normalize_manual_download_save_path,
+    validate_download_save_path,
+)
 from app.chain.download import DownloadChain
 from app.domain.context import Context, MediaInfo, SubtitleInfo, TorrentInfo
 from app.domain.metainfo import MetaInfo
-from app.application.directory import validate_download_save_path
-from app.schemas import DownloaderTorrent, TransferDirectoryConf
+from app.runtime.events import eventmanager
+from app.schemas.system import TransferDirectoryConf
+from app.schemas.transfer import DownloaderTorrent
 from app.schemas.types import MediaSource, MediaType
 
 
@@ -30,7 +37,9 @@ def _mock_tmdb_supplement(monkeypatch):
             """返回原媒体对象。"""
             return media
 
-    monkeypatch.setattr(download_module, "MediaChain", _NoopMediaChain)
+    monkeypatch.setattr(download_submission, "MediaChain", _NoopMediaChain)
+    monkeypatch.setattr(download_subtitle, "MediaChain", _NoopMediaChain)
+    monkeypatch.setattr(download_existence, "MediaChain", _NoopMediaChain)
 
 
 def _download_dirs():
@@ -212,7 +221,7 @@ def test_validate_manual_download_save_path_accepts_unconfigured_absolute_path(
     expected,
 ):
     """手动下载可把任意绝对路径原样语义传给远程下载器。"""
-    assert validate_download_save_path(save_path, allow_unconfigured=True) == expected
+    assert normalize_manual_download_save_path(save_path) == expected
 
 
 @pytest.mark.parametrize(
@@ -227,7 +236,7 @@ def test_validate_manual_download_save_path_accepts_unconfigured_absolute_path(
 def test_validate_manual_download_save_path_rejects_ambiguous_path(save_path):
     """手动直传仍拒绝相对路径和跨目录写法。"""
     with pytest.raises(ValueError):
-        validate_download_save_path(save_path, allow_unconfigured=True)
+        normalize_manual_download_save_path(save_path)
 
 
 @pytest.mark.parametrize(
@@ -422,7 +431,7 @@ def _build_download_chain() -> DownloadChain:
 
 
 def test_download_single_rejects_bad_save_path_before_downloader(monkeypatch):
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
     chain = _build_download_chain()
 
     download_id, error_msg = chain.download_single(
@@ -437,10 +446,48 @@ def test_download_single_rejects_bad_save_path_before_downloader(monkeypatch):
     chain.download.assert_not_called()
 
 
+def test_manual_download_accepts_unconfigured_windows_save_path(monkeypatch):
+    """Web 手动下载可将 Windows 绝对路径直接传给远程下载器。"""
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
+
+    save_path, error_msg = DownloadChain._apply_resource_download_event(
+        context=_build_context(),
+        episodes=None,
+        channel=None,
+        source="Manual",
+        downloader="qbittorrent",
+        save_path=r"D:\Adult\Movies",
+        userid=None,
+        username="tester",
+    )
+
+    assert save_path == "D:/Adult/Movies"
+    assert error_msg is None
+
+
+def test_non_manual_download_still_rejects_unconfigured_save_path(monkeypatch):
+    """订阅和自动下载仍受已配置下载目录白名单保护。"""
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
+
+    save_path, error_msg = DownloadChain._apply_resource_download_event(
+        context=_build_context(),
+        episodes=None,
+        channel=None,
+        source="Subscribe",
+        downloader="qbittorrent",
+        save_path=r"D:\Adult\Movies",
+        userid=None,
+        username="tester",
+    )
+
+    assert save_path == r"D:\Adult\Movies"
+    assert "保存路径" in error_msg
+
+
 def test_download_single_rejects_event_overridden_bad_save_path_before_downloader(monkeypatch):
     event_data = SimpleNamespace(cancel=False, source="plugin", reason="", options={"save_path": "/etc"})
     monkeypatch.setattr(
-        download_module.eventmanager,
+        eventmanager,
         "send_event",
         lambda *args, **kwargs: SimpleNamespace(event_data=event_data),
     )
@@ -459,7 +506,7 @@ def test_download_single_rejects_event_overridden_bad_save_path_before_downloade
 
 
 def test_download_single_applies_configured_root_classification(monkeypatch):
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "app.application.directory.DirectoryHelper.get_download_dirs",
         lambda _self: _classified_download_dirs(),
@@ -480,7 +527,7 @@ def test_download_single_applies_configured_root_classification(monkeypatch):
 
 def test_download_single_accepts_legacy_remote_root_without_storage_prefix(monkeypatch):
     """旧订阅的无前缀远程根应以正确 FileURI 提交给下载模块。"""
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         "app.application.directory.DirectoryHelper.get_download_dirs",
         lambda _self: _classified_download_dirs(),
@@ -501,9 +548,9 @@ def test_download_single_accepts_legacy_remote_root_without_storage_prefix(monke
 
 @pytest.mark.parametrize("save_path", ["", "   "])
 def test_download_single_rejects_explicit_empty_save_path_before_default_fallback(monkeypatch, save_path):
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
     monkeypatch.setattr(
-        download_module.DirectoryHelper,
+        download_subtitle.DirectoryHelper,
         "get_dir",
         lambda *_args, **_kwargs: TransferDirectoryConf(storage="local", download_path="/downloads"),
     )
@@ -524,7 +571,7 @@ def test_download_single_rejects_explicit_empty_save_path_before_default_fallbac
 def test_download_single_rejects_event_empty_save_path_override_before_downloader(monkeypatch):
     event_data = SimpleNamespace(cancel=False, source="plugin", reason="", options={"save_path": ""})
     monkeypatch.setattr(
-        download_module.eventmanager,
+        eventmanager,
         "send_event",
         lambda *args, **kwargs: SimpleNamespace(event_data=event_data),
     )
@@ -571,7 +618,11 @@ def test_download_subtitle_returns_specific_error_for_bad_save_path(monkeypatch)
     media_chain = MagicMock()
     media_chain.recognize_media.return_value = mediainfo
     media_chain.supplement_tmdb_info.return_value = mediainfo
-    monkeypatch.setattr(download_module, "MediaChain", MagicMock(return_value=media_chain))
+    monkeypatch.setattr(
+        download_subtitle,
+        "MediaChain",
+        MagicMock(return_value=media_chain),
+    )
     subtitle = SubtitleInfo(
         title="Demo Movie",
         enclosure="https://example.test/subtitle.srt",
@@ -595,7 +646,7 @@ def test_resolve_media_download_dir_rejects_explicit_empty_save_path_before_defa
     save_path,
 ):
     monkeypatch.setattr(
-        download_module.DirectoryHelper,
+        download_subtitle.DirectoryHelper,
         "get_dir",
         lambda *_args, **_kwargs: TransferDirectoryConf(storage="local", download_path="/downloads"),
     )

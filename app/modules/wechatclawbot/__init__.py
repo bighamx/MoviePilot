@@ -9,7 +9,7 @@ from app.application.messaging.agent import (
     resolve_config_principal_ids,
 )
 from app.runtime.log import logger
-from app.modules._base import _MessageChannelModuleBase
+from app.modules._base.notification import _MessageChannelModuleBase
 from app.modules.wechatclawbot.wechatclawbot import WechatClawBot
 from app.schemas.message import IncomingMessage
 from app.schemas.message import Message
@@ -69,17 +69,17 @@ class WechatClawBotModule(_MessageChannelModuleBase[WechatClawBot]):
         """
         return False
 
-    def stop(self) -> None:
-        """停止模块"""
-        for client in self.get_instances().values():
-            try:
-                client.stop()
-            except Exception as err:
-                logger.error(f"停止微信 ClawBot 模块实例失败：{err}")
+    def stop(self) -> bool:
+        """停止全部微信 ClawBot 实例，并返回资源是否全部收敛。"""
+        return self._stop_service_instances()
 
     def _test_connection(self, client) -> Tuple[bool, str]:
         """微信 ClawBot 的连接探测返回 (状态, 信息)。"""
         return client.test_connection()
+
+    def _service_kwargs(self, conf) -> Dict[str, Any]:
+        """将稳定通知身份传递给 ClawBot 客户端。"""
+        return {"name": conf.name, "identity": conf.id, **conf.config}
 
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
         """初始化模块设置。"""
@@ -115,6 +115,11 @@ class WechatClawBotModule(_MessageChannelModuleBase[WechatClawBot]):
                 overwrite=bool(params.get("overwrite")),
             )
             return {"success": success, "message": message}
+
+        if action == NotificationAction.RECONCILE_CONFIG:
+            return WechatClawBot.reconcile_cached_states(
+                params.get("previous") or [], params.get("current") or []
+            )
 
         client, errmsg = self._resolve_client(params)
         if not client:
@@ -154,6 +159,11 @@ class WechatClawBotModule(_MessageChannelModuleBase[WechatClawBot]):
             for candidate in candidate_names:
                 config = self.get_config(candidate)
                 if not config:
+                    config = next(
+                        (item for item in self.get_configs().values() if item.id == candidate),
+                        None,
+                    )
+                if not config:
                     continue
                 client = self.get_instance(config.name)
                 if client:
@@ -174,10 +184,12 @@ class WechatClawBotModule(_MessageChannelModuleBase[WechatClawBot]):
     def _build_temp_client(self, params: Dict[str, Any]) -> Optional[Any]:
         """基于表单参数创建临时客户端，用于未保存配置时的扫码状态预览。"""
         source_name = str(params.get("source") or params.get("fallback_source") or "").strip()
+        fallback_name = str(params.get("fallback_source") or "").strip()
         if not source_name:
             return None
         return WechatClawBot(
-            name=source_name,
+            name=fallback_name or source_name,
+            identity=source_name,
             WECHATCLAWBOT_BASE_URL=params.get("WECHATCLAWBOT_BASE_URL"),
             WECHATCLAWBOT_DEFAULT_TARGET=params.get("WECHATCLAWBOT_DEFAULT_TARGET"),
             WECHATCLAWBOT_ADMINS=params.get("WECHATCLAWBOT_ADMINS"),

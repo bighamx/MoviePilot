@@ -3,10 +3,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.application.transfer.workflow import TransferPlanningInput
 from app.domain.context import MediaInfo
 from app.domain.meta.metavideo import MetaVideo
 from app.modules.filemanager.transhandler import TransHandler
-from app.schemas import FileItem, TransferInfo
+from app.schemas.file import FileItem
+from app.schemas.transfer import TransferInfo
 from app.schemas.types import MediaType
 
 
@@ -28,17 +30,53 @@ def _transfer_without_episode(file_name: str) -> tuple[TransferInfo, MagicMock, 
     source_oper = MagicMock()
     target_oper = MagicMock()
 
-    result = TransHandler().transfer_media(
-        fileitem=fileitem,
-        in_meta=meta,
-        mediainfo=mediainfo,
+    handler = TransHandler()
+    planning_input = TransferPlanningInput(
+        source_fileitem=fileitem.model_dump(mode="json"),
+        meta=meta.to_dict(),
+        mediainfo=mediainfo.to_dict(),
         target_storage="local",
-        target_path=Path("/library"),
-        transfer_type="copy",
-        source_oper=source_oper,
-        target_oper=target_oper,
+        target_path="/library",
+        requested_transfer_type="copy",
+        media_type=MediaType.TV.value,
+        need_scrape=False,
+        need_rename=True,
         need_notify=True,
+        preview=False,
     )
+    try:
+        checkpoint = handler.plan_transfer(
+            planning_input,
+            meta=meta,
+            mediainfo=mediainfo,
+            source_oper=source_oper,
+            target_storage="local",
+            target_path=Path("/library"),
+            transfer_type="copy",
+            need_scrape=False,
+            need_rename=True,
+            need_notify=True,
+            overwrite_mode=None,
+            episodes_info=None,
+            preview=False,
+        )
+    except ValueError as error:
+        result = TransferInfo(
+            success=False,
+            message=str(error),
+            fileitem=fileitem,
+            fail_list=[fileitem.path],
+            transfer_type="copy",
+            need_notify=True,
+        )
+    else:
+        result = handler.execute_transfer_plan(
+            checkpoint,
+            meta=meta,
+            mediainfo=mediainfo,
+            source_oper=source_oper,
+            target_oper=target_oper,
+        )
     return result, source_oper, target_oper
 
 

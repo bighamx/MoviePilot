@@ -10,7 +10,7 @@ from app.application.messaging.agent import (
     resolve_config_principal_ids,
 )
 from app.runtime.log import logger
-from app.modules._base import _MessageChannelModuleBase
+from app.modules._base.notification import _MessageChannelModuleBase
 from app.modules.slack.slack import Slack
 from app.schemas.event import CommandRegisterEventData
 from app.schemas.message import IncomingMessage
@@ -77,13 +77,9 @@ class SlackModule(_MessageChannelModuleBase[Slack]):
         """
         return 3
 
-    def stop(self) -> None:
-        """停止模块"""
-        for client in self.get_instances().values():
-            try:
-                client.stop()
-            except Exception as err:
-                logger.error(f"停止Slack模块实例失败：{err}")
+    def stop(self) -> bool:
+        """停止全部 Slack 实例，并返回资源是否全部收敛。"""
+        return self._stop_service_instances()
 
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
         pass

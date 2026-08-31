@@ -3,6 +3,7 @@ import base64
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
@@ -10,25 +11,25 @@ from urllib.parse import quote
 
 from telebot import apihelper
 
-from app.agent.tools.impl.send_message import SendMessageInput, SendMessageTool
+from app.agent import AgentChain, MoviePilotAgent  # pylint: disable=no-name-in-module
+from app.agent.llm import LLMHelper  # pylint: disable=no-name-in-module
 from app.agent.tools.impl.send_local_file import SendLocalFileInput
-from app.agent import MoviePilotAgent, AgentChain
-from app.agent.llm import AgentCapabilityManager
+from app.agent.tools.impl.send_message import SendMessageInput, SendMessageTool
 from app.chain.message import MessageChain
-from app.runtime.config import settings
-from app.agent.llm import LLMHelper
 from app.modules.discord import DiscordModule
-from app.modules.qqbot import QQBotModule
+from app.modules.qqbot import QQBotModule  # pylint: disable=no-name-in-module
 from app.modules.qqbot.qqbot import QQBot
 from app.modules.slack import SlackModule
-from app.modules.telegram.telegram import Telegram
-from app.modules.telegram import TelegramModule
 from app.modules.synologychat import SynologyChatModule
+from app.modules.telegram import TelegramModule  # pylint: disable=no-name-in-module
+from app.modules.telegram.telegram import Telegram
 from app.modules.vocechat import VoceChatModule
 from app.modules.wechat import WechatModule
 from app.modules.wechat.wechatbot import WeChatBot
-from app.schemas import IncomingMessage, Message
-from app.schemas.types import NotificationChannel, MessageType
+from app.runtime.config import settings
+from app.runtime.loop import main_loop_registry
+from app.schemas import IncomingMessage, Message  # pylint: disable=no-name-in-module
+from app.schemas.types import MessageType, NotificationChannel
 
 
 class AgentImageSupportTest(unittest.TestCase):
@@ -199,6 +200,11 @@ class AgentImageSupportTest(unittest.TestCase):
 
     def test_image_message_routes_to_agent_even_when_global_agent_is_disabled(self):
         chain = MessageChain()
+        chain.runtime_config = replace(
+            chain.runtime_config,
+            ai_agent_enable=True,
+            ai_agent_global=False,
+        )
 
         with patch.object(chain, "load_cache", return_value={}), patch.object(
             chain.messagehelper, "put"
@@ -222,6 +228,11 @@ class AgentImageSupportTest(unittest.TestCase):
 
     def test_audio_message_routes_to_agent_without_forcing_voice_reply(self):
         chain = MessageChain()
+        chain.runtime_config = replace(
+            chain.runtime_config,
+            ai_agent_enable=True,
+            ai_agent_global=False,
+        )
 
         with patch.object(chain, "load_cache", return_value={}), patch.object(
             chain, "_transcribe_audio_refs", return_value="帮我推荐一部电影"
@@ -247,6 +258,11 @@ class AgentImageSupportTest(unittest.TestCase):
 
     def test_file_message_routes_to_agent_even_when_global_agent_is_disabled(self):
         chain = MessageChain()
+        chain.runtime_config = replace(
+            chain.runtime_config,
+            ai_agent_enable=True,
+            ai_agent_global=False,
+        )
 
         with patch.object(chain, "load_cache", return_value={}), patch.object(
             chain.messagehelper, "put"
@@ -433,9 +449,18 @@ class AgentImageSupportTest(unittest.TestCase):
 
     def test_handle_ai_message_routes_images_to_files_when_image_input_disabled(self):
         chain = MessageChain()
+        chain.runtime_config = replace(
+            chain.runtime_config,
+            ai_agent_enable=True,
+        )
 
-        with patch.object(settings, "AI_AGENT_ENABLE", True), patch.object(
+        loop = Mock(**{"is_running.return_value": True, "is_closed.return_value": False})
+        with patch.object(main_loop_registry, "require", return_value=loop), patch.object(
+            settings, "AI_AGENT_ENABLE", True
+        ), patch.object(
             settings, "LLM_SUPPORT_IMAGE_INPUT", False
+        ), patch(
+            "app.chain.message.supports_image_input", return_value=False
         ), patch.object(chain, "_get_or_create_session_id", return_value="session-1"), patch.object(
             chain, "_download_attachments_to_data_urls"
         ) as download_images, patch.object(
@@ -481,8 +506,15 @@ class AgentImageSupportTest(unittest.TestCase):
     def test_handle_ai_message_forwards_voice_input_to_agent_manager(self):
         """AI消息入队时应保留语音输入标记。"""
         chain = MessageChain()
+        chain.runtime_config = replace(
+            chain.runtime_config,
+            ai_agent_enable=True,
+        )
 
-        with patch.object(settings, "AI_AGENT_ENABLE", True), patch.object(
+        loop = Mock(**{"is_running.return_value": True, "is_closed.return_value": False})
+        with patch.object(main_loop_registry, "require", return_value=loop), patch.object(
+            settings, "AI_AGENT_ENABLE", True
+        ), patch.object(
             chain, "_get_or_create_session_id", return_value="session-1"
         ), patch(
             "app.chain.message.get_running_agent_manager"
@@ -1328,29 +1360,31 @@ class AgentImageSupportTest(unittest.TestCase):
 
     def test_prepare_agent_files_saves_local_file(self):
         chain = MessageChain()
-        with tempfile.TemporaryDirectory() as tempdir, patch(
-            "app.chain.message.settings",
-            SimpleNamespace(TEMP_PATH=Path(tempdir)),
-        ), patch.object(
+        with tempfile.TemporaryDirectory() as tempdir:
+            chain.runtime_config = replace(
+                chain.runtime_config,
+                temporary_path=Path(tempdir),
+            )
+            with patch.object(
             chain,
             "_download_message_file_bytes",
             return_value="你好，MoviePilot".encode("utf-8"),
-        ):
-            prepared = chain._prepare_agent_files(
-                session_id="session-1",
-                files=[
-                    IncomingMessage.MessageAttachment(
-                        ref="tg://document_file_id/doc-1",
-                        name="note.txt",
-                        mime_type="text/plain",
-                    )
-                ],
-                channel=NotificationChannel.Telegram,
-                source="telegram-test",
-            )
+            ):
+                prepared = chain._prepare_agent_files(
+                    session_id="session-1",
+                    files=[
+                        IncomingMessage.MessageAttachment(
+                            ref="tg://document_file_id/doc-1",
+                            name="note.txt",
+                            mime_type="text/plain",
+                        )
+                    ],
+                    channel=NotificationChannel.Telegram,
+                    source="telegram-test",
+                )
 
-            self.assertEqual(prepared[0]["status"], "ready")
-            self.assertTrue(Path(prepared[0]["local_path"]).exists())
+                self.assertEqual(prepared[0]["status"], "ready")
+                self.assertTrue(Path(prepared[0]["local_path"]).exists())
 
     def test_telegram_post_message_passes_file_to_client(self):
         module = TelegramModule()

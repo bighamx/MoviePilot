@@ -1,19 +1,102 @@
+import errno
 import json
 import re
 import shutil
+import threading
+import uuid
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Union, Optional
+from typing import Any, Optional, Protocol, Union
 
-from app.chain import ChainBase
-from app.runtime.config import settings
-from app.application.plugin.runtime import get_plugin_manager
-from app.runtime.state import SystemHelper
+from app.application.configuration import get_chain_runtime_config_snapshot
+from app.chain.base import ChainBase
+from app.runtime import version as runtime_version
 from app.runtime.log import logger
+from app.runtime.state import SystemHelper
 from app.schemas.message import Message
 from app.schemas.notification import NotificationChannel
-from app.adapters.network.http import RequestUtils
-from app.adapters.system.host import SystemUtils
-from version import FRONTEND_VERSION, APP_VERSION
+
+
+class SystemResponsePort(Protocol):
+    """系统链查询发布版本所需的最小同步 HTTP 响应契约。"""
+
+    def json(self) -> Any:
+        """返回响应 JSON 载荷。"""
+        ...
+
+    def close(self) -> None:
+        """释放响应与连接资源。"""
+        ...
+
+
+class SystemHttpPort(Protocol):
+    """系统链查询发布版本所需的同步 GET 端口。"""
+
+    def get(
+        self,
+        url: str,
+        *,
+        proxies: Optional[dict[str, str]],
+        headers: Mapping[str, str],
+    ) -> Optional[SystemResponsePort]:
+        """读取远端发布列表，并保留无响应与有响应两态。"""
+        ...
+
+
+class SystemEnvironmentPort(Protocol):
+    """系统链备份插件时所需的最小运行环境端口。"""
+
+    def is_docker(self) -> bool:
+        """返回当前进程是否运行在 Docker 容器中。"""
+        ...
+
+
+_system_port_lock = threading.RLock()
+_system_http_port: Optional[SystemHttpPort] = None
+_system_environment_port: Optional[SystemEnvironmentPort] = None
+
+
+def configure_system_ports(
+    *,
+    http: SystemHttpPort,
+    environment: SystemEnvironmentPort,
+) -> tuple[Optional[SystemHttpPort], Optional[SystemEnvironmentPort]]:
+    """由启动组合根装配系统链技术端口，并返回旧快照。"""
+    global _system_http_port, _system_environment_port
+    with _system_port_lock:
+        previous = (_system_http_port, _system_environment_port)
+        _system_http_port = http
+        _system_environment_port = environment
+        return previous
+
+
+def reset_system_ports(
+    http: Optional[SystemHttpPort] = None,
+    environment: Optional[SystemEnvironmentPort] = None,
+) -> None:
+    """恢复指定系统链端口；省略参数时回到未装配状态。"""
+    global _system_http_port, _system_environment_port
+    with _system_port_lock:
+        _system_http_port = http
+        _system_environment_port = environment
+
+
+def _system_ports_snapshot() -> tuple[SystemHttpPort, SystemEnvironmentPort]:
+    """读取一致的系统链端口快照，未装配时稳定失败。"""
+    with _system_port_lock:
+        http = _system_http_port
+        environment = _system_environment_port
+    if http is None or environment is None:
+        raise RuntimeError("系统链技术端口尚未由启动组合根装配")
+    return http, environment
+
+
+def _close_system_response(response: SystemResponsePort) -> None:
+    """释放版本响应；关闭失败只记录诊断，不覆盖解析结果。"""
+    try:
+        response.close()
+    except Exception as err:
+        logger.debug(f"释放版本响应失败：{str(err)}")
 
 
 class SystemChain(ChainBase):
@@ -22,6 +105,7 @@ class SystemChain(ChainBase):
     """
 
     _restart_file = "__system_restart__"
+    _plugin_restore_pending_file = "__plugin_restore_pending__"
 
     def remote_clear_cache(self, channel: NotificationChannel, userid: Union[int, str], source: Optional[str] = None):
         """
@@ -31,7 +115,7 @@ class SystemChain(ChainBase):
         self.post_message(Message(
             channel=channel,
             source=source,
-            title=f"缓存清理完成！",
+            title="缓存清理完成！",
             userid=userid,
             save_history=False))
 
@@ -63,13 +147,15 @@ class SystemChain(ChainBase):
         """
 
         # 非docker环境不处理
-        if not SystemUtils.is_docker():
+        _, environment = _system_ports_snapshot()
+        if not environment.is_docker():
             return
 
         try:
             # 使用绝对路径确保准确性
-            plugins_dir = settings.ROOT_PATH / "app" / "plugins"
-            backup_dir = settings.CONFIG_PATH / "plugins_backup"
+            config = get_chain_runtime_config_snapshot()
+            plugins_dir = config.root_path / "app" / "plugins"
+            backup_dir = config.config_path / "plugins_backup"
 
             if not plugins_dir.exists():
                 logger.info("插件目录不存在，跳过备份")
@@ -77,31 +163,46 @@ class SystemChain(ChainBase):
 
             # 确保备份目录存在
             backup_dir.mkdir(parents=True, exist_ok=True)
-
+            pending_file = backup_dir / SystemChain._plugin_restore_pending_file
+            pending_items = (
+                SystemChain.__read_plugin_restore_pending(pending_file)
+                if pending_file.exists()
+                else None
+            )
             # 需要排除的文件和目录
             exclude_items = {"__init__.py", "__pycache__", ".DS_Store"}
+
+            backup_failed = False
 
             # 遍历插件目录，备份除排除项外的所有内容
             for item in plugins_dir.iterdir():
                 if item.name in exclude_items:
                     continue
-
+                # 失败项目的原快照是下一次恢复的唯一材料，关停备份不能覆盖它。
+                if pending_file.exists() and (
+                    pending_items is None or item.name in pending_items
+                ):
+                    logger.debug(f"插件 {item.name} 有待重试恢复标记，保留原快照")
+                    continue
                 target_path = backup_dir / item.name
 
-                # 如果是目录
-                if item.is_dir():
-                    if target_path.exists():
-                        continue
-                    shutil.copytree(item, target_path)
-                    logger.debug(f"已备份插件目录: {item.name}")
-                # 如果是文件
-                elif item.is_file():
-                    if target_path.exists():
-                        continue
-                    shutil.copy2(item, target_path)
-                    logger.info(f"已备份插件文件: {item.name}")
+                try:
+                    SystemChain.__replace_snapshot(
+                        item,
+                        target_path,
+                        ignore=shutil.ignore_patterns(
+                            "__pycache__", "*.pyc", ".DS_Store"
+                        ) if item.is_dir() else None,
+                    )
+                    logger.debug(f"已备份插件项目: {item.name}")
+                except Exception as e:
+                    backup_failed = True
+                    logger.error(f"备份插件 {item.name} 失败: {e}")
 
-            logger.info(f"插件备份完成，备份位置: {backup_dir}")
+            if backup_failed:
+                logger.warning(f"插件备份部分失败，保留可用旧快照: {backup_dir}")
+            else:
+                logger.info(f"插件备份完成，备份位置: {backup_dir}")
 
         except Exception as e:
             logger.error(f"插件备份失败: {str(e)}")
@@ -113,55 +214,182 @@ class SystemChain(ChainBase):
         """
 
         # 非docker环境不处理
-        if not SystemUtils.is_docker():
+        _, environment = _system_ports_snapshot()
+        if not environment.is_docker():
             return
 
         # 使用绝对路径确保准确性
-        plugins_dir = settings.ROOT_PATH / "app" / "plugins"
-        backup_dir = settings.CONFIG_PATH / "plugins_backup"
+        config = get_chain_runtime_config_snapshot()
+        plugins_dir = config.root_path / "app" / "plugins"
+        backup_dir = config.config_path / "plugins_backup"
 
         if not backup_dir.exists():
             logger.info("插件备份目录不存在，跳过恢复")
             return
 
-        # 系统被重置才恢复插件
-        if SystemHelper().is_system_reset():
+        pending_file = backup_dir / SystemChain._plugin_restore_pending_file
 
-            # 确保插件目录存在
-            plugins_dir.mkdir(parents=True, exist_ok=True)
+        # 系统重置或上次恢复未完成时才消费备份。
+        system_reset = SystemHelper().is_system_reset()
+        should_restore = system_reset or pending_file.exists()
+        if not should_restore:
+            logger.info("当前不是系统重置，保留插件备份供后续重置使用")
+            return
 
-            # 遍历备份目录，恢复所有内容
-            restored_count = 0
-            for item in backup_dir.iterdir():
-                target_path = plugins_dir / item.name
-                try:
-                    # 如果是目录，且目录内有内容
-                    if item.is_dir() and any(item.iterdir()):
-                        if target_path.exists():
-                            shutil.rmtree(target_path)
-                        shutil.copytree(item, target_path)
-                        logger.debug(f"已恢复插件目录: {item.name}")
-                        restored_count += 1
-                    # 如果是文件
-                    elif item.is_file():
-                        shutil.copy2(item, target_path)
-                        logger.debug(f"已恢复插件文件: {item.name}")
-                        restored_count += 1
-                except Exception as e:
-                    logger.error(f"恢复插件 {item.name} 时发生错误: {str(e)}")
+        # 确保插件目录存在
+        plugins_dir.mkdir(parents=True, exist_ok=True)
+
+        # 遍历备份目录，恢复所有内容
+        restored_count = 0
+        restore_failed = False
+        failed_items: dict[str, bool] = {}
+        pending_items = (
+            SystemChain.__read_plugin_restore_pending(pending_file)
+            if pending_file.exists() and not system_reset
+            else None
+        )
+        for item in backup_dir.iterdir():
+            if (
+                item.name == SystemChain._plugin_restore_pending_file
+                or SystemChain.__is_snapshot_artifact(item.name)
+            ):
+                continue
+            target_path = plugins_dir / item.name
+            if pending_items is not None:
+                if item.name not in pending_items:
                     continue
+                if not pending_items[item.name] and target_path.exists():
+                    logger.info(f"插件 {item.name} 已在恢复失败后重新安装，跳过备份覆盖")
+                    continue
+            target_existed = target_path.exists()
+            try:
+                if item.is_dir() or item.is_file():
+                    SystemChain.__replace_snapshot(item, target_path)
+                    logger.debug(f"已恢复插件文件: {item.name}")
+                    restored_count += 1
+            except Exception as e:
+                restore_failed = True
+                failed_items[item.name] = target_existed
+                logger.error(f"恢复插件 {item.name} 时发生错误: {str(e)}")
+                continue
 
-            logger.info(f"插件恢复完成，共恢复 {restored_count} 个项目")
+        logger.info(f"插件恢复完成，共恢复 {restored_count} 个项目")
 
-            # 安装缺少的依赖
-            get_plugin_manager().install_plugin_missing_dependencies()
+        if restore_failed:
+            if SystemChain.__write_plugin_restore_pending(pending_file, failed_items):
+                logger.warning("插件恢复未完成，保留备份并标记为下次启动重试")
+            else:
+                logger.warning("插件恢复未完成，已保留备份，但无法写入下次启动重试标记")
+            return
 
-        # 删除备份目录
+        # 源码恢复完成后即可消费备份；依赖由启动后的统一后台任务处理。
         try:
             shutil.rmtree(backup_dir)
             logger.info(f"已删除插件备份目录: {backup_dir}")
         except Exception as e:
             logger.warning(f"删除备份目录失败: {str(e)}")
+            if backup_dir.exists():
+                SystemChain.__write_plugin_restore_pending(pending_file, {})
+
+    @staticmethod
+    def __is_snapshot_artifact(name: str) -> bool:
+        """识别快照替换过程中生成的临时或旧快照条目。"""
+        return bool(re.fullmatch(r"\..+\.(?:tmp|old)-[0-9a-f]{32}", name))
+
+    @staticmethod
+    def __read_plugin_restore_pending(pending_file: Path) -> Optional[dict[str, bool]]:
+        """读取仍需恢复的插件项目；无效内容按全部项目重试。"""
+        try:
+            payload = json.loads(pending_file.read_text(encoding="utf-8"))
+            failed_items = payload.get("failed_items")
+            if not isinstance(failed_items, dict):
+                return None
+            return {
+                str(name): target_existed
+                for name, target_existed in failed_items.items()
+                if isinstance(name, str) and isinstance(target_existed, bool)
+            }
+        except (OSError, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def __write_plugin_restore_pending(
+        pending_file: Path,
+        failed_items: dict[str, bool],
+    ) -> bool:
+        """记录失败项目及其原目标状态，供普通重启继续未完成恢复。"""
+        try:
+            pending_file.write_text(
+                json.dumps({"failed_items": failed_items}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            return True
+        except Exception as e:
+            logger.error(f"写入插件恢复重试标记失败: {e}")
+            return False
+
+    @staticmethod
+    def __replace_snapshot(source: Path, target: Path, *, ignore=None) -> None:
+        """复制到同级临时路径后替换目标，避免失败时丢失旧快照。"""
+        target.parent.mkdir(parents=True, exist_ok=True)
+        suffix = uuid.uuid4().hex
+        staging = target.with_name(f".{target.name}.tmp-{suffix}")
+        previous = target.with_name(f".{target.name}.old-{suffix}")
+        previous_available = False
+        published = False
+        try:
+            if source.is_dir():
+                shutil.copytree(source, staging, ignore=ignore)
+            else:
+                shutil.copy2(source, staging)
+            if target.exists():
+                try:
+                    target.replace(previous)
+                except OSError as error:
+                    if error.errno != errno.EXDEV:
+                        raise
+                    # overlayfs 可能拒绝把镜像层目录直接 rename 到可写层，
+                    # 先复制旧目标保留恢复材料，再删除旧目录继续发布快照。
+                    if target.is_dir():
+                        shutil.copytree(target, previous, symlinks=True)
+                    else:
+                        shutil.copy2(target, previous, follow_symlinks=False)
+                    previous_available = True
+                    SystemChain.__remove_snapshot_path(target)
+                else:
+                    previous_available = True
+            staging.replace(target)
+            published = True
+        except Exception:
+            if previous_available and not published:
+                try:
+                    SystemChain.__remove_snapshot_path(target)
+                    previous.replace(target)
+                    previous_available = False
+                except Exception as rollback_error:
+                    logger.error(
+                        f"恢复旧快照失败，已保留恢复材料 {previous}: "
+                        f"{rollback_error}"
+                    )
+            raise
+        finally:
+            if staging.is_dir():
+                shutil.rmtree(staging, ignore_errors=True)
+            elif staging.exists():
+                staging.unlink(missing_ok=True)
+            if published and previous.exists():
+                if previous.is_dir():
+                    shutil.rmtree(previous, ignore_errors=True)
+                else:
+                    previous.unlink(missing_ok=True)
+
+    @staticmethod
+    def __remove_snapshot_path(path: Path) -> None:
+        """删除待替换目标，保留失败回滚所需的旧快照副本。"""
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path)
+        elif path.exists() or path.is_symlink():
+            path.unlink()
 
     def __get_version_message(self) -> str:
         """
@@ -169,8 +397,8 @@ class SystemChain(ChainBase):
         """
         server_release_version = self.__get_server_release_version()
         front_release_version = self.__get_front_release_version()
-        server_local_version = self.get_server_local_version()
-        front_local_version = self.get_frontend_version()
+        server_local_version = runtime_version.get_app_version()
+        front_local_version = runtime_version.get_frontend_version()
         if server_release_version == server_local_version:
             title = f"当前后端版本：{server_local_version}，已是最新版本\n"
         else:
@@ -224,20 +452,25 @@ class SystemChain(ChainBase):
         """
         try:
             # 获取所有发布的版本列表
-            response = RequestUtils(
-                proxies=settings.PROXY,
-                headers=settings.GITHUB_HEADERS
-            ).get_res("https://api.github.com/repos/jxxghp/MoviePilot/releases")
+            http, _ = _system_ports_snapshot()
+            response = http.get(
+                "https://api.github.com/repos/jxxghp/MoviePilot/releases",
+                proxies=get_chain_runtime_config_snapshot().proxy,
+                headers=get_chain_runtime_config_snapshot().github_headers,
+            )
             if response:
-                releases = [release['tag_name'] for release in response.json()]
-                v2_releases = [tag for tag in releases if re.match(r"^v2\.", tag)]
-                if not v2_releases:
-                    logger.warn("获取v2后端最新版本版本出错！")
-                else:
-                    # 找到最新的v2版本
-                    latest_v2 = sorted(v2_releases, key=lambda s: list(map(int, re.findall(r'\d+', s))))[-1]
-                    logger.info(f"获取到后端最新版本：{latest_v2}")
-                    return latest_v2
+                try:
+                    releases = [release['tag_name'] for release in response.json()]
+                    v2_releases = [tag for tag in releases if re.match(r"^v2\.", tag)]
+                    if not v2_releases:
+                        logger.warn("获取v2后端最新版本版本出错！")
+                    else:
+                        # 找到最新的v2版本
+                        latest_v2 = sorted(v2_releases, key=lambda s: list(map(int, re.findall(r'\d+', s))))[-1]
+                        logger.info(f"获取到后端最新版本：{latest_v2}")
+                        return latest_v2
+                finally:
+                    _close_system_response(response)
             else:
                 logger.error("无法获取后端版本信息，请检查网络连接或GitHub API请求。")
         except Exception as err:
@@ -251,20 +484,25 @@ class SystemChain(ChainBase):
         """
         try:
             # 获取所有发布的版本列表
-            response = RequestUtils(
-                proxies=settings.PROXY,
-                headers=settings.GITHUB_HEADERS
-            ).get_res("https://api.github.com/repos/jxxghp/MoviePilot-Frontend/releases")
+            http, _ = _system_ports_snapshot()
+            response = http.get(
+                "https://api.github.com/repos/jxxghp/MoviePilot-Frontend/releases",
+                proxies=get_chain_runtime_config_snapshot().proxy,
+                headers=get_chain_runtime_config_snapshot().github_headers,
+            )
             if response:
-                releases = [release['tag_name'] for release in response.json()]
-                v2_releases = [tag for tag in releases if re.match(r"^v2\.", tag)]
-                if not v2_releases:
-                    logger.warn("获取v2前端最新版本版本出错！")
-                else:
-                    # 找到最新的v2版本
-                    latest_v2 = sorted(v2_releases, key=lambda s: list(map(int, re.findall(r'\d+', s))))[-1]
-                    logger.info(f"获取到前端最新版本：{latest_v2}")
-                    return latest_v2
+                try:
+                    releases = [release['tag_name'] for release in response.json()]
+                    v2_releases = [tag for tag in releases if re.match(r"^v2\.", tag)]
+                    if not v2_releases:
+                        logger.warn("获取v2前端最新版本版本出错！")
+                    else:
+                        # 找到最新的v2版本
+                        latest_v2 = sorted(v2_releases, key=lambda s: list(map(int, re.findall(r'\d+', s))))[-1]
+                        logger.info(f"获取到前端最新版本：{latest_v2}")
+                        return latest_v2
+                finally:
+                    _close_system_response(response)
             else:
                 logger.error("无法获取前端版本信息，请检查网络连接或GitHub API请求。")
         except Exception as err:
@@ -273,25 +511,10 @@ class SystemChain(ChainBase):
 
     @staticmethod
     def get_server_local_version():
-        """
-        查看当前版本
-        """
-        return APP_VERSION
+        """返回当前后端构建版本。"""
+        return runtime_version.get_app_version()
 
     @staticmethod
     def get_frontend_version():
-        """
-        获取前端版本
-        """
-        if SystemUtils.is_frozen() and SystemUtils.is_windows():
-            version_file = settings.CONFIG_PATH.parent / "nginx" / "html" / "version.txt"
-        else:
-            version_file = Path(settings.FRONTEND_PATH) / "version.txt"
-        if version_file.exists():
-            try:
-                with open(version_file, 'r', encoding='utf-8', errors='replace') as f:
-                    version = str(f.read()).strip()
-                return version
-            except Exception as err:
-                logger.debug(f"加载版本文件 {version_file} 出错：{str(err)}")
-        return FRONTEND_VERSION
+        """返回当前部署的前端资源版本。"""
+        return runtime_version.get_frontend_version()

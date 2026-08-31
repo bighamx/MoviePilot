@@ -5,11 +5,12 @@ from typing import Any, Optional
 from typing import List
 from urllib.parse import quote, urlparse, parse_qs
 
-from fastapi.concurrency import run_in_threadpool
 from jinja2 import Template
 from pyquery import PyQuery
 
-from app.runtime.config import settings
+from app.runtime.execution import run_in_threadpool
+from app.runtime.settings import get_runtime_setting
+
 from app.runtime.log import logger
 from app.schemas.types import MediaType
 from app.adapters.system import rust as rust_accel
@@ -67,14 +68,17 @@ class SiteSpider:
 
     @property
     def __class__(self):
+        """隐藏 Spider 的真实类型，避免模板或脚本读取内部实现。"""
         return object
 
     @property
     def __dict__(self):
+        """隐藏 Spider 实例属性，避免外部枚举请求上下文。"""
         return {}
 
     @property
     def __dir__(self):
+        """拒绝外部列举 Spider 的受保护属性。"""
         raise AttributeError(f"Cannot read protected attribute!")
 
     def __init__(self,
@@ -134,9 +138,9 @@ class SiteSpider:
         self.page = page
         if self.domain and not str(self.domain).endswith("/"):
             self.domain = self.domain + "/"
-        self.ua = indexer.get('ua') or settings.USER_AGENT
-        self.proxies = settings.PROXY if indexer.get('proxy') else None
-        self.proxy_server = settings.PROXY_SERVER if indexer.get('proxy') else None
+        self.ua = indexer.get('ua') or get_runtime_setting('USER_AGENT')
+        self.proxies = get_runtime_setting('PROXY') if indexer.get('proxy') else None
+        self.proxy_server = get_runtime_setting('PROXY_SERVER') if indexer.get('proxy') else None
         self.cookie = indexer.get('cookie')
         self.referer = referer
         # 初始化属性
@@ -334,13 +338,26 @@ class SiteSpider:
                 )
         return search_word
 
+    def __can_search(self) -> bool:
+        """判断当前站点配置与请求媒体类型是否允许发起搜索。"""
+        if self.site_media_type and self.mtype and self.site_media_type != self.mtype:
+            return False
+        return bool(self.search and self.domain)
+
+    @staticmethod
+    def __decode_response(response: Any) -> Any:
+        """按统一编码策略将同步或异步响应投影为待解析文本。"""
+        return RequestUtils.get_decoded_html_content(
+            response,
+            performance_mode=get_runtime_setting('ENCODING_DETECTION_PERFORMANCE_MODE'),
+            confidence_threshold=get_runtime_setting('ENCODING_DETECTION_MIN_CONFIDENCE')
+        )
+
     def get_torrents(self) -> List[dict]:
         """
         开始请求
         """
-        if self.site_media_type and self.mtype and self.site_media_type != self.mtype:
-            return []
-        if not self.search or not self.domain:
+        if not self.__can_search():
             return []
 
         # 获取搜索URL
@@ -357,21 +374,13 @@ class SiteSpider:
             proxies=self.proxies
         ).get_res(searchurl, allow_redirects=True)
         # 解析返回
-        return self.parse(
-            RequestUtils.get_decoded_html_content(
-                ret,
-                performance_mode=settings.ENCODING_DETECTION_PERFORMANCE_MODE,
-                confidence_threshold=settings.ENCODING_DETECTION_MIN_CONFIDENCE
-            )
-        )
+        return self.parse(self.__decode_response(ret))
 
     async def async_get_torrents(self) -> List[dict]:
         """
         异步请求
         """
-        if self.site_media_type and self.mtype and self.site_media_type != self.mtype:
-            return []
-        if not self.search or not self.domain:
+        if not self.__can_search():
             return []
 
         # 获取搜索URL
@@ -390,15 +399,11 @@ class SiteSpider:
         # 解析返回
         return await run_in_threadpool(
             self.parse,
-            RequestUtils.get_decoded_html_content(
-                ret,
-                performance_mode=settings.ENCODING_DETECTION_PERFORMANCE_MODE,
-                confidence_threshold=settings.ENCODING_DETECTION_MIN_CONFIDENCE
-            )
+            self.__decode_response(ret)
         )
 
     def __get_title(self, torrent: Any):
-        # title default text
+        """按站点字段配置提取并清洗种子标题。"""
         if 'title' not in self.fields:
             return
         selector = self.fields.get('title', {})
@@ -420,7 +425,7 @@ class SiteSpider:
                                                          selector.get('filters'))
 
     def __get_description(self, torrent: Any):
-        # description text
+        """按选择器或模板生成种子副标题。"""
         if 'description' not in self.fields:
             return
         selector = self.fields.get('description', {})
@@ -454,7 +459,7 @@ class SiteSpider:
                                                                selector.get('filters'))
 
     def __get_detail(self, torrent: Any):
-        # details page text
+        """提取并规范化种子详情页地址。"""
         if 'details' not in self.fields:
             return
         selector = self.fields.get('details', {})
@@ -472,7 +477,7 @@ class SiteSpider:
                 self.torrents_info['page_url'] = detail_link
 
     def __get_download(self, torrent: Any):
-        # download link text
+        """提取并规范化种子下载地址。"""
         if 'download' not in self.fields:
             return
         selector = self.fields.get('download', {})
@@ -520,7 +525,7 @@ class SiteSpider:
             self.torrents_info['language_icon'] = self.__normalize_link(icon_link)
 
     def __get_imdbid(self, torrent: Any):
-        # imdbid
+        """提取种子关联的 IMDb 标识。"""
         if "imdbid" not in self.fields:
             return
         selector = self.fields.get('imdbid', {})
@@ -528,7 +533,7 @@ class SiteSpider:
         self.torrents_info['imdbid'] = self.__filter_text(item, selector.get('filters'))
 
     def __get_size(self, torrent: Any):
-        # torrent size int
+        """提取种子大小并转换为字节数。"""
         if 'size' not in self.fields:
             return
         selector = self.fields.get('size', {})
@@ -542,7 +547,7 @@ class SiteSpider:
             self.torrents_info['size'] = 0
 
     def __get_leechers(self, torrent: Any):
-        # torrent leechers int
+        """提取种子的下载人数。"""
         if 'leechers' not in self.fields:
             return
         selector = self.fields.get('leechers', {})
@@ -556,7 +561,7 @@ class SiteSpider:
             self.torrents_info['peers'] = 0
 
     def __get_seeders(self, torrent: Any):
-        # torrent seeders int
+        """提取种子的做种人数。"""
         if 'seeders' not in self.fields:
             return
         selector = self.fields.get('seeders', {})
@@ -570,7 +575,7 @@ class SiteSpider:
             self.torrents_info['seeders'] = 0
 
     def __get_grabs(self, torrent: Any):
-        # torrent grabs int
+        """提取种子的完成人数。"""
         if 'grabs' not in self.fields:
             return
         selector = self.fields.get('grabs', {})
@@ -584,7 +589,7 @@ class SiteSpider:
             self.torrents_info['grabs'] = 0
 
     def __get_pubdate(self, torrent: Any):
-        # torrent pubdate yyyy-mm-dd hh:mm:ss
+        """按站点日期配置提取并规范化发布时间。"""
         if 'date_added' not in self.fields and 'date' not in self.fields:
             return
         selector = self.fields.get('date_added', {})
@@ -688,7 +693,7 @@ class SiteSpider:
             return True
 
     def __get_date_elapsed(self, torrent: Any):
-        # torrent date elapsed text
+        """提取相对发布时间对应的已过秒数。"""
         if 'date_elapsed' not in self.fields:
             return
         selector = self.fields.get('date_elapsed', {})
@@ -696,7 +701,7 @@ class SiteSpider:
         self.torrents_info['date_elapsed'] = self.__filter_text(date_elapsed, selector.get('filters'))
 
     def __get_downloadvolumefactor(self, torrent: Any):
-        # downloadvolumefactor int
+        """按促销标签解析种子下载系数。"""
         selector = self.fields.get('downloadvolumefactor', {})
         if not selector:
             return
@@ -720,7 +725,7 @@ class SiteSpider:
                     self.torrents_info['downloadvolumefactor'] = int(downloadvolumefactor.group(1))
 
     def __get_uploadvolumefactor(self, torrent: Any):
-        # uploadvolumefactor int
+        """按促销标签解析种子上传系数。"""
         selector = self.fields.get('uploadvolumefactor', {})
         if not selector:
             return
@@ -744,7 +749,7 @@ class SiteSpider:
                     self.torrents_info['uploadvolumefactor'] = int(uploadvolumefactor.group(1))
 
     def __get_labels(self, torrent: Any):
-        # labels ['label1', 'label2']
+        """提取并清洗种子标签列表。"""
         if 'labels' not in self.fields:
             return
         selector = self.fields.get('labels', {})
@@ -766,7 +771,7 @@ class SiteSpider:
             del labels
 
     def __get_free_date(self, torrent: Any):
-        # free date yyyy-mm-dd hh:mm:ss
+        """提取种子免费促销截止时间。"""
         if 'freedate' not in self.fields:
             return
         selector = self.fields.get('freedate', {})
@@ -774,7 +779,7 @@ class SiteSpider:
         self.torrents_info['freedate'] = self.__filter_text(freedate, selector.get('filters'))
 
     def __get_hit_and_run(self, torrent: Any):
-        # hitandrun True/False
+        """判定种子是否带有 Hit and Run 要求。"""
         if 'hr' not in self.fields:
             return
         selector = self.fields.get('hr', {})
@@ -789,7 +794,7 @@ class SiteSpider:
             del hit_and_run
 
     def __get_category(self, torrent: Any):
-        # category 电影/电视剧/音乐
+        """将站点分类字段投影为统一媒体类型。"""
         if self.requested_result_media_type:
             self.torrents_info['category'] = self.requested_result_media_type.value
             return

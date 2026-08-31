@@ -1,17 +1,15 @@
 """插件 Agent 工具共享辅助方法"""
 
 import json
-import shutil
 from typing import Any, Optional
 
-from app.runtime.config import settings
+from app.adapters.external.plugin.client import is_local_repo_url
+from app.application.configuration import get_configured_system_config
+from app.application.plugin.gateway import get_plugin_install_service
 from app.application.plugin.runtime import get_plugin_manager
-from app.application.plugin.install import PluginInstallCommand
-from app.application.configuration import get_configured_system_config as SystemConfigOper
-from app.adapters.external.server import MoviePilotServerHelper
-from app.adapters.external.market import PluginHelper
-from app.adapters.system.plugin.package import PluginPackageManager
+from app.schemas.plugin import PluginRuntimeStatus
 from app.schemas.types import SystemConfigKey
+
 
 # 默认只向智能体返回一个可读预览，避免超大插件数据挤爆上下文窗口。
 DEFAULT_PLUGIN_DATA_PREVIEW_CHARS = 12_000
@@ -79,10 +77,13 @@ def refresh_plugin_registrations(plugin_id: str) -> None:
     register_plugin_api(plugin_id)
 
 
-def reload_plugin_runtime(plugin_id: str) -> None:
+def reload_plugin_runtime(plugin_id: str) -> PluginRuntimeStatus:
     """重载插件实例并重新注册其命令、定时任务和 API。"""
-    get_plugin_manager().reload_plugin(plugin_id)
-    refresh_plugin_registrations(plugin_id)
+    plugin_manager = get_plugin_manager()
+    with plugin_manager.mutation(f"重载插件 {plugin_id}"):
+        runtime_status = plugin_manager.reload_plugin(plugin_id)
+        refresh_plugin_registrations(plugin_id)
+        return runtime_status
 
 
 def summarize_plugin(plugin: Any) -> dict[str, Any]:
@@ -103,7 +104,7 @@ def summarize_plugin(plugin: Any) -> dict[str, Any]:
         "system_version_message": getattr(plugin, "system_version_message", None),
         "state": bool(getattr(plugin, "state", False)),
         "repo_url": repo_url,
-        "source": "local_repo" if PluginHelper.is_local_repo_url(repo_url) else "market",
+        "source": "local_repo" if is_local_repo_url(repo_url) else "market",
     }
 
 
@@ -295,85 +296,46 @@ def summarize_candidates(matches: list[dict[str, Any]], limit: int = DEFAULT_PLU
 
 
 async def install_plugin_runtime(
-    plugin_id: str, repo_url: Optional[str], force: bool = False
+    plugin_id: str,
+    repo_url: Optional[str],
+    force: bool = False,
+    *,
+    explicit_source: bool = False,
 ) -> tuple[bool, str, bool]:
     """
     按现有插件接口的行为安装插件，并刷新运行态注册信息。
     """
-    plugin_manager = get_plugin_manager()
-    plugin_helper = PluginHelper()
-    package_manager = PluginPackageManager(plugin_helper)
-
-    from app.agent.tools.base import run_agent_blocking
-
-    async def save_installed_plugins(plugin_ids: list[str]) -> object:
-        """保存智能体安装用例确认后的插件列表。"""
-        return await SystemConfigOper().async_set(
-            SystemConfigKey.UserInstalledPlugins,
-            plugin_ids,
-        )
-
-    async def install_package(
-        target_id: str,
-        target_repo: str,
-        _release_version: Optional[str],
-        force_install: bool,
-    ) -> tuple[bool, str]:
-        """调用插件包适配器执行异步安装。"""
-        return await package_manager.async_install(
-            plugin_id=target_id,
-            repo_url=target_repo,
-            force_install=force_install,
-        )
-
-    async def skip_compatibility_check(
-        _target_id: str,
-        _target_repo: str,
-    ) -> None:
-        """保持 Agent 旧安装入口不额外执行系统版本预检查。"""
-        return None
-
-    async def reload_runtime(target_id: str) -> object:
-        """通过 Agent 阻塞任务适配器重建插件实例。"""
-        return await run_agent_blocking(
-            "plugin",
-            plugin_manager.reload_plugin,
-            target_id,
-        )
-
-    async def refresh_registrations(target_id: str) -> object:
-        """通过 Agent 阻塞任务适配器刷新服务、命令和动态路由。"""
-        return await run_agent_blocking(
-            "plugin",
-            refresh_plugin_registrations,
-            target_id,
-        )
-
-    result = await PluginInstallCommand(
-        installed_plugins_reader=lambda: SystemConfigOper().get(
-            SystemConfigKey.UserInstalledPlugins
-        ) or [],
-        installed_plugins_writer=save_installed_plugins,
-        plugin_ids_provider=plugin_manager.get_plugin_ids,
-        compatibility_checker=skip_compatibility_check,
-        package_installer=install_package,
-        package_checkpointer=package_manager.async_checkpoint,
-        package_committer=package_manager.async_commit,
-        package_rollback=package_manager.async_rollback,
-        install_reporter=lambda target_id, target_repo: (
-            MoviePilotServerHelper.async_install_plugin_reg(
-                plugin_id=target_id,
-                repo_url=target_repo,
-            )
-        ),
-        plugin_reloader=reload_runtime,
-        registration_refresher=refresh_registrations,
-    ).execute(
+    result = await get_plugin_install_service().install(
         plugin_id=plugin_id,
-        repo_url=repo_url,
+        repo_url=repo_url or None,
         force=force,
+        explicit_source=explicit_source,
     )
     return result.success, result.message, result.refreshed_only
+
+
+async def inspect_plugin_sources(
+    plugin_id: str,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """返回 Agent 可展示的脱敏来源候选与当前准入状态。"""
+    inspection = await get_plugin_install_service().inspect_source(
+        plugin_id=plugin_id,
+        force=force,
+    )
+    candidates = [
+        candidate.public_dict()
+        for candidate in inspection.online_candidates
+    ]
+    if inspection.local_candidate is not None:
+        candidates.append(inspection.local_candidate.public_dict())
+    return {
+        "selection_status": inspection.selection.status.value,
+        "selection_reason": inspection.selection.reason,
+        "inventory_complete": inspection.inventory_complete,
+        "candidates": candidates,
+    }
 
 
 async def uninstall_plugin_runtime(plugin_id: str) -> dict[str, Any]:
@@ -383,37 +345,56 @@ async def uninstall_plugin_runtime(plugin_id: str) -> dict[str, Any]:
     from app.application.plugin.folders import remove_plugin_from_folders
     from app.application.plugin.routes import remove_plugin_api
     from app.application.scheduling import remove_plugin_job
-
-    config_oper = SystemConfigOper()
-    install_plugins = config_oper.get(SystemConfigKey.UserInstalledPlugins) or []
-    if plugin_id in install_plugins:
-        install_plugins = [plugin for plugin in install_plugins if plugin != plugin_id]
-        await config_oper.async_set(SystemConfigKey.UserInstalledPlugins, install_plugins)
-
-    remove_plugin_api(plugin_id)
-    remove_plugin_job(plugin_id)
+    from app.agent.tools.base import run_agent_blocking
 
     plugin_manager = get_plugin_manager()
-    plugin_class = plugin_manager.plugins.get(plugin_id)
-    was_clone = bool(getattr(plugin_class, "is_clone", False))
-    clone_files_removed = False
+    with plugin_manager.mutation(f"卸载插件 {plugin_id}"):
+        virtual_instance = plugin_manager.get_plugin_instance(plugin_id)
+        source_instances = plugin_manager.get_plugin_source_instances(plugin_id)
+        if not virtual_instance and source_instances:
+            instance_ids = "、".join(item.instance_id for item in source_instances)
+            raise ValueError(f"请先卸载该插件的分身：{instance_ids}")
 
-    if was_clone:
-        plugin_manager.delete_plugin_config(plugin_id)
-        plugin_manager.delete_plugin_data(plugin_id)
-        plugin_base_dir = settings.ROOT_PATH / "app" / "plugins" / plugin_id.lower()
-        if plugin_base_dir.exists():
+        config_oper = get_configured_system_config()
+        install_plugins = config_oper.get(SystemConfigKey.UserInstalledPlugins) or []
+        if plugin_id in install_plugins:
+            install_plugins = [
+                plugin for plugin in install_plugins if plugin != plugin_id
+            ]
+            await config_oper.async_set(
+                SystemConfigKey.UserInstalledPlugins,
+                install_plugins,
+            )
+
+        remove_plugin_api(plugin_id)
+        remove_plugin_job(plugin_id)
+
+        plugin_class = plugin_manager.plugins.get(plugin_id)
+        was_clone = bool(getattr(plugin_class, "is_clone", False))
+        clone_files_removed = False
+
+        if virtual_instance:
+            plugin_manager.delete_plugin_config(plugin_id, force=True)
+            plugin_manager.delete_plugin_data(plugin_id, force=True)
+            plugin_manager.delete_plugin_instance(plugin_id)
+        elif was_clone:
+            plugin_manager.delete_plugin_config(plugin_id)
+            plugin_manager.delete_plugin_data(plugin_id)
             try:
-                shutil.rmtree(plugin_base_dir)
-                plugin_manager.plugins.pop(plugin_id, None)
-                clone_files_removed = True
+                clone_files_removed = await run_agent_blocking(
+                    "plugin",
+                    plugin_manager.remove_plugin_package,
+                    plugin_id,
+                )
+                if clone_files_removed:
+                    plugin_manager.plugins.pop(plugin_id, None)
             except Exception:
                 clone_files_removed = False
 
-    remove_plugin_from_folders(plugin_id)
-    plugin_manager.remove_plugin(plugin_id)
+        remove_plugin_from_folders(plugin_id)
+        plugin_manager.remove_plugin(plugin_id)
 
-    return {
-        "was_clone": was_clone,
-        "clone_files_removed": clone_files_removed,
-    }
+        return {
+            "was_clone": was_clone,
+            "clone_files_removed": clone_files_removed,
+        }

@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from app.agent.tools.impl.add_subscribe import AddSubscribeTool
@@ -17,7 +18,15 @@ class TestAgentAddSubscribeTool(unittest.TestCase):
         self.assertNotIn("第1季(默认)", message)
 
     def test_tv_subscription_without_season_reports_default_first_season(self):
-        tool = AddSubscribeTool(session_id="session-1", user_id="10001")
+        tool = AddSubscribeTool(
+            session_id="session-1",
+            user_id="10001",
+            data=SimpleNamespace(
+                users=SimpleNamespace(
+                    find_name_by_bindings=lambda _bindings: "moviepilot-user"
+                )
+            ),
+        )
         tool.set_message_attr(
             channel=NotificationChannel.Telegram.value,
             source="telegram-main",
@@ -27,10 +36,7 @@ class TestAgentAddSubscribeTool(unittest.TestCase):
         with patch(
             "app.agent.tools.impl.add_subscribe.SubscribeChain.async_add",
             new=AsyncMock(return_value=(1, "")),
-        ) as async_add, patch(
-            "app.agent.tools.impl.add_subscribe.UserOper.get_name",
-            return_value="moviepilot-user",
-        ):
+        ) as async_add:
             result = asyncio.run(
                 tool.run(
                     title="Breaking Bad",
@@ -44,7 +50,13 @@ class TestAgentAddSubscribeTool(unittest.TestCase):
         self.assertIn("默认按第一季订阅", result)
 
     def test_subscription_falls_back_to_channel_username_when_no_binding_exists(self):
-        tool = AddSubscribeTool(session_id="session-1", user_id="10001")
+        tool = AddSubscribeTool(
+            session_id="session-1",
+            user_id="10001",
+            data=SimpleNamespace(
+                users=SimpleNamespace(find_name_by_bindings=lambda _bindings: None)
+            ),
+        )
         tool.set_message_attr(
             channel=NotificationChannel.Telegram.value,
             source="telegram-main",
@@ -54,10 +66,7 @@ class TestAgentAddSubscribeTool(unittest.TestCase):
         with patch(
             "app.agent.tools.impl.add_subscribe.SubscribeChain.async_add",
             new=AsyncMock(return_value=(1, "")),
-        ) as async_add, patch(
-            "app.agent.tools.impl.add_subscribe.UserOper.get_name",
-            return_value=None,
-        ):
+        ) as async_add:
             result = asyncio.run(
                 tool.run(
                     title="The Matrix",
@@ -70,7 +79,13 @@ class TestAgentAddSubscribeTool(unittest.TestCase):
         self.assertIn("成功添加订阅：The Matrix (1999)", result)
 
     def test_feishu_subscription_uses_pre_resolved_username_when_openid_lookup_misses(self):
-        tool = AddSubscribeTool(session_id="session-1", user_id="ou_feishu_user")
+        tool = AddSubscribeTool(
+            session_id="session-1",
+            user_id="ou_feishu_user",
+            data=SimpleNamespace(
+                users=SimpleNamespace(find_name_by_bindings=lambda _bindings: None)
+            ),
+        )
         tool.set_message_attr(
             channel=NotificationChannel.Feishu.value,
             source="feishu-main",
@@ -80,10 +95,7 @@ class TestAgentAddSubscribeTool(unittest.TestCase):
         with patch(
             "app.agent.tools.impl.add_subscribe.SubscribeChain.async_add",
             new=AsyncMock(return_value=(1, "")),
-        ) as async_add, patch(
-            "app.agent.tools.impl.add_subscribe.UserOper.get_name",
-            return_value=None,
-        ):
+        ) as async_add:
             result = asyncio.run(
                 tool.run(
                     title="The Matrix",

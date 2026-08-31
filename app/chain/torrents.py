@@ -1,27 +1,24 @@
 import copy
 import re
 import traceback
-from typing import Callable, Dict, List, Union, Optional
+from typing import Callable, Dict, List, Optional, Union
 
-from app.application.site.sites import SitesHelper  # pylint: disable=no-name-in-module
-
-from app.chain import ChainBase
-from app.chain.media import MediaChain
-from app.runtime.config import settings, global_vars
-from app.domain.context import TorrentInfo, Context, MediaInfo
-from app.domain.context import MusicInfo
-from app.domain.meta.metamusic import MetaMusic
-from app.domain.metainfo import MetaInfo
-from app.application.chain.data import SitePortProxy as SiteOper
 from app.application.configuration import get_configured_system_config
 from app.application.rss import RssHelper
-from app.application.torrent import TorrentHelper
-from app.runtime.log import logger
-from app.schemas.message import Message
-from app.schemas.types import SystemConfigKey, NotificationChannel, MessageType, MediaType
-from app.schemas.media import resolve_media_identity
+from app.application.site.sites import SitesHelper  # pylint: disable=import-error,no-name-in-module
+from app.application.torrent.download import TorrentHelper
+from app.chain.base import ChainBase
+from app.chain.media import MediaChain
 from app.domain import site as site_rules
+from app.domain.context import Context, MediaInfo, MusicInfo, TorrentInfo
+from app.domain.meta.metamusic import MetaMusic
+from app.domain.metainfo import MetaInfo
 from app.foundation import text as text_tools
+from app.runtime.log import logger
+from app.runtime.stop import runtime_stop_state
+from app.schemas.media import resolve_media_identity
+from app.schemas.message import Message
+from app.schemas.types import MediaType, MessageType, NotificationChannel, SystemConfigKey
 
 
 class TorrentsChain(ChainBase):
@@ -35,12 +32,33 @@ class TorrentsChain(ChainBase):
     _music_spider_file = "__torrents_music_cache__"
     _music_rss_file = "__rss_music_cache__"
 
+    def _cache_type(self, stype: Optional[str]) -> str:
+        """把可选缓存类型统一为本次读取使用的明确订阅模式。"""
+        return stype or self.runtime_config.subscribe_mode
+
+    def _cache_file_pair(self, stype: str) -> tuple[str, str]:
+        """返回指定订阅模式下影视与音乐缓存的唯一文件映射。"""
+        if stype == 'spider':
+            return self._spider_file, self._music_spider_file
+        return self._rss_file, self._music_rss_file
+
+    @staticmethod
+    def _merge_torrent_caches(
+        torrents_cache: Dict[str, List[Context]],
+        music_cache: Dict[str, List[Context]],
+    ) -> Dict[str, List[Context]]:
+        """按站点稳定合并音乐独立缓存，空列表不创建无效站点键。"""
+        for domain, contexts in music_cache.items():
+            if contexts:
+                torrents_cache.setdefault(domain, []).extend(contexts)
+        return torrents_cache
+
     @property
     def cache_file(self) -> str:
         """
         返回缓存文件列表
         """
-        if settings.SUBSCRIBE_MODE == 'spider':
+        if self.runtime_config.subscribe_mode == 'spider':
             return self._spider_file
         return self._rss_file
 
@@ -50,13 +68,13 @@ class TorrentsChain(ChainBase):
         """
         self.post_message(Message(
             channel=channel,
-            title=f"开始刷新种子 ...",
+            title="开始刷新种子 ...",
             userid=userid,
             save_history=False))
         self.refresh()
         self.post_message(Message(
             channel=channel,
-            title=f"种子刷新完成！",
+            title="种子刷新完成！",
             userid=userid,
             save_history=False))
 
@@ -66,34 +84,24 @@ class TorrentsChain(ChainBase):
         :param stype: 强制指定缓存类型，spider:爬虫缓存，rss:rss缓存
         """
 
-        if not stype:
-            stype = settings.SUBSCRIBE_MODE
-
-        # 读取缓存
-        if stype == 'spider':
-            torrents_cache = self.load_cache(self._spider_file) or {}
-        else:
-            torrents_cache = self.load_cache(self._rss_file) or {}
+        stype = self._cache_type(stype)
+        video_file, _music_file = self._cache_file_pair(stype)
+        torrents_cache = self.load_cache(video_file) or {}
 
         # 兼容性处理：为旧版本的Context对象补齐新增候选识别字段
         self._ensure_context_compatibility(torrents_cache, stype=stype)
 
         # 合并音乐独立缓存，供订阅匹配等消费方按站点读取完整候选
         music_cache = self.get_music_torrents(stype=stype)
-        for domain, contexts in music_cache.items():
-            if contexts:
-                torrents_cache.setdefault(domain, []).extend(contexts)
-
-        return torrents_cache
+        return self._merge_torrent_caches(torrents_cache, music_cache)
 
     def get_music_torrents(self, stype: Optional[str] = None) -> Dict[str, List[Context]]:
         """
         获取音乐独立缓存的种子
         :param stype: 强制指定缓存类型，spider:爬虫缓存，rss:rss缓存
         """
-        if not stype:
-            stype = settings.SUBSCRIBE_MODE
-        music_file = self._music_spider_file if stype == 'spider' else self._music_rss_file
+        stype = self._cache_type(stype)
+        _video_file, music_file = self._cache_file_pair(stype)
         music_cache = self.load_cache(music_file) or {}
         # 兼容性处理：为旧版本的Context对象补齐新增候选识别字段
         self._ensure_context_compatibility(music_cache, stype=stype)
@@ -104,11 +112,7 @@ class TorrentsChain(ChainBase):
         返回影视与音乐缓存文件名，供按当前订阅模式回写各自缓存
         :param stype: 强制指定缓存类型，spider:爬虫缓存，rss:rss缓存
         """
-        if not stype:
-            stype = settings.SUBSCRIBE_MODE
-        if stype == 'spider':
-            return self._spider_file, self._music_spider_file
-        return self._rss_file, self._music_rss_file
+        return self._cache_file_pair(self._cache_type(stype))
 
     @staticmethod
     def split_cache_contexts(
@@ -134,27 +138,17 @@ class TorrentsChain(ChainBase):
         :param stype: 强制指定缓存类型，spider:爬虫缓存，rss:rss缓存
         """
 
-        if not stype:
-            stype = settings.SUBSCRIBE_MODE
-
-        # 异步读取缓存
-        if stype == 'spider':
-            torrents_cache = await self.async_load_cache(self._spider_file) or {}
-            music_cache = await self.async_load_cache(self._music_spider_file) or {}
-        else:
-            torrents_cache = await self.async_load_cache(self._rss_file) or {}
-            music_cache = await self.async_load_cache(self._music_rss_file) or {}
+        stype = self._cache_type(stype)
+        video_file, music_file = self._cache_file_pair(stype)
+        torrents_cache = await self.async_load_cache(video_file) or {}
+        music_cache = await self.async_load_cache(music_file) or {}
 
         # 兼容性处理：为旧版本的Context对象补齐新增候选识别字段
         self._ensure_context_compatibility(torrents_cache, stype=stype)
         self._ensure_context_compatibility(music_cache, stype=stype)
 
         # 合并音乐独立缓存，供订阅匹配等消费方按站点读取完整候选
-        for domain, contexts in music_cache.items():
-            if contexts:
-                torrents_cache.setdefault(domain, []).extend(contexts)
-
-        return torrents_cache
+        return self._merge_torrent_caches(torrents_cache, music_cache)
 
     def get_subscribe_cache_candidates(
             self,
@@ -362,23 +356,23 @@ class TorrentsChain(ChainBase):
         """
         清理种子缓存数据，包含音乐独立缓存
         """
-        logger.info(f'开始清理种子缓存数据 ...')
+        logger.info('开始清理种子缓存数据 ...')
         self.remove_cache(self._spider_file)
         self.remove_cache(self._rss_file)
         self.remove_cache(self._music_spider_file)
         self.remove_cache(self._music_rss_file)
-        logger.info(f'种子缓存数据清理完成')
+        logger.info('种子缓存数据清理完成')
 
     async def async_clear_torrents(self):
         """
         异步清理种子缓存数据，包含音乐独立缓存
         """
-        logger.info(f'开始异步清理种子缓存数据 ...')
+        logger.info('开始异步清理种子缓存数据 ...')
         await self.async_remove_cache(self._spider_file)
         await self.async_remove_cache(self._rss_file)
         await self.async_remove_cache(self._music_spider_file)
         await self.async_remove_cache(self._music_rss_file)
-        logger.info(f'异步种子缓存数据清理完成')
+        logger.info('异步种子缓存数据清理完成')
 
     def browse(self, domain: str, keyword: Optional[str] = None, cat: Optional[str] = None,
                page: Optional[int] = 0,
@@ -456,7 +450,7 @@ class TorrentsChain(ChainBase):
                     site=site.get("id"),
                     site_name=site.get("name"),
                     site_cookie=site.get("cookie"),
-                    site_ua=site.get("ua") or settings.USER_AGENT,
+                    site_ua=site.get("ua") or self.runtime_config.user_agent,
                     site_proxy=site.get("proxy"),
                     site_order=site.get("pri"),
                     site_downloader=site.get("downloader"),
@@ -526,6 +520,118 @@ class TorrentsChain(ChainBase):
                 torrents.append(torrent)
         return torrents
 
+    def _refresh_indexer(
+            self,
+            indexer: dict,
+            stype: str,
+            include_music: bool,
+            torrents_cache: Dict[str, List[Context]],
+            music_cache: Dict[str, List[Context]],
+    ) -> str:
+        """抓取并写入单个站点的影视、音乐资源缓存。"""
+        domain = site_rules.extract_domain(indexer.get("domain"))
+        if stype == "spider":
+            torrents: List[TorrentInfo] = []
+            for page in range(2):
+                page_torrents = self.browse(domain=domain, page=page)
+                if not page_torrents:
+                    break
+                torrents.extend(page_torrents)
+        else:
+            torrents = self.rss(domain=domain)
+        if include_music and self._music_browse_paths(indexer):
+            torrents = self.__append_music_browse_torrents(domain=domain, torrents=torrents)
+        torrents.sort(key=lambda item: item.pubdate or "", reverse=True)
+        music_torrents = [
+            item for item in torrents if item.category == MediaType.MUSIC.value
+        ][:self.runtime_config.refresh_batch_size]
+        torrents = [
+            item for item in torrents if item.category != MediaType.MUSIC.value
+        ][:self.runtime_config.refresh_batch_size]
+        if not torrents and not music_torrents:
+            logger.info(f'{indexer.get("name")} 没有获取到种子')
+            return domain
+        if self._is_no_cache_site(domain):
+            logger.info(
+                f'{indexer.get("name")} 有 {len(torrents) + len(music_torrents)} 个种子 (不缓存)'
+            )
+            torrents_cache[domain] = []
+            music_cache[domain] = []
+        else:
+            cached_signatures = {
+                f'{item.torrent_info.title}{item.torrent_info.description}'
+                for item in torrents_cache.get(domain) or []
+            }
+            torrents = [
+                item for item in torrents
+                if f'{item.title}{item.description}' not in cached_signatures
+            ]
+            music_signatures = {
+                f'{item.torrent_info.title}{item.torrent_info.description}'
+                for item in music_cache.get(domain) or []
+            }
+            music_torrents = [
+                item for item in music_torrents
+                if f'{item.title}{item.description}' not in music_signatures
+            ]
+        if not torrents and not music_torrents:
+            logger.info(f'{indexer.get("name")} 没有新种子')
+            return domain
+        logger.info(f'{indexer.get("name")} 有 {len(torrents) + len(music_torrents)} 个新种子')
+        for torrent in torrents + music_torrents:
+            if runtime_stop_state.is_system_stopped:
+                break
+            if not torrent.enclosure:
+                logger.warning(f"缺少种子链接，忽略处理: {torrent.title}")
+                continue
+            context = self._build_refresh_context(torrent, stype)
+            target_cache = music_cache if torrent.category == MediaType.MUSIC.value else torrents_cache
+            target_cache.setdefault(domain, []).append(context)
+            if len(target_cache[domain]) > self.runtime_config.torrent_cache_size:
+                target_cache[domain] = target_cache[domain][-self.runtime_config.torrent_cache_size:]
+        return domain
+
+    def _is_no_cache_site(self, domain: str) -> bool:
+        """判断站点是否配置为不缓存资源。"""
+        return any(key in domain for key in self.runtime_config.no_cache_site_key.split(","))
+
+    def _build_refresh_context(self, torrent: TorrentInfo, stype: str) -> Context:
+        """识别单个种子并构造缓存上下文。"""
+        logger.info(f'处理资源：{torrent.title} ...')
+        if torrent.category == MediaType.MUSIC.value:
+            meta = MetaMusic.parse_query(torrent.title)
+            mediainfo = MusicInfo(
+                title=meta.title,
+                artists=list(meta.artists),
+                album=meta.album,
+                year=meta.year,
+                names=[meta.title] if meta.title else [],
+            )
+            candidate_recognized = False
+            match_source = "unknown"
+        else:
+            meta = MetaInfo(title=torrent.title, subtitle=torrent.description)
+            if torrent.title != meta.org_string:
+                logger.info(f'种子名称应用识别词后发生改变：{torrent.title} => {meta.org_string}')
+            if meta.type != MediaType.TV and torrent.category == MediaType.TV.value:
+                meta.type = MediaType.TV
+            mediainfo = MediaChain().recognize_by_meta(meta, obtain_images=False) or MediaInfo()
+            mediainfo.clear()
+            candidate_recognized = bool(mediainfo and all(resolve_media_identity(media=mediainfo)))
+            match_source = self._get_media_id_match_source(mediainfo)
+        context = Context(
+            meta_info=meta,
+            media_info=mediainfo,
+            torrent_info=torrent,
+            resource_source="spider" if stype == "spider" else "rss",
+            match_source=match_source if candidate_recognized else "unknown",
+            candidate_recognized=candidate_recognized,
+            media_info_is_target=False,
+        )
+        if not mediainfo or not all(resolve_media_identity(media=mediainfo)):
+            context.media_recognize_fail_count = 1
+        return context
+
     def refresh(
             self,
             stype: Optional[str] = None,
@@ -541,18 +647,9 @@ class TorrentsChain(ChainBase):
         :param include_music: 是否额外抓取站点的音乐专用浏览入口，服务音乐订阅
         """
 
-        def __is_no_cache_site(_domain: str) -> bool:
-            """
-            判断站点是否不需要缓存
-            """
-            for url_key in settings.NO_CACHE_SITE_KEY.split(','):
-                if url_key in _domain:
-                    return True
-            return False
-
         # 刷新类型
         if not stype:
-            stype = settings.SUBSCRIBE_MODE
+            stype = self.runtime_config.subscribe_mode
 
         # 刷新站点
         if not sites:
@@ -589,150 +686,25 @@ class TorrentsChain(ChainBase):
             )
         # 遍历站点缓存资源
         for index, indexer in enumerate(indexers, start=1):
-            if global_vars.is_system_stopped:
+            if runtime_stop_state.is_system_stopped:
                 break
             if progress_callback:
                 progress_callback(
                     value=(index - 1) / total_indexers * 100 if total_indexers else 100,
-                    text=(
-                        f"正在刷新站点资源（{index}/{total_indexers}）"
-                        f"{indexer.get('name')} ..."
-                    ),
+                    text=f"正在刷新站点资源（{index}/{total_indexers}）{indexer.get('name')} ...",
                     data={
                         "total": total_indexers,
                         "finished": index - 1,
                         "current": indexer.get("id"),
                     },
                 )
-            domain = site_rules.extract_domain(indexer.get("domain"))
-            domains.append(domain)
-            if stype == "spider":
-                # 刷新首页种子
-                torrents: List[TorrentInfo] = []
-                # 读取第0页和第1页
-                for page in range(2):
-                    page_torrents = self.browse(domain=domain, page=page)
-                    if page_torrents:
-                        torrents.extend(page_torrents)
-                    else:
-                        # 如果某一页没有数据，说明已经到最后一页，停止获取
-                        break
-                # 存在音乐订阅时，默认首页可能不包含音乐资源，需要额外抓取音乐专用入口
-                if include_music and self._music_browse_paths(indexer):
-                    torrents = self.__append_music_browse_torrents(
-                        domain=domain, torrents=torrents
-                    )
-            else:
-                # 刷新RSS种子
-                torrents: List[TorrentInfo] = self.rss(domain=domain)
-                # 混合站点的 RSS 通常不提供媒体分类；有音乐订阅时补抓专用入口，
-                # 后续仍按与 spider 相同的独立缓存和去重规则处理。
-                if include_music and self._music_browse_paths(indexer):
-                    torrents = self.__append_music_browse_torrents(
-                        domain=domain, torrents=torrents
-                    )
-            # 按pubdate降序排列
-            torrents.sort(key=lambda x: x.pubdate or '', reverse=True)
-            # 音乐与影视按同一公共参数独立计算刷新配额，并分别写入各自缓存，音乐不会被影视资源挤出
-            music_torrents = [
-                t for t in torrents if t.category == MediaType.MUSIC.value
-            ][:settings.CONF.refresh]
-            torrents = [
-                t for t in torrents if t.category != MediaType.MUSIC.value
-            ][:settings.CONF.refresh]
-            if torrents or music_torrents:
-                if __is_no_cache_site(domain):
-                    # 不需要缓存的站点，直接处理
-                    logger.info(f'{indexer.get("name")} 有 {len(torrents) + len(music_torrents)} 个种子 (不缓存)')
-                    torrents_cache[domain] = []
-                    music_cache[domain] = []
-                else:
-                    # 过滤出没有处理过的种子 - 优化：使用集合查找，避免重复创建字符串列表
-                    cached_signatures = {f'{t.torrent_info.title}{t.torrent_info.description}'
-                                         for t in torrents_cache.get(domain) or []}
-                    torrents = [torrent for torrent in torrents
-                                if f'{torrent.title}{torrent.description}' not in cached_signatures]
-                    # 音乐种子对照音乐独立缓存去重
-                    music_signatures = {f'{t.torrent_info.title}{t.torrent_info.description}'
-                                        for t in music_cache.get(domain) or []}
-                    music_torrents = [torrent for torrent in music_torrents
-                                      if f'{torrent.title}{torrent.description}' not in music_signatures]
-                if torrents or music_torrents:
-                    logger.info(f'{indexer.get("name")} 有 {len(torrents) + len(music_torrents)} 个新种子')
-                else:
-                    logger.info(f'{indexer.get("name")} 没有新种子')
-                    continue
-                try:
-                    for torrent in torrents + music_torrents:
-                        if global_vars.is_system_stopped:
-                            break
-                        if not torrent.enclosure:
-                            logger.warn(f"缺少种子链接，忽略处理: {torrent.title}")
-                            continue
-                        logger.info(f'处理资源：{torrent.title} ...')
-                        if torrent.category == MediaType.MUSIC.value:
-                            meta = MetaMusic.parse_query(torrent.title)
-                            mediainfo = MusicInfo(
-                                title=meta.title,
-                                artists=list(meta.artists),
-                                album=meta.album,
-                                year=meta.year,
-                                names=[meta.title] if meta.title else [],
-                            )
-                            candidate_recognized = False
-                            match_source = "unknown"
-                        else:
-                            meta = MetaInfo(title=torrent.title, subtitle=torrent.description)
-                            if torrent.title != meta.org_string:
-                                logger.info(f'种子名称应用识别词后发生改变：{torrent.title} => {meta.org_string}')
-                            # 使用站点种子分类，校正类型识别
-                            if meta.type != MediaType.TV \
-                                    and torrent.category == MediaType.TV.value:
-                                meta.type = MediaType.TV
-                            mediainfo = MediaChain().recognize_by_meta(
-                                meta,
-                                obtain_images=False,
-                            )
-                            if not mediainfo:
-                                logger.warn(f'{torrent.title} 未识别到媒体信息')
-                                mediainfo = MediaInfo()
-                            mediainfo.clear()
-                            candidate_recognized = bool(
-                                mediainfo and all(resolve_media_identity(media=mediainfo))
-                            )
-                            match_source = self._get_media_id_match_source(mediainfo)
-                        # 上下文
-                        context = Context(
-                            meta_info=meta,
-                            media_info=mediainfo,
-                            torrent_info=torrent,
-                            resource_source="spider" if stype == "spider" else "rss",
-                            match_source=match_source if candidate_recognized else "unknown",
-                            candidate_recognized=candidate_recognized,
-                            media_info_is_target=False,
-                        )
-                        # 如果未识别到媒体信息，设置初始失败次数为1
-                        if not mediainfo or not all(resolve_media_identity(media=mediainfo)):
-                            context.media_recognize_fail_count = 1
-                        # 添加到缓存：音乐进入独立缓存，与影视分开存储
-                        if torrent.category == MediaType.MUSIC.value:
-                            target_cache = music_cache
-                        else:
-                            target_cache = torrents_cache
-                        if not target_cache.get(domain):
-                            target_cache[domain] = [context]
-                        else:
-                            target_cache[domain].append(context)
-                        # 如果超过了限制条数则移除掉前面的，音乐与影视各自独立计算配额
-                        if len(target_cache[domain]) > settings.CONF.torrents:
-                            target_cache[domain] = target_cache[domain][-settings.CONF.torrents:]
-                finally:
-                    torrents.clear()
-                    music_torrents.clear()
-                    del torrents
-                    del music_torrents
-            else:
-                logger.info(f'{indexer.get("name")} 没有获取到种子')
+            domains.append(self._refresh_indexer(
+                indexer=indexer,
+                stype=stype,
+                include_music=include_music,
+                torrents_cache=torrents_cache,
+                music_cache=music_cache,
+            ))
 
         # 保存缓存到本地，影视与音乐分别存储
         if stype == "spider":
@@ -814,7 +786,7 @@ class TorrentsChain(ChainBase):
             rss_url, errmsg = RssHelper().get_rss_link(
                 url=site.get("url"),
                 cookie=site.get("cookie"),
-                ua=site.get("ua") or settings.USER_AGENT,
+                ua=site.get("ua") or self.runtime_config.user_agent,
                 proxy=True if site.get("proxy") else False,
                 timeout=site.get("timeout"),
             )
@@ -826,18 +798,18 @@ class TorrentsChain(ChainBase):
                     # 获取过期rss除去passkey部分
                     new_rss = re.sub(r'&passkey=([a-zA-Z0-9]+)', f'&passkey={new_passkey}', site.get("rss"))
                     logger.info(f"更新站点 {domain} RSS地址 ...")
-                    SiteOper().update_rss(domain=domain, rss=new_rss)
+                    self.site_repository.update_rss(domain=domain, rss=new_rss)
                 else:
                     # 发送消息
                     self.post_message(
                         Message(mtype=MessageType.SiteMessage, title=f"站点 {domain} RSS链接已过期",
-                                     link=settings.MP_DOMAIN('#/site'))
+                                     link=self.runtime_config.site_url)
                     )
             else:
                 self.post_message(
                     Message(mtype=MessageType.SiteMessage, title=f"站点 {domain} RSS链接已过期",
-                                 link=settings.MP_DOMAIN('#/site')))
+                                 link=self.runtime_config.site_url))
         except Exception as e:
             logger.error(f"站点 {domain} RSS链接自动获取失败：{str(e)} - {traceback.format_exc()}")
             self.post_message(Message(mtype=MessageType.SiteMessage, title=f"站点 {domain} RSS链接已过期",
-                                           link=settings.MP_DOMAIN('#/site')))
+                                           link=self.runtime_config.site_url))

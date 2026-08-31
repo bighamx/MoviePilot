@@ -1,75 +1,72 @@
 import asyncio
 import io
 import json
-import re
 import zipfile
-from collections import deque
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Optional, Union, Annotated
-from urllib.parse import urljoin, urlparse
+from typing import Annotated, Any, Optional, Union
 
-import aiofiles
 import anyio
 import pillow_avif  # noqa: F401  # pylint: disable=unused-import  # AVIF 注册副作用
-from anyio import Path as AsyncPath
-from app.application.site.sites import SitesHelper  # pylint: disable=no-name-in-module
-from fastapi import Body, Depends, HTTPException, Header, Request, Response
+from fastapi import Body, Depends, Header, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
+from app.adapters.web.security.access import verify_apitoken, verify_resource_token, verify_token
+from app.api.context import get_host_runtime
+from app.api.dependencies.auth import (
+    get_current_active_superuser,
+    get_current_active_superuser_async,
+    get_current_active_user_async,
+)
+from app.api.principal import ApiPrincipal
+from app.api.response import ResponseAPIRouter
+from app.application.backup import DatabaseBackupInProgressError
+from app.application.configuration import (
+    get_configured_system_config,
+    get_runtime_settings,
+)
+from app.application.database import get_database_governance
+from app.application.image import ImageHelper
+from app.application.messaging.message import MessageHelper
+from app.application.module import get_module_manager
+from app.application.network import get_configured_network_test_service
+from app.application.rules import RuleHelper
+from app.application.scheduling import get_scheduler
+from app.application.security.url import SecurityUtils
+from app.application.site.sites import SitesHelper  # pylint: disable=import-error,no-name-in-module
+from app.application.system import LogFileData, LogNotFoundError
+from app.chain.media import MediaChain
+from app.chain.mediaserver import MediaServerChain
+from app.chain.search.facade import SearchChain
+from app.domain.context import TorrentInfo as _DomainTorrentInfo
+from app.domain.metainfo import MetaInfo
+from app.foundation.crypto import HashUtils
+from app.foundation.environment import is_free_threaded_runtime, is_gil_enabled
+from app.runtime.execution import run_in_threadpool_to_completion
+from app.runtime.localization import LocaleHelper
+from app.runtime.log import logger
+from app.runtime.progress import AsyncProgressHelper
+from app.runtime.stop import runtime_stop_state
+from app.runtime.version import get_app_version, get_frontend_version
 from app.schemas.common import JsonObject as _SchemaJsonObject
 from app.schemas.common import JsonObjectList as _SchemaJsonObjectList
 from app.schemas.common import TimeData as _SchemaTimeData
 from app.schemas.common import ValueData as _SchemaValueData
 from app.schemas.response import Response as _SchemaResponse
+from app.schemas.system import DatabaseBackupArtifactData as _SchemaDatabaseBackupArtifactData
+from app.schemas.system import DatabaseBackupVerificationData as _SchemaDatabaseBackupVerificationData
 from app.schemas.system import NetTestTarget as _SchemaNetTestTarget
 from app.schemas.system import PluginMarketSyncData as _SchemaPluginMarketSyncData
 from app.schemas.system import PluginMarketSyncRequest as _SchemaPluginMarketSyncRequest
 from app.schemas.system import RuleTestData as _SchemaRuleTestData
 from app.schemas.system import SystemEnvironmentUpdateData as _SchemaSystemEnvironmentUpdateData
 from app.schemas.system import SystemModuleListData as _SchemaSystemModuleListData
-from app.schemas.system import TorrentInfo as _SchemaTorrentInfo
+from app.schemas.system import SystemUpdateStatus as _SchemaSystemUpdateStatus
 from app.schemas.token import TokenPayload as _SchemaTokenPayload
-from app.api.response import ResponseAPIRouter
-from app.chain.media import MediaChain
-from app.chain.mediaserver import MediaServerChain
-from app.chain.search import SearchChain
-from app.chain.system import SystemChain
-from app.runtime.config import global_vars, settings
-from app.runtime.events import eventmanager
-from app.domain.metainfo import MetaInfo
-from app.application.module import ModuleManager
-from app.adapters.web.security.access import verify_apitoken, verify_resource_token, verify_token
-from app.api.principal import ApiPrincipal
-from app.application.configuration import get_configured_system_config
-from app.api.deps import get_current_active_superuser, get_current_active_superuser_async, get_current_active_user_async
-from app.application.image import ImageHelper
-from app.runtime.localization import LocaleHelper
-from app.adapters.external.market import (
-    PLUGIN_MARKET_WIKI_URL,
-    extract_plugin_market_repos_from_wiki,
-    merge_plugin_market_repos,
-    split_plugin_market_repo_urls,
-)
-from app.application.messaging.message import MessageHelper
-from app.runtime.progress import AsyncProgressHelper
-from app.application.rules import RuleHelper
-from app.adapters.external.server import MoviePilotServerHelper
-from app.runtime.state import SystemHelper
-from app.runtime.log import logger
-from app.application.scheduling import Scheduler
-from app.schemas.event import ConfigChangeEventData
-from app.schemas.types import SystemConfigKey, EventType
-from app.foundation.crypto import HashUtils
-from app.adapters.network.http import RequestUtils, AsyncRequestUtils
-from app.adapters.system import rust as rust_accel
-from app.application.security.url import SecurityUtils
-from app.foundation.url import UrlUtils
-from version import APP_VERSION
+from app.schemas.types import SystemConfigKey
+from app.startup.composition.context import HostRuntime
 
 router = ResponseAPIRouter()
 
-_NETTEST_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 _PUBLIC_SYSTEM_CONFIG_KEYS = {
     item.value: item
     for item in (
@@ -84,325 +81,16 @@ _PUBLIC_SYSTEM_CONFIG_KEYS = {
     )
 }
 _PUBLIC_SETTINGS_KEYS = {"PLUGIN_MARKET"}
-_LOG_DOWNLOAD_LIMIT = 10
-_LOG_DOWNLOAD_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 
 
-def _validate_llm_server_tool_config(env: dict) -> Optional[str]:
-    """校验强制服务端联网搜索配置，返回用户可读错误信息。"""
-    from app.agent.llm.server_tools import (
-        ServerToolRegistry,
-        ServerToolUnavailableError,
+def _database_backup_artifact_data(artifact: Any) -> _SchemaDatabaseBackupArtifactData:
+    """将内部备份制品映射为不含宿主路径的 Web DTO。"""
+    return _SchemaDatabaseBackupArtifactData(
+        name=artifact.name,
+        db_type=artifact.db_type,
+        created_at=artifact.created_at,
+        size=artifact.size,
     )
-
-    mode = ServerToolRegistry.normalize_web_search_mode(
-        env.get(
-            "LLM_WEB_SEARCH_MODE",
-            getattr(settings, "LLM_WEB_SEARCH_MODE", "local"),
-        )
-    )
-    if mode != "builtin":
-        return None
-
-    provider = str(
-        env.get("LLM_PROVIDER", getattr(settings, "LLM_PROVIDER", "")) or ""
-    ).strip()
-    model = str(
-        env.get("LLM_MODEL", getattr(settings, "LLM_MODEL", "")) or ""
-    ).strip()
-    base_url = env.get("LLM_BASE_URL", getattr(settings, "LLM_BASE_URL", None))
-    capability = ServerToolRegistry.get_capability(
-        provider=provider,
-        model=model,
-        base_url=str(base_url or "").strip() or None,
-        tool_id="web_search",
-    )
-    if capability:
-        return None
-
-    return str(
-        ServerToolUnavailableError(
-            provider=provider,
-            model=model,
-            tool_id="web_search",
-        )
-    )
-
-
-def _is_allowed_plugin_market_wiki_url(wiki_url: str) -> bool:
-    """
-    校验插件市场 Wiki 地址是否属于固定文档源。
-    """
-    parsed_url = urlparse(wiki_url)
-    if parsed_url.scheme != "https":
-        return False
-    if (parsed_url.hostname or "").lower() != "raw.githubusercontent.com":
-        return False
-    return bool(
-        re.fullmatch(
-            r"/jxxghp/MoviePilot-Wiki/[^/]+/plugin\.md",
-            parsed_url.path,
-        )
-    )
-
-
-def _match_nettest_prefix(url: str, prefix: str) -> bool:
-    """
-    判断目标URL是否仍然落在允许的协议、主机、端口和路径前缀内。
-
-    nettest 会在服务端手动处理重定向，因此这里需要一个比简单 startswith
-    更严格的匹配，避免不同端口或同名路径被误判为白名单内跳转。
-    """
-    parsed_url = urlparse(url)
-    parsed_prefix = urlparse(prefix)
-    if parsed_url.scheme.lower() != parsed_prefix.scheme.lower():
-        return False
-    if (parsed_url.hostname or "").lower() != (parsed_prefix.hostname or "").lower():
-        return False
-    url_port = parsed_url.port or (443 if parsed_url.scheme.lower() == "https" else 80)
-    prefix_port = parsed_prefix.port or (
-        443 if parsed_prefix.scheme.lower() == "https" else 80
-    )
-    if url_port != prefix_port:
-        return False
-    return parsed_url.path.startswith(parsed_prefix.path or "/")
-
-
-def _build_nettest_rules() -> list[dict[str, Any]]:
-    """
-    构建系统内置的网络测试目标。
-
-    这里集中维护“前端允许显示哪些测试项”和“后端允许访问哪些远端地址”。
-    前端只拿到展示所需的 id/name/icon；真正的 URL、代理策略、内容校验规则
-    和重定向白名单都保留在服务端，避免再出现用户可控 SSRF。
-    """
-    github_proxy = UrlUtils.standardize_base_url(settings.GITHUB_PROXY or "")
-    pip_proxy = UrlUtils.standardize_base_url(
-        settings.PIP_PROXY or "https://pypi.org/simple/"
-    )
-    tmdb_key = settings.TMDB_API_KEY
-    tmdb_domain = settings.TMDB_API_DOMAIN or "api.themoviedb.org"
-
-    github_readme_url = "https://github.com/jxxghp/MoviePilot/blob/v2/README.md"
-    raw_readme_url = "https://raw.githubusercontent.com/jxxghp/MoviePilot/v2/README.md"
-
-    rules = [
-        {
-            "id": "tmdb_api",
-            "name": "api.themoviedb.org",
-            "icon": "tmdb",
-            "url": f"https://api.themoviedb.org/3/movie/550?api_key={tmdb_key}",
-            "proxy": True,
-            "allowed_redirect_prefixes": [
-                "https://api.themoviedb.org/3/",
-            ],
-        },
-        {
-            "id": "tmdb_api_alt",
-            "name": "api.tmdb.org",
-            "icon": "tmdb",
-            "url": f"https://api.tmdb.org/3/movie/550?api_key={tmdb_key}",
-            "proxy": True,
-            "allowed_redirect_prefixes": [
-                "https://api.tmdb.org/3/",
-            ],
-        },
-        {
-            "id": "tmdb_web",
-            "name": "www.themoviedb.org",
-            "icon": "tmdb",
-            "url": "https://www.themoviedb.org",
-            "proxy": True,
-            "allowed_redirect_prefixes": ["https://www.themoviedb.org/"],
-        },
-        {
-            "id": "tvdb_api",
-            "name": "api.thetvdb.com",
-            "icon": "tvdb",
-            "url": "https://api.thetvdb.com/series/81189",
-            "proxy": True,
-            "allowed_redirect_prefixes": ["https://api.thetvdb.com/"],
-        },
-        {
-            "id": "fanart_api",
-            "name": "webservice.fanart.tv",
-            "icon": "fanart",
-            "url": "https://webservice.fanart.tv",
-            "proxy": True,
-            "allowed_redirect_prefixes": ["https://webservice.fanart.tv/"],
-        },
-        {
-            "id": "telegram_api",
-            "name": "api.telegram.org",
-            "icon": "telegram",
-            "url": "https://api.telegram.org",
-            "proxy": True,
-            "allowed_redirect_prefixes": [
-                "https://api.telegram.org/",
-                "https://core.telegram.org/",
-            ],
-        },
-        {
-            "id": "wechat_api",
-            "name": "qyapi.weixin.qq.com",
-            "icon": "wechat",
-            "url": "https://qyapi.weixin.qq.com/cgi-bin/gettoken",
-            "proxy": False,
-            "allowed_redirect_prefixes": ["https://qyapi.weixin.qq.com/"],
-        },
-        {
-            "id": "douban_api",
-            "name": "frodo.douban.com",
-            "icon": "douban",
-            "url": "https://frodo.douban.com",
-            "proxy": False,
-            "allowed_redirect_prefixes": [
-                "https://frodo.douban.com/",
-                "https://www.douban.com/doubanapp/frodo",
-            ],
-        },
-        {
-            "id": "slack_api",
-            "name": "slack.com",
-            "icon": "slack",
-            "url": "https://slack.com",
-            "proxy": False,
-            "allowed_redirect_prefixes": [
-                "https://slack.com/",
-                "https://www.slack.com/",
-            ],
-        },
-        {
-            "id": "pip_proxy",
-            "name": "pypi.org",
-            "icon": "python",
-            "url": f"{pip_proxy}rsa/",
-            "proxy": True,
-            "allowed_redirect_prefixes": [
-                pip_proxy,
-                "https://pypi.org/simple/",
-            ],
-            "expected_text": "pypi:repository-version",
-            "invalid_message": "PIP加速代理已失效，请检查配置",
-            "proxy_name": "PIP加速代理",
-        },
-        {
-            "id": "github_proxy_web",
-            "name": "github.com",
-            "icon": "github",
-            "url": f"{github_proxy}{github_readme_url}"
-            if github_proxy
-            else github_readme_url,
-            "proxy": True,
-            "allowed_redirect_prefixes": [
-                "https://github.com/",
-                *((f"{github_proxy}https://github.com/",) if github_proxy else ()),
-            ],
-            "expected_text": "MoviePilot",
-            "invalid_message": "Github加速代理已失效，请检查配置"
-            if github_proxy
-            else "无效响应",
-            "proxy_name": "Github加速代理" if github_proxy else "",
-            "headers": settings.GITHUB_HEADERS,
-        },
-        {
-            "id": "github_api",
-            "name": "api.github.com",
-            "icon": "github",
-            "url": "https://api.github.com",
-            "proxy": True,
-            "allowed_redirect_prefixes": ["https://api.github.com/"],
-            "headers": settings.GITHUB_HEADERS,
-        },
-        {
-            "id": "github_codeload",
-            "name": "codeload.github.com",
-            "icon": "github",
-            "url": "https://codeload.github.com",
-            "proxy": True,
-            "allowed_redirect_prefixes": [
-                "https://codeload.github.com/",
-                "https://github.com/",
-            ],
-            "headers": settings.GITHUB_HEADERS,
-        },
-        {
-            "id": "github_proxy_raw",
-            "name": "raw.githubusercontent.com",
-            "icon": "github",
-            "url": f"{github_proxy}{raw_readme_url}"
-            if github_proxy
-            else raw_readme_url,
-            "proxy": True,
-            "allowed_redirect_prefixes": [
-                "https://raw.githubusercontent.com/",
-                *(
-                    (f"{github_proxy}https://raw.githubusercontent.com/",)
-                    if github_proxy
-                    else ()
-                ),
-            ],
-            "expected_text": "MoviePilot",
-            "invalid_message": "Github加速代理已失效，请检查配置"
-            if github_proxy
-            else "无效响应",
-            "proxy_name": "Github加速代理" if github_proxy else "",
-            "headers": settings.GITHUB_HEADERS,
-        },
-    ]
-    if tmdb_domain not in {"api.themoviedb.org", "api.tmdb.org"}:
-        rules.insert(
-            2,
-            {
-                "id": "tmdb_api_configured",
-                "name": tmdb_domain,
-                "icon": "tmdb",
-                "url": f"https://{tmdb_domain}/3/movie/550?api_key={tmdb_key}",
-                "proxy": True,
-                "allowed_redirect_prefixes": [
-                    f"https://{tmdb_domain}/3/",
-                ],
-            },
-        )
-    return rules
-
-
-def _collect_named_log_files(name: str) -> list[Path]:
-    """
-    根据前端传入的日志标识收集可下载日志文件。
-
-    `moviepilot` 固定表示主程序日志，其余标识按插件 ID 处理并映射到
-    `plugins/<plugin_id>.log*`。这里不接收路径或后缀，避免下载入口变成任意
-    日志文件选择器；滚动日志按当前文件优先、备份文件按修改时间倒序补足。
-    """
-    normalized_name = (name or "").strip().lower()
-    if not normalized_name or not _LOG_DOWNLOAD_NAME_PATTERN.fullmatch(normalized_name):
-        raise HTTPException(status_code=404, detail="Not Found")
-
-    log_root = settings.LOG_PATH
-    if normalized_name == "moviepilot":
-        log_dir = log_root
-        log_prefix = "moviepilot.log"
-    else:
-        log_dir = log_root / "plugins"
-        log_prefix = f"{normalized_name}.log"
-
-    if not log_dir.exists() or not log_dir.is_dir():
-        raise HTTPException(status_code=404, detail="Not Found")
-
-    current_log = log_dir / log_prefix
-    backup_logs = [
-        item
-        for item in log_dir.iterdir()
-        if item.is_file() and item.name.startswith(f"{log_prefix}.")
-    ]
-    backup_logs.sort(key=lambda item: item.stat().st_mtime, reverse=True)
-
-    log_files = []
-    if current_log.exists() and current_log.is_file():
-        log_files.append(current_log)
-    log_files.extend(backup_logs)
-    return log_files[:_LOG_DOWNLOAD_LIMIT]
 
 
 def _verify_log_resource_superuser(
@@ -420,15 +108,17 @@ def _verify_log_resource_superuser(
     return token_payload
 
 
-async def _build_log_zip_response(name: str) -> StreamingResponse:
-    """
-    将指定日志标识对应的日志文件打包为 zip 响应。
-
-    打包前逐个校验文件仍位于日志根目录内，避免符号链接或并发文件变更绕过
-    `name` 到固定目录的映射约束。zip 内使用日志根目录相对路径，便于区分
-    主程序日志与插件日志。
-    """
-    zip_data, zip_stem = await anyio.to_thread.run_sync(_build_log_zip_data, name)
+async def _build_log_zip_response(
+    name: str, runtime: HostRuntime
+) -> StreamingResponse:
+    """读取受限日志条目并生成兼容 ZIP 响应。"""
+    try:
+        entries = await runtime.system.collect_logs(name)
+    except LogNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Not Found") from error
+    zip_data, zip_stem = await anyio.to_thread.run_sync(
+        _build_log_zip_data, name, entries
+    )
     headers = {
         "Content-Disposition": f'attachment; filename="{zip_stem}.zip"'
     }
@@ -439,103 +129,22 @@ async def _build_log_zip_response(name: str) -> StreamingResponse:
     )
 
 
-def _build_log_zip_data(name: str) -> tuple[bytes, str]:
-    """
-    同步生成日志 zip 内容和文件名前缀。
-
-    日志收集、路径解析、文件读取和压缩都属于可能阻塞的本地 I/O；调用方需要
-    将本函数放到 worker thread 中执行，避免日志下载占用 ASGI 事件循环。
-    """
-    log_files = _collect_named_log_files(name)
-    if not log_files:
-        raise HTTPException(status_code=404, detail="Not Found")
-
-    log_root = settings.LOG_PATH
+def _build_log_zip_data(
+    name: str, entries: list[LogFileData]
+) -> tuple[bytes, str]:
+    """只负责把应用服务提供的日志内容编码为 ZIP framing。"""
     zip_buffer = io.BytesIO()
     filename_time = datetime.now().strftime("%Y%m%d-%H%M%S")
     safe_name = (name or "logs").strip().lower() or "logs"
     zip_stem = f"{safe_name}-logs-{filename_time}"
     with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for log_file in log_files:
-            if not SecurityUtils.is_safe_path(
-                base_path=log_root,
-                user_path=log_file,
-            ):
-                raise HTTPException(status_code=404, detail="Not Found")
-            arcname = f"{zip_stem}/{log_file.name}"
-            archive.write(log_file, arcname)
+        for entry in entries:
+            archive.writestr(f"{zip_stem}/{entry.name}", entry.content)
 
     zip_buffer.seek(0)
     return zip_buffer.getvalue(), zip_stem
 
 
-def _validate_nettest_url(url: str) -> Optional[str]:
-    """
-    对实际请求地址做基础安全校验。
-
-    即使请求来自服务端内置规则，这里仍保留一层兜底校验，防止配置项被拼出
-    非 HTTPS、带凭据或不在内置目标集合中的地址。
-    """
-    parsed = urlparse(url)
-    if parsed.scheme.lower() != "https":
-        return "测试地址仅支持 HTTPS"
-    if not parsed.netloc:
-        return "测试地址无效"
-    if parsed.username or parsed.password:
-        return "测试地址不支持携带账号信息"
-    if not _get_nettest_rule(url):
-        return "测试地址不在允许的测试目标列表中"
-    return None
-
-
-def _get_nettest_rule(
-    url: Optional[str] = None, target_id: Optional[str] = None
-) -> Optional[dict[str, Any]]:
-    """
-    根据 target_id 或历史兼容参数匹配网络测试规则。
-
-    现在的主路径是 target_id。保留 url 参数是为了兼容旧前端或未升级的调用方，
-    但匹配结果仍然只能落到服务端预定义规则上。
-    """
-    for rule in _build_nettest_rules():
-        if target_id and rule.get("id") == target_id:
-            return rule
-        if url and rule.get("url") == url:
-            return rule
-    return None
-
-
-def _is_allowed_nettest_redirect(url: str, rule: dict[str, Any]) -> bool:
-    """
-    校验重定向目标是否仍属于当前测试项允许的跳转范围。
-
-    nettest 不再信任客户端跟随重定向，而是只允许在该测试项自己的白名单内跳转，
-    这样既能兼容正常 30x，又不会把安全边界重新放开。
-    """
-    parsed = urlparse(url)
-    if parsed.scheme.lower() != "https" or not parsed.netloc:
-        return False
-    if parsed.username or parsed.password:
-        return False
-    return any(
-        _match_nettest_prefix(url, prefix)
-        for prefix in rule.get("allowed_redirect_prefixes", [])
-    )
-
-
-async def _close_nettest_response(response: Any) -> None:
-    """
-    安静地关闭 httpx 响应对象。
-
-    nettest 在手动处理重定向时会提前结束部分响应读取，这里统一做资源回收，
-    避免连接泄漏干扰后续测试。
-    """
-    if response is None or not hasattr(response, "aclose"):
-        return
-    try:
-        await response.aclose()
-    except Exception as err:
-        logger.debug(f"关闭网络测试响应失败: {err}")
 
 
 async def fetch_image(
@@ -553,14 +162,17 @@ async def fetch_image(
         return None
 
     if allowed_domains is None:
-        allowed_domains = set(settings.SECURITY_IMAGE_DOMAINS)
+        allowed_domains = set(get_runtime_settings().get("SECURITY_IMAGE_DOMAINS", []))
 
     fetch_url = SecurityUtils.strip_url_signature(url)
     # 验证URL安全性
     if not await SecurityUtils.is_safe_image_url_async(
         url,
         allowed_domains,
-        allowed_private_ranges=settings.IMAGE_PROXY_ALLOWED_PRIVATE_RANGES,
+        allowed_private_ranges=get_runtime_settings().get(
+            "IMAGE_PROXY_ALLOWED_PRIVATE_RANGES",
+            [],
+        ),
     ):
         return None
 
@@ -576,7 +188,10 @@ async def fetch_image(
 
         # 检查 If-None-Match
         etag = HashUtils.md5(content)
-        headers = RequestUtils.generate_cache_headers(etag, max_age=86400 * 7)
+        headers = {
+            "ETag": etag,
+            "Cache-Control": f"public, max-age={86400 * 7}",
+        }
         headers["Content-Type"] = media_type
         headers["X-Content-Type-Options"] = "nosniff"
         if if_none_match == etag:
@@ -618,7 +233,7 @@ async def proxy_img(
     """
     图片代理，可选是否使用代理服务器，支持 HTTP 缓存
     """
-    allowed_domains = set(settings.SECURITY_IMAGE_DOMAINS)
+    allowed_domains = set(get_runtime_settings().get("SECURITY_IMAGE_DOMAINS", []))
     cookies = (
         MediaServerChain().get_image_cookies(server=None, image_url=imgurl)
         if use_cookies
@@ -661,7 +276,9 @@ async def cache_img(
     """
     # 如果没有启用全局图片缓存，则不使用磁盘缓存
     return await fetch_image(
-        url=url, use_cache=settings.GLOBAL_IMAGE_CACHE, if_none_match=if_none_match
+        url=url,
+        use_cache=bool(get_runtime_settings().get("GLOBAL_IMAGE_CACHE")),
+        if_none_match=if_none_match,
     )
 
 
@@ -679,22 +296,23 @@ def get_global_setting(token: str):
         raise HTTPException(status_code=403, detail="Forbidden")
 
     # 白名单模式，仅包含登录前UI初始化必需的字段
-    info = settings.model_dump(
+    runtime_settings = get_runtime_settings()
+    info = runtime_settings.snapshot(
         include={
             "TMDB_IMAGE_DOMAIN",
             "GLOBAL_IMAGE_CACHE",
-            "ADVANCED_MODE",
+            "WALLPAPER_ROTATION_INTERVAL",
         }
     )
     # 追加版本信息（用于版本检查）
     info.update(
         {
-            "FRONTEND_VERSION": SystemChain.get_frontend_version(),
-            "BACKEND_VERSION": APP_VERSION,
+            "FRONTEND_VERSION": get_frontend_version(),
+            "BACKEND_VERSION": get_app_version(),
         }
     )
     # 仅在后端开发模式下返回该标记，避免生产环境暴露无意义运行态信息
-    if settings.DEV:
+    if runtime_settings.get("DEV"):
         info.update({"BACKEND_DEV": True})
     return _SchemaResponse(success=True, data=info)
 
@@ -704,13 +322,17 @@ def get_global_setting(token: str):
     summary="查询用户相关系统设置",
     response_model=_SchemaResponse[_SchemaJsonObject],
 )
-async def get_user_global_setting(_: ApiPrincipal = Depends(get_current_active_user_async)):
+async def get_user_global_setting(
+    _: ApiPrincipal = Depends(get_current_active_user_async),
+    runtime: HostRuntime = Depends(get_host_runtime),
+):
     """
     查询用户相关系统设置（登录后获取）
     包含业务功能相关的配置和用户权限信息
     """
     # 业务功能相关的配置字段
-    info = settings.model_dump(
+    runtime_settings = get_runtime_settings()
+    info = runtime_settings.snapshot(
         include={
             "AI_AGENT_ENABLE",
             "AI_AGENT_HIDE_ENTRY",
@@ -722,21 +344,113 @@ async def get_user_global_setting(_: ApiPrincipal = Depends(get_current_active_u
         }
     )
     # 智能助手总开关未开启，智能推荐状态强制返回False
-    if not settings.AI_AGENT_ENABLE:
+    if not runtime_settings.get("AI_AGENT_ENABLE"):
         info["AI_RECOMMEND_ENABLED"] = False
         info["LLM_SUPPORT_AUDIO_INPUT"] = False
         info["LLM_SUPPORT_AUDIO_OUTPUT"] = False
 
     # 追加用户唯一ID和订阅分享管理权限
-    share_admin = await MoviePilotServerHelper.async_is_admin_user()
     info.update(
         {
-            "USER_UNIQUE_ID": MoviePilotServerHelper.get_user_uuid(),
-            "SUBSCRIBE_SHARE_MANAGE": share_admin,
-            "WORKFLOW_SHARE_MANAGE": share_admin,
+            "PYTHON_FREE_THREADED": is_free_threaded_runtime(),
+            "PYTHON_GIL_ENABLED": is_gil_enabled(),
         }
     )
+    info.update(await runtime.system.user_global())
     return _SchemaResponse(success=True, data=info)
+
+
+@router.get(
+    "/database/backups",
+    summary="查询受管数据库备份",
+    response_model=list[_SchemaDatabaseBackupArtifactData],
+)
+async def list_database_backups(
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> list[_SchemaDatabaseBackupArtifactData]:
+    """列出当前备份目录中的正式制品，不触发内容校验。"""
+    try:
+        artifacts = await run_in_threadpool_to_completion(
+            get_database_governance().list_backups
+        )
+    except Exception as error:
+        logger.exception("读取数据库备份列表失败")
+        raise HTTPException(status_code=500, detail="读取数据库备份列表失败，请查看日志") from error
+    return [_database_backup_artifact_data(artifact) for artifact in artifacts]
+
+
+@router.post(
+    "/database/backups",
+    summary="立即创建数据库备份",
+    response_model=_SchemaDatabaseBackupArtifactData,
+)
+async def create_database_backup(
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaDatabaseBackupArtifactData:
+    """创建、校验并原子发布当前活动数据库的一致快照。"""
+    try:
+        artifact = await run_in_threadpool_to_completion(
+            get_database_governance().create_backup
+        )
+    except DatabaseBackupInProgressError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+    except Exception as error:
+        logger.exception("创建数据库备份失败")
+        raise HTTPException(status_code=500, detail="创建数据库备份失败，请查看日志") from error
+    return _database_backup_artifact_data(artifact)
+
+
+@router.post(
+    "/database/backups/{name}/verify",
+    summary="校验受管数据库备份",
+    response_model=_SchemaDatabaseBackupVerificationData,
+)
+async def verify_database_backup(
+    name: str,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaDatabaseBackupVerificationData:
+    """校验一个受管制品，响应不包含宿主路径或适配器错误明细。"""
+    try:
+        verification = await run_in_threadpool_to_completion(
+            get_database_governance().verify_backup,
+            name,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="数据库备份文件名无效") from error
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="数据库备份不存在") from error
+    except Exception as error:
+        logger.exception("校验数据库备份失败：%s", name)
+        raise HTTPException(status_code=500, detail="校验数据库备份失败，请查看日志") from error
+    return _SchemaDatabaseBackupVerificationData(
+        valid=verification.valid,
+        method=verification.method,
+    )
+
+
+@router.delete(
+    "/database/backups/{name}",
+    summary="删除受管数据库备份",
+    response_model=_SchemaResponse[None],
+)
+async def delete_database_backup(
+    name: str,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaResponse[None]:
+    """删除一个受管制品，只接受备份目录内的合法文件名。"""
+    try:
+        await run_in_threadpool_to_completion(
+            get_database_governance().delete_backup,
+            name,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail="数据库备份文件名无效") from error
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail="数据库备份不存在") from error
+    except Exception as error:
+        logger.exception("删除数据库备份失败：%s", name)
+        raise HTTPException(status_code=500, detail="删除数据库备份失败，请查看日志") from error
+    return _SchemaResponse(success=True)
 
 
 @router.get(
@@ -746,21 +460,25 @@ async def get_user_global_setting(_: ApiPrincipal = Depends(get_current_active_u
 )
 async def get_env_setting(
     _: ApiPrincipal = Depends(get_current_active_superuser_async),
+    runtime: HostRuntime = Depends(get_host_runtime),
 ) -> _SchemaResponse:
     """
     查询系统环境变量，包括当前版本号（仅管理员）
     """
-    info = settings.model_dump(exclude={"SECRET_KEY", "RESOURCE_SECRET_KEY"})
+    info = get_runtime_settings().snapshot(
+        exclude={"SECRET_KEY", "RESOURCE_SECRET_KEY"}
+    )
     info.update(
         {
-            "VERSION": APP_VERSION,
+            "VERSION": get_app_version(),
             "AUTH_VERSION": SitesHelper().auth_version,
             "INDEXER_VERSION": SitesHelper().indexer_version,
-            "FRONTEND_VERSION": SystemChain().get_frontend_version(),
-            "RUST_ACCEL_AVAILABLE": rust_accel.is_available(),
-            "RUST_ACCEL_ENABLED": rust_accel.is_enabled(),
+            "FRONTEND_VERSION": get_frontend_version(),
+            "PYTHON_FREE_THREADED": is_free_threaded_runtime(),
+            "PYTHON_GIL_ENABLED": is_gil_enabled(),
         }
     )
+    info.update(runtime.system.runtime_features())
     return _SchemaResponse(success=True, data=info)
 
 
@@ -769,11 +487,14 @@ async def get_env_setting(
     summary="查询安装版本统计报表",
     response_model=_SchemaResponse[_SchemaJsonObject],
 )
-async def usage_statistic(_: ApiPrincipal = Depends(get_current_active_user_async)):
+async def usage_statistic(
+    _: ApiPrincipal = Depends(get_current_active_user_async),
+    runtime: HostRuntime = Depends(get_host_runtime),
+):
     """
     查询安装版本统计报表
     """
-    return _SchemaResponse(success=True, data=await MoviePilotServerHelper.async_get_usage_statistic())
+    return _SchemaResponse(success=True, data=await runtime.system.usage())
 
 
 @router.get("/ping", summary="服务存活检测", response_model=_SchemaResponse[None])
@@ -790,40 +511,18 @@ async def ping(_: ApiPrincipal = Depends(get_current_active_user_async)) -> _Sch
     response_model=_SchemaResponse[_SchemaSystemEnvironmentUpdateData],
 )
 async def set_env_setting(
-    env: dict, _: ApiPrincipal = Depends(get_current_active_superuser_async)
+    env: dict,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+    runtime: HostRuntime = Depends(get_host_runtime),
 ):
     """
     更新系统环境变量（仅管理员）
     """
-    validation_error = _validate_llm_server_tool_config(env)
-    if validation_error:
-        return _SchemaResponse(success=False, message=validation_error)
-
-    result = settings.update_settings(env=env)
-    # 统计成功和失败的结果
-    success_updates = {k: v for k, v in result.items() if v[0]}
-    failed_updates = {k: v for k, v in result.items() if v[0] is False}
-
-    if failed_updates:
-        return _SchemaResponse(
-            success=False,
-            message=f"{', '.join([v[1] for v in failed_updates.values()])}",
-            data={"success_updates": success_updates, "failed_updates": failed_updates},
-        )
-
-    if success_updates:
-        # 发送配置变更事件
-        await eventmanager.async_send_event(
-            etype=EventType.ConfigChanged,
-            data=ConfigChangeEventData(
-                key=success_updates.keys(), change_type="update"
-            ),
-        )
-
+    result = await runtime.system.update_environment(env)
     return _SchemaResponse(
-        success=True,
-        message="所有配置项更新成功",
-        data={"success_updates": success_updates},
+        success=result.success,
+        message=result.message,
+        data=result.data,
     )
 
 
@@ -852,7 +551,7 @@ async def get_progress(
 
     async def event_generator():
         try:
-            while not global_vars.is_system_stopped:
+            while not runtime_stop_state.is_system_stopped:
                 if await request.is_disconnected():
                     break
                 detail = await progress.get(locale=locale)
@@ -876,7 +575,10 @@ async def get_public_setting(
     查询普通用户可读取的非敏感系统设置
     """
     if key in _PUBLIC_SETTINGS_KEYS:
-        return _SchemaResponse(success=True, data={"value": getattr(settings, key)})
+        return _SchemaResponse(
+            success=True,
+            data={"value": get_runtime_settings().get(key)},
+        )
     if key not in _PUBLIC_SYSTEM_CONFIG_KEYS:
         raise HTTPException(status_code=404, detail="配置项不存在")
     value = get_configured_system_config().get(_PUBLIC_SYSTEM_CONFIG_KEYS[key])
@@ -891,62 +593,18 @@ async def get_public_setting(
 async def sync_plugin_market_from_wiki(
     request: Optional[_SchemaPluginMarketSyncRequest] = Body(default=None),
     _: ApiPrincipal = Depends(get_current_active_superuser_async),
+    runtime: HostRuntime = Depends(get_host_runtime),
 ) -> _SchemaResponse:
     """
     从 Wiki 插件文档同步插件市场仓库地址。
     """
-    wiki_url = (request.wiki_url if request else None) or PLUGIN_MARKET_WIKI_URL
-    wiki_url = wiki_url.strip()
-    if not _is_allowed_plugin_market_wiki_url(wiki_url):
-        return _SchemaResponse(success=False, message="不支持的 Wiki 同步地址")
-
-    res = await AsyncRequestUtils(
-        ua=settings.USER_AGENT,
-        proxies=settings.PROXY,
-        timeout=30,
-        content_type=None,
-        accept_type="text/plain,*/*",
-    ).get_res(wiki_url)
-    if res is None:
-        return _SchemaResponse(success=False, message="无法访问 Wiki 插件仓库清单")
-    if res.status_code != 200:
-        return _SchemaResponse(
-            success=False,
-            message=f"访问 Wiki 插件仓库清单失败，状态码：{res.status_code}",
-        )
-
-    wiki_repos = extract_plugin_market_repos_from_wiki(res.text)
-    if not wiki_repos:
-        return _SchemaResponse(success=False, message="未在 Wiki 中识别到插件仓库地址")
-
-    local_repos = split_plugin_market_repo_urls(settings.PLUGIN_MARKET)
-    local_repo_keys = {repo.lower() for repo in local_repos}
-    added_count = len([repo for repo in wiki_repos if repo.lower() not in local_repo_keys])
-    merged_repos = merge_plugin_market_repos(local_repos, wiki_repos)
-    merged_value = ",".join(merged_repos)
-
-    success, message = settings.update_setting("PLUGIN_MARKET", merged_value)
-    if success:
-        await eventmanager.async_send_event(
-            etype=EventType.ConfigChanged,
-            data=ConfigChangeEventData(
-                key="PLUGIN_MARKET", value=merged_value, change_type="update"
-            ),
-        )
-    elif success is None:
-        success = True
-
+    result = await runtime.system.sync_plugin_market(
+        request.wiki_url if request else None
+    )
     return _SchemaResponse(
-        success=success,
-        message=message,
-        data={
-            "value": merged_value,
-            "repos": merged_repos,
-            "wiki_repos": wiki_repos,
-            "added_count": added_count,
-            "total_count": len(merged_repos),
-            "source_url": wiki_url,
-        },
+        success=result.success,
+        message=result.message,
+        data=result.data,
     )
 
 
@@ -961,8 +619,9 @@ async def get_setting(
     """
     查询系统设置（仅管理员）
     """
-    if hasattr(settings, key):
-        value = getattr(settings, key)
+    runtime_settings = get_runtime_settings()
+    if runtime_settings.contains(key):
+        value = runtime_settings.get(key)
     else:
         value = get_configured_system_config().get(key)
     return _SchemaResponse(success=True, data={"value": value})
@@ -973,35 +632,13 @@ async def set_setting(
     key: str,
     value: Annotated[Union[list, dict, bool, int, str] | None, Body()] = None,
     _: ApiPrincipal = Depends(get_current_active_superuser_async),
+    runtime: HostRuntime = Depends(get_host_runtime),
 ):
     """
     更新系统设置（仅管理员）
     """
-    if hasattr(settings, key):
-        success, message = settings.update_setting(key=key, value=value)
-        if success:
-            # 发送配置变更事件
-            await eventmanager.async_send_event(
-                etype=EventType.ConfigChanged,
-                data=ConfigChangeEventData(key=key, value=value, change_type="update"),
-            )
-        elif success is None:
-            success = True
-        return _SchemaResponse(success=success, message=message)
-    elif key in {item.value for item in SystemConfigKey}:
-        if isinstance(value, list):
-            value = list(filter(None, value))
-            value = value if value else None
-        success = await get_configured_system_config().async_set(key, value)
-        if success:
-            # 发送配置变更事件
-            await eventmanager.async_send_event(
-                etype=EventType.ConfigChanged,
-                data=ConfigChangeEventData(key=key, value=value, change_type="update"),
-            )
-        return _SchemaResponse(success=True)
-    else:
-        return _SchemaResponse(success=False, message=f"配置项 '{key}' 不存在")
+    result = await runtime.system.update_setting(key, value)
+    return _SchemaResponse(success=result.success, message=result.message)
 
 
 @router.get(
@@ -1028,7 +665,7 @@ async def get_message(
 
     async def event_generator():
         try:
-            while not global_vars.is_system_stopped:
+            while not runtime_stop_state.is_system_stopped:
                 if await request.is_disconnected():
                     break
                 detail = message.get(role)
@@ -1040,132 +677,64 @@ async def get_message(
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+async def _get_logging_impl(
+    request: Request,
+    length: Optional[int] = 50,
+    logfile: Optional[str] = "moviepilot.log",
+    _: _SchemaTokenPayload = Depends(_verify_log_resource_superuser),
+    runtime: HostRuntime = Depends(get_host_runtime),
+):
+    """把应用服务提供的日志数据映射为文本或 SSE 响应。"""
+    resolved_logfile = logfile or "moviepilot.log"
+    if length == -1:
+        try:
+            return Response(
+                content=await runtime.system.read_log(resolved_logfile),
+                media_type="text/plain",
+            )
+        except LogNotFoundError as error:
+            raise HTTPException(status_code=404, detail="Not Found") from error
+        except Exception as error:
+            return Response(
+                content=f"读取日志文件失败: {error}", media_type="text/plain"
+            )
+    try:
+        source = await runtime.system.follow_log(
+            resolved_logfile, length or 50, request.is_disconnected
+        )
+    except LogNotFoundError as error:
+        raise HTTPException(status_code=404, detail="Not Found") from error
+
+    async def event_generator():
+        """只为原始日志行添加 SSE data framing。"""
+        try:
+            async for line in source:
+                yield f"data: {line}\n\n"
+        except asyncio.CancelledError:
+            return
+        except Exception as error:
+            logger.error("日志读取异常: %s", error)
+            yield f"data: 日志读取异常: {error}\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @router.get(
     "/logging",
     summary="实时日志",
     response_model=None,
     response_class=StreamingResponse,
-    responses={
-        200: {
-            "description": "实时日志流或完整日志文本",
-            "content": {
-                "text/event-stream": {"schema": {"type": "string"}},
-                "text/plain": {"schema": {"type": "string"}},
-            },
-        }
-    },
+    responses={200: {"description": "实时日志流或完整日志文本", "content": {"text/event-stream": {"schema": {"type": "string"}}, "text/plain": {"schema": {"type": "string"}}}}},
 )
 async def get_logging(
     request: Request,
     length: Optional[int] = 50,
     logfile: Optional[str] = "moviepilot.log",
     _: _SchemaTokenPayload = Depends(_verify_log_resource_superuser),
+    runtime: HostRuntime = Depends(get_host_runtime),
 ):
-    """
-    实时获取系统日志
-    length = -1 时, 返回text/plain
-    否则 返回格式SSE
-    """
-    base_path = AsyncPath(settings.LOG_PATH)
-    log_path = base_path / logfile
-
-    if not await SecurityUtils.async_is_safe_path(
-        base_path=base_path, user_path=log_path, allowed_suffixes={".log"}
-    ):
-        raise HTTPException(status_code=404, detail="Not Found")
-
-    if not await log_path.exists() or not await log_path.is_file():
-        raise HTTPException(status_code=404, detail="Not Found")
-
-    async def log_generator():
-        try:
-            # 使用固定大小的双向队列来限制内存使用
-            lines_queue = deque(maxlen=max(length, 50))
-            # 获取文件大小
-            file_stat = await log_path.stat()
-            file_size = file_stat.st_size
-
-            # 读取历史日志
-            async with aiofiles.open(
-                log_path, mode="r", encoding="utf-8", errors="replace"
-            ) as f:
-                # 优化大文件读取策略
-                if file_size > 100 * 1024:
-                    # 只读取最后100KB的内容
-                    bytes_to_read = min(file_size, 100 * 1024)
-                    position = file_size - bytes_to_read
-                    await f.seek(position)
-                    content = await f.read()
-                    # 找到第一个完整的行
-                    first_newline = content.find("\n")
-                    if first_newline != -1:
-                        content = content[first_newline + 1 :]
-                else:
-                    # 小文件直接读取全部内容
-                    content = await f.read()
-
-                # 按行分割并添加到队列，只保留非空行
-                lines = [line.strip() for line in content.splitlines() if line.strip()]
-                # 只取最后N行
-                for line in lines[-max(length, 50) :]:
-                    lines_queue.append(line)
-
-            # 输出历史日志
-            for line in lines_queue:
-                yield f"data: {line}\n\n"
-
-            # 实时监听新日志
-            async with aiofiles.open(
-                log_path, mode="r", encoding="utf-8", errors="replace"
-            ) as f:
-                # 移动文件指针到文件末尾，继续监听新增内容
-                await f.seek(0, 2)
-                # 记录初始文件大小
-                initial_stat = await log_path.stat()
-                initial_size = initial_stat.st_size
-                # 实时监听新日志，使用更短的轮询间隔
-                while not global_vars.is_system_stopped:
-                    if await request.is_disconnected():
-                        break
-                    # 检查文件是否有新内容
-                    current_stat = await log_path.stat()
-                    current_size = current_stat.st_size
-                    if current_size > initial_size:
-                        # 文件有新内容，读取新行
-                        line = await f.readline()
-                        if line:
-                            line = line.strip()
-                            if line:
-                                yield f"data: {line}\n\n"
-                        initial_size = current_size
-                    else:
-                        # 没有新内容，短暂等待
-                        await asyncio.sleep(0.5)
-        except asyncio.CancelledError:
-            return
-        except Exception as err:
-            logger.error(f"日志读取异常: {err}")
-            yield f"data: 日志读取异常: {err}\n\n"
-
-    # 根据length参数返回不同的响应
-    if length == -1:
-        # 返回全部日志作为文本响应
-        if not await log_path.exists():
-            return Response(content="日志文件不存在！", media_type="text/plain")
-        try:
-            # 使用 aiofiles 异步读取文件
-            async with aiofiles.open(
-                log_path, mode="r", encoding="utf-8", errors="replace"
-            ) as file:
-                text = await file.read()
-            # 倒序输出
-            text = "\n".join(text.split("\n")[::-1])
-            return Response(content=text, media_type="text/plain")
-        except Exception as e:
-            return Response(content=f"读取日志文件失败: {e}", media_type="text/plain")
-    else:
-        # 返回SSE流响应
-        return StreamingResponse(log_generator(), media_type="text/event-stream")
+    """实时日志的兼容公开入口。"""
+    return await _get_logging_impl(request, length, logfile, _, runtime)
 
 
 @router.get(
@@ -1187,11 +756,12 @@ async def get_logging(
 async def download_logging(
     name: str,
     _: _SchemaTokenPayload = Depends(_verify_log_resource_superuser),
+    runtime: HostRuntime = Depends(get_host_runtime),
 ):
     """
     按日志标识下载主程序或插件滚动日志，返回 zip 文件。
     """
-    return await _build_log_zip_response(name)
+    return await _build_log_zip_response(name, runtime)
 
 
 @router.get(
@@ -1199,17 +769,16 @@ async def download_logging(
     summary="查询Github所有Release版本",
     response_model=_SchemaResponse[_SchemaJsonObjectList],
 )
-async def latest_version(_: _SchemaTokenPayload = Depends(verify_token)):
+async def latest_version(
+    _: _SchemaTokenPayload = Depends(verify_token),
+    runtime: HostRuntime = Depends(get_host_runtime),
+):
     """
     查询Github所有Release版本
     """
-    version_res = await AsyncRequestUtils(
-        proxies=settings.PROXY, headers=settings.GITHUB_HEADERS
-    ).get_res(f"https://api.github.com/repos/jxxghp/MoviePilot/releases")
-    if version_res is not None and version_res.status_code == 200:
-        ver_json = version_res.json()
-        if ver_json:
-            return _SchemaResponse(success=True, data=ver_json)
+    releases = await runtime.system.releases()
+    if releases:
+        return _SchemaResponse(success=True, data=releases)
     return _SchemaResponse(success=False)
 
 
@@ -1228,9 +797,9 @@ def ruletest(
     过滤规则测试，规则类型 1-订阅，2-洗版，3-搜索
     """
     metainfo = MetaInfo(title=title, subtitle=subtitle)
-    torrent = _SchemaTorrentInfo(
+    torrent = _DomainTorrentInfo(
         title=title,
-        description=subtitle,
+        description=subtitle or "",
     )
     # 查询规则组详情
     rulegroup = RuleHelper().get_rule_group(rulegroup_name)
@@ -1241,7 +810,7 @@ def ruletest(
         "rulegroup": rulegroup.model_dump() if rulegroup else None,
         "meta_info": metainfo.to_dict(),
         "media_info": None,
-        "torrent_info": torrent.model_dump(),
+        "torrent_info": torrent.to_dict(),
         "priority": None,
         "matched": False,
     }
@@ -1267,7 +836,9 @@ def ruletest(
 
     # 过滤
     result = SearchChain().filter_torrents(
-        rule_groups=[rulegroup.name], torrent_list=[torrent], mediainfo=media_info
+        rule_groups=[rulegroup.name or rulegroup_name],
+        torrent_list=[torrent],
+        mediainfo=media_info,
     )
     if not result:
         return _SchemaResponse(
@@ -1279,7 +850,7 @@ def ruletest(
         {
             "matched": True,
             "priority": 100 - result[0].pri_order + 1,
-            "torrent_info": result[0].model_dump(),
+            "torrent_info": result[0].to_dict(),
         }
     )
     return _SchemaResponse(
@@ -1300,16 +871,10 @@ async def nettest_targets(_: _SchemaTokenPayload = Depends(verify_token)):
     这里只返回前端渲染所需的最小信息，避免把可请求 URL、内容校验规则和
     跳转白名单暴露给客户端。
     """
+    targets = get_configured_network_test_service().list_targets()
     return _SchemaResponse(
         success=True,
-        data=[
-            {
-                "id": item["id"],
-                "name": item["name"],
-                "icon": item["icon"],
-            }
-            for item in _build_nettest_rules()
-        ],
+        data=[{"id": item.id, "name": item.name, "icon": item.icon} for item in targets],
     )
 
 
@@ -1330,81 +895,17 @@ async def nettest(
     `target_id` 是当前前端使用的正式入口。`url/proxy/include` 仅作兼容保留，
     其中 `include` 不再参与客户端可控的内容匹配，具体校验由服务端规则决定。
     """
-    target = _get_nettest_rule(url=url, target_id=target_id)
-    if not target:
-        return _SchemaResponse(success=False, message="测试目标不存在")
-    # 记录开始的毫秒数
-    start_time = datetime.now()
-    url = target["url"]
-    invalid_message = _validate_nettest_url(url)
-    if invalid_message:
-        logger.warning(f"拦截不安全的网络测试地址: {url}")
-        return _SchemaResponse(success=False, message=invalid_message)
-    if include:
-        logger.debug("nettest include 参数已忽略，改为服务端固定校验")
-
-    request_utils = AsyncRequestUtils(
-        proxies=settings.PROXY if target.get("proxy") else None,
-        headers=target.get("headers"),
-        timeout=10,
-        ua=settings.NORMAL_USER_AGENT,
-        verify=True,
-        follow_redirects=False,
+    result = await get_configured_network_test_service().execute(
+        target_id=target_id,
+        url=url,
+        include=include,
     )
-    result = None
-    current_url = url
-    redirect_count = 0
-    while redirect_count <= 3:
-        result = await request_utils.get_res(current_url, allow_redirects=False)
-        if result is None:
-            break
-        if result.status_code not in _NETTEST_REDIRECT_STATUS_CODES:
-            break
-        location = result.headers.get("location")
-        if not location:
-            break
-        next_url = urljoin(current_url, location)
-        if not _is_allowed_nettest_redirect(next_url, target):
-            await _close_nettest_response(result)
-            logger.warning(f"拦截网络测试重定向: {current_url} -> {next_url}")
-            return _SchemaResponse(success=False, message="测试目标发生了未授权跳转")
-        await _close_nettest_response(result)
-        current_url = next_url
-        redirect_count += 1
-    if redirect_count > 3:
-        return _SchemaResponse(success=False, message="测试目标重定向次数过多")
-    # 计时结束的毫秒数
-    end_time = datetime.now()
-    time = round((end_time - start_time).total_seconds() * 1000)
-    # 计算相关秒数
-    if result is None:
-        return _SchemaResponse(
-            success=False,
-            message=f"{target.get('proxy_name') or target.get('name')}无法连接",
-            data={"time": time},
-        )
-    elif result.status_code == 200:
-        expected_text = target.get("expected_text")
-        if expected_text and expected_text.lower() not in (result.text or "").lower():
-            return _SchemaResponse(
-                success=False,
-                message=target.get("invalid_message") or "无效响应",
-                data={"time": time},
-            )
-        return _SchemaResponse(success=True, data={"time": time})
-    else:
-        if target.get("proxy_name"):
-            # 加速代理失败
-            message = f"{target['proxy_name']}已失效，错误码：{result.status_code}"
-        else:
-            message = f"错误码：{result.status_code}"
-            if "github" in url:
-                # 非加速代理访问github
-                if result.status_code == 401:
-                    message = "Github Token已失效，请检查配置"
-                elif result.status_code in {403, 429}:
-                    message = "触发限流，请配置Github Token"
-        return _SchemaResponse(success=False, message=message, data={"time": time})
+    data = {"time": result.elapsed_ms} if result.elapsed_ms is not None else None
+    return _SchemaResponse(
+        success=result.success,
+        message=result.message,
+        data=data,
+    )
 
 
 @router.get(
@@ -1417,7 +918,7 @@ def modulelist(_: _SchemaTokenPayload = Depends(verify_token)):
     查询已加载的模块ID列表
     """
     modules = []
-    for spec in ModuleManager().list_specs():
+    for spec in get_module_manager().list_specs():
         module_id = spec.id
         name = str(spec.metadata["name"])
         modules.append(
@@ -1441,37 +942,87 @@ def moduletest(moduleid: str, _: _SchemaTokenPayload = Depends(verify_token)):
     """
     模块可用性测试接口
     """
-    state, errmsg = ModuleManager().test(moduleid)
+    state, errmsg = get_module_manager().test(moduleid)
     return _SchemaResponse(success=state, message=errmsg)
 
 
 @router.get("/restart", summary="重启系统", response_model=_SchemaResponse[None])
-def restart_system(_: ApiPrincipal = Depends(get_current_active_superuser)):
+def restart_system(
+    _: ApiPrincipal = Depends(get_current_active_superuser),
+    runtime: HostRuntime = Depends(get_host_runtime),
+):
     """
     重启系统（仅管理员）
     """
-    if not SystemHelper.can_restart():
-        return _SchemaResponse(success=False, message="当前运行环境不支持重启操作！")
-    ret, msg = SystemHelper.restart()
-    return _SchemaResponse(success=ret, message=msg)
+    result = runtime.system.restart()
+    return _SchemaResponse(success=result.success, message=result.message)
 
 
-@router.post("/upgrade", summary="升级并重启系统", response_model=_SchemaResponse[None])
+@router.post("/upgrade", summary="Dev 更新并重启系统", response_model=_SchemaResponse[None])
 def upgrade_system(
     mode: Annotated[str | None, Body()] = None,
     _: ApiPrincipal = Depends(get_current_active_superuser),
+    runtime: HostRuntime = Depends(get_host_runtime),
 ):
-    """
-    触发系统升级并重启（仅管理员）
+    """保留 Dev 更新入口；Release 更新必须使用后台下载与确认安装流程。"""
+    result = runtime.system.upgrade(mode)
+    return _SchemaResponse(success=result.success, message=result.message)
 
-    - 当前已开启自动升级时：直接重启，由启动流程完成升级。
-    - 当前未开启自动升级时：写入一次性升级标记，本次重启后仅执行一次升级。
-    """
-    if not SystemHelper.can_restart():
-        return _SchemaResponse(success=False, message="当前运行环境不支持升级操作！")
 
-    ret, msg = SystemHelper.upgrade(mode=mode or "release")
-    return _SchemaResponse(success=ret, message=msg)
+@router.get(
+    "/update/status",
+    summary="查询系统更新状态",
+    response_model=_SchemaResponse[_SchemaSystemUpdateStatus],
+)
+def system_update_status(
+    _: ApiPrincipal = Depends(get_current_active_superuser),
+    runtime: HostRuntime = Depends(get_host_runtime),
+):
+    """返回后台检查、下载或待安装状态（仅管理员）。"""
+    return _SchemaResponse(success=True, data=runtime.system.update_status())
+
+
+@router.post(
+    "/update/check",
+    summary="立即检查系统更新",
+    response_model=_SchemaResponse[_SchemaSystemUpdateStatus],
+)
+def check_system_update(
+    _: ApiPrincipal = Depends(get_current_active_superuser),
+    runtime: HostRuntime = Depends(get_host_runtime),
+):
+    """立即查询 GitHub Release（仅管理员）。"""
+    return _SchemaResponse(success=True, data=runtime.system.check_update())
+
+
+@router.post(
+    "/update/download",
+    summary="后台下载系统更新",
+    response_model=_SchemaResponse[_SchemaSystemUpdateStatus],
+)
+def download_system_update(
+    _: ApiPrincipal = Depends(get_current_active_superuser),
+    runtime: HostRuntime = Depends(get_host_runtime),
+):
+    """启动后台下载并立即返回当前状态（仅管理员）。"""
+    result = runtime.system.download_update()
+    return _SchemaResponse(
+        success=result.success, data=result.data, message=result.message
+    )
+
+
+@router.post(
+    "/update/install",
+    summary="确认重启安装系统更新",
+    response_model=_SchemaResponse[None],
+)
+def install_system_update(
+    _: ApiPrincipal = Depends(get_current_active_superuser),
+    runtime: HostRuntime = Depends(get_host_runtime),
+):
+    """确认消费已校验更新包，并重启进入安装阶段（仅管理员）。"""
+    result = runtime.system.install_update()
+    return _SchemaResponse(success=result.success, message=result.message)
 
 
 @router.get("/runscheduler", summary="运行服务", response_model=_SchemaResponse[None])
@@ -1482,9 +1033,9 @@ def run_scheduler(jobid: str, _: ApiPrincipal = Depends(get_current_active_super
     if not jobid:
         return _SchemaResponse(success=False, message="命令不能为空！")
     if jobid in {"recommend_refresh", "cookiecloud"}:
-        Scheduler().start(jobid, manual=True)
+        get_scheduler().start(jobid, manual=True)
     else:
-        Scheduler().start(jobid)
+        get_scheduler().start(jobid)
     return _SchemaResponse(success=True)
 
 
@@ -1499,7 +1050,7 @@ def run_scheduler2(jobid: str, _: Annotated[str, Depends(verify_apitoken)]):
         return _SchemaResponse(success=False, message="命令不能为空！")
 
     if jobid in {"recommend_refresh", "cookiecloud"}:
-        Scheduler().start(jobid, manual=True)
+        get_scheduler().start(jobid, manual=True)
     else:
-        Scheduler().start(jobid)
+        get_scheduler().start(jobid)
     return _SchemaResponse(success=True)

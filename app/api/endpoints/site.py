@@ -1,8 +1,36 @@
-from typing import List, Any, Dict, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from fastapi import Depends, HTTPException
-from starlette.background import BackgroundTasks
 
+from app.adapters.web.security.access import verify_token
+from app.api.context import get_background_task_registry, resolve_background_task_registry
+from app.api.dependencies.auth import (
+    get_current_active_manage_user,
+    get_current_active_manage_user_async,
+    get_current_active_superuser,
+    get_current_active_superuser_async,
+)
+from app.api.dependencies.site import (
+    get_site_mutation_command,
+    get_site_query_service,
+    get_site_sync_query_service,
+)
+from app.api.endpoints.plugin import register_plugin_api
+from app.api.principal import ApiPrincipal
+from app.api.response import ResponseAPIRouter
+from app.application.commands import init_commands
+from app.application.configuration import get_configured_system_config
+from app.application.plugin.runtime import get_plugin_manager
+from app.application.scheduling import get_scheduler
+from app.application.site.mutation import SiteMutationCommand
+from app.application.site.query import SiteQueryService
+from app.application.site.sites import SitesHelper  # pylint: disable=import-error,no-name-in-module
+from app.chain.site import SiteChain
+from app.chain.torrents import TorrentsChain
+from app.domain import site as site_rules
+from app.runtime.log import logger
+from app.runtime.tasks import TaskRegistry
+from app.schemas.common import JsonData
 from app.schemas.common import JsonObject as _SchemaJsonObject
 from app.schemas.response import Response as _SchemaResponse
 from app.schemas.site import SiteAuth as _SchemaSiteAuth
@@ -14,32 +42,8 @@ from app.schemas.site import SiteStatistic as _SchemaSiteStatistic
 from app.schemas.site import SiteUserData as _SchemaSiteUserData
 from app.schemas.system import TorrentInfo as _SchemaTorrentInfo
 from app.schemas.token import TokenPayload as _SchemaTokenPayload
+from app.schemas.types import MediaType, SystemConfigKey
 from app.schemas.workflow import Site as _SchemaSite
-from app.api.response import ResponseAPIRouter
-from app.application.site.mutation import SiteMutationCommand
-from app.application.site.query import SiteQueryService
-from app.api.endpoints.plugin import register_plugin_api
-from app.chain.site import SiteChain
-from app.chain.torrents import TorrentsChain
-from app.command import Command
-from app.application.plugin.runtime import get_plugin_manager as PluginManager
-from app.adapters.web.security.access import verify_token
-from app.api.principal import ApiPrincipal
-from app.application.configuration import get_configured_system_config
-from app.api.deps import (
-    get_current_active_manage_user,
-    get_current_active_manage_user_async,
-    get_current_active_superuser,
-    get_current_active_superuser_async,
-    get_site_mutation_command,
-    get_site_query_service,
-    get_site_sync_query_service,
-)
-from app.application.site.sites import SitesHelper  # pylint: disable=no-name-in-module
-from app.runtime.log import logger
-from app.application.scheduling import Scheduler
-from app.schemas.types import SystemConfigKey, MediaType
-from app.domain import site as site_rules
 
 router = ResponseAPIRouter()
 
@@ -167,18 +171,21 @@ async def update_site(
 
 @router.get("/cookiecloud", summary="CookieCloud同步", response_model=_SchemaResponse[None])
 async def cookie_cloud_sync(
-    background_tasks: BackgroundTasks,
+    task_registry: Annotated[TaskRegistry, Depends(get_background_task_registry)],
     _: ApiPrincipal = Depends(get_current_active_superuser_async),
 ) -> Any:
     """
     运行CookieCloud同步站点信息
     """
-    background_tasks.add_task(Scheduler().start, job_id="cookiecloud")
+    resolve_background_task_registry(task_registry).create_sync(
+        get_scheduler().start, job_id="cookiecloud", owner="api.site.cookiecloud_sync"
+    )
     return _SchemaResponse(success=True, message="CookieCloud同步任务已启动！")
 
 
 @router.get("/reset", summary="重置站点", response_model=_SchemaResponse[None])
 async def reset(
+    task_registry: Annotated[TaskRegistry, Depends(get_background_task_registry)],
     command: SiteMutationCommand = Depends(get_site_mutation_command),
     _: ApiPrincipal = Depends(get_current_active_superuser_async),
 ) -> Any:
@@ -186,11 +193,14 @@ async def reset(
     清空所有站点数据并重新同步CookieCloud站点信息
     """
     result = await command.reset()
-    get_configured_system_config().set(SystemConfigKey.IndexerSites, [])
-    get_configured_system_config().set(SystemConfigKey.RssSites, [])
-    # 启动定时服务
-    Scheduler().start("cookiecloud", manual=True)
-    # 插件站点删除
+    await get_configured_system_config().async_set(SystemConfigKey.IndexerSites, [])
+    await get_configured_system_config().async_set(SystemConfigKey.RssSites, [])
+    resolve_background_task_registry(task_registry).create_sync(
+        get_scheduler().start,
+        job_id="cookiecloud",
+        owner="api.site.reset",
+        manual=True,
+    )
     return _SchemaResponse(success=result.success, message="站点已重置！")
 
 
@@ -198,7 +208,7 @@ async def reset(
     "/priorities", summary="批量更新站点优先级", response_model=_SchemaResponse[None]
 )
 async def update_sites_priority(
-    priorities: List[dict],
+    priorities: List[Dict[str, JsonData]],
     command: SiteMutationCommand = Depends(get_site_mutation_command),
     _: ApiPrincipal = Depends(get_current_active_manage_user_async),
 ) -> Any:
@@ -557,9 +567,9 @@ def auth_site(
     status, msg = SitesHelper().check_user(auth_info.site, auth_info.params)
     get_configured_system_config().set(SystemConfigKey.UserSiteAuthParams, auth_info.model_dump())
     # 认证成功后，重新初始化插件
-    PluginManager().init_config()
-    Scheduler().init_plugin_jobs()
-    Command().init_commands()
+    get_plugin_manager().init_config()
+    get_scheduler().init_plugin_jobs()
+    init_commands()
     register_plugin_api()
     return _SchemaResponse(success=status, message=msg)
 
@@ -570,14 +580,14 @@ def auth_site(
     response_model=_SchemaResponse[_SchemaSiteMappingData],
 )
 async def site_mapping(
-    query: SiteQueryService = Depends(get_site_sync_query_service),
+    query: SiteQueryService = Depends(get_site_query_service),
     _: ApiPrincipal = Depends(get_current_active_superuser_async),
 ):
     """
     获取站点域名到名称的映射关系
     """
     try:
-        sites = query.list_sync()
+        sites = await query.list_ordered()
         mapping = {}
         for site in sites:
             mapping[site.domain] = site.name

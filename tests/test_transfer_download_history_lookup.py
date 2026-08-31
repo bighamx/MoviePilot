@@ -64,7 +64,7 @@ def test_resolve_download_history_falls_back_to_parent_download_path():
     )
 
     history = _make_chain()._resolve_download_history(
-        downloadhis=oper,
+        repository=oper,
         file_path=Path("/downloads/season-pack/Test.Show.S01E01.mkv"),
     )
 
@@ -85,7 +85,7 @@ def test_resolve_download_history_falls_back_to_unique_savepath_hash():
     )
 
     history = _make_chain()._resolve_download_history(
-        downloadhis=oper,
+        repository=oper,
         file_path=Path("/downloads/season-pack/subs/Test.Show.S01E01.zh.ass"),
     )
 
@@ -108,7 +108,7 @@ def test_resolve_download_history_skips_ambiguous_savepath_hashes():
     )
 
     history = _make_chain()._resolve_download_history(
-        downloadhis=oper,
+        repository=oper,
         file_path=Path("/downloads/shared/Test.Show.S01E01.mkv"),
     )
 
@@ -123,12 +123,12 @@ def test_resolve_download_history_stops_at_shared_download_root_path(monkeypatch
         }
     )
     monkeypatch.setattr(
-        "app.chain.transfer.DirectoryHelper.get_download_dirs",
+        "app.chain.transfer.workflow.DirectoryHelper.get_download_dirs",
         lambda _: [_download_dir()],
     )
 
     history = _make_chain()._resolve_download_history(
-        downloadhis=oper,
+        repository=oper,
         file_path=Path("/downloads/Ghost.Concert.mkv"),
     )
 
@@ -151,12 +151,12 @@ def test_resolve_download_history_stops_at_shared_download_root_savepath(monkeyp
         },
     )
     monkeypatch.setattr(
-        "app.chain.transfer.DirectoryHelper.get_download_dirs",
+        "app.chain.transfer.workflow.DirectoryHelper.get_download_dirs",
         lambda _: [_download_dir()],
     )
 
     history = _make_chain()._resolve_download_history(
-        downloadhis=oper,
+        repository=oper,
         file_path=Path("/downloads/Ghost.Concert.mkv"),
     )
 
@@ -179,12 +179,12 @@ def test_resolve_download_history_accepts_shared_root_savepath_for_exact_file(mo
         },
     )
     monkeypatch.setattr(
-        "app.chain.transfer.DirectoryHelper.get_download_dirs",
+        "app.chain.transfer.workflow.DirectoryHelper.get_download_dirs",
         lambda _: [_download_dir()],
     )
 
     history = _make_chain()._resolve_download_history(
-        downloadhis=oper,
+        repository=oper,
         file_path=Path("/downloads/Ghost.Concert.mkv"),
     )
 
@@ -201,7 +201,7 @@ def test_resolve_download_history_stops_at_type_category_download_root(monkeypat
         }
     )
     monkeypatch.setattr(
-        "app.chain.transfer.DirectoryHelper.get_download_dirs",
+        "app.chain.transfer.workflow.DirectoryHelper.get_download_dirs",
         lambda _: [
             _download_dir(
                 download_type_folder=True,
@@ -210,12 +210,12 @@ def test_resolve_download_history_stops_at_type_category_download_root(monkeypat
         ],
     )
     monkeypatch.setattr(
-        "app.chain.transfer.MediaChain.media_category",
+        "app.chain.transfer.workflow.MediaChain.media_category",
         lambda _: {"电影": [], "电视剧": ["动漫"]},
     )
 
     history = _make_chain()._resolve_download_history(
-        downloadhis=oper,
+        repository=oper,
         file_path=Path("/downloads/电视剧/动漫/Ghost.Concert.mkv"),
     )
 
@@ -225,11 +225,11 @@ def test_resolve_download_history_stops_at_type_category_download_root(monkeypat
 def test_get_shared_download_roots_includes_nested_category(monkeypatch):
     """多级分类的每一级目录都应成为共享下载边界。"""
     monkeypatch.setattr(
-        "app.chain.transfer.DirectoryHelper.get_download_dirs",
+        "app.chain.transfer.workflow.DirectoryHelper.get_download_dirs",
         lambda _: [_download_dir(download_category_folder=True)],
     )
     monkeypatch.setattr(
-        "app.chain.transfer.MediaChain.media_category",
+        "app.chain.transfer.workflow.MediaChain.media_category",
         lambda _: {"电影": [], "电视剧": ["动漫/日本/季度新番"]},
     )
 
@@ -248,11 +248,11 @@ def test_get_shared_download_roots_includes_nested_category(monkeypatch):
 def test_get_shared_download_roots_excludes_torrent_subdirectory(monkeypatch):
     """分类目录下由种子创建的子目录不应成为共享下载边界。"""
     monkeypatch.setattr(
-        "app.chain.transfer.DirectoryHelper.get_download_dirs",
+        "app.chain.transfer.workflow.DirectoryHelper.get_download_dirs",
         lambda _: [_download_dir(download_category_folder=True)],
     )
     monkeypatch.setattr(
-        "app.chain.transfer.MediaChain.media_category",
+        "app.chain.transfer.workflow.MediaChain.media_category",
         lambda _: {"电影": [], "电视剧": ["动漫/日本番剧"]},
     )
 
@@ -267,11 +267,11 @@ def test_get_shared_download_roots_excludes_torrent_subdirectory(monkeypatch):
 def test_get_shared_download_roots_keeps_first_level_without_category_config(monkeypatch):
     """分类配置不可用时应保留原有的一级共享边界保护。"""
     monkeypatch.setattr(
-        "app.chain.transfer.DirectoryHelper.get_download_dirs",
+        "app.chain.transfer.workflow.DirectoryHelper.get_download_dirs",
         lambda _: [_download_dir(download_category_folder=True)],
     )
     monkeypatch.setattr(
-        "app.chain.transfer.MediaChain.media_category",
+        "app.chain.transfer.workflow.MediaChain.media_category",
         lambda _: None,
     )
 
@@ -292,16 +292,16 @@ def test_resolve_download_history_stops_at_nested_category_root(monkeypatch):
         }
     )
     monkeypatch.setattr(
-        "app.chain.transfer.DirectoryHelper.get_download_dirs",
+        "app.chain.transfer.workflow.DirectoryHelper.get_download_dirs",
         lambda _: [_download_dir(download_category_folder=True)],
     )
     monkeypatch.setattr(
-        "app.chain.transfer.MediaChain.media_category",
+        "app.chain.transfer.workflow.MediaChain.media_category",
         lambda _: {"电影": [], "电视剧": ["动漫/日本番剧"]},
     )
 
     history = _make_chain()._resolve_download_history(
-        downloadhis=oper,
+        repository=oper,
         file_path=Path("/downloads/动漫/日本番剧/Ghost.Concert.mkv"),
     )
 

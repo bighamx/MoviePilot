@@ -1,11 +1,12 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from app.application.configuration import get_chain_runtime_config_snapshot
 from app.chain.scraping import ScrapingChain, ScrapingConfig, _MusicScrapeFileResult
 from app.domain.context import MUSIC_ENTITY_ALBUM, MusicAlbumInfo, MusicInfo, MusicLyrics
 from app.runtime.events import Event
 from app.domain.meta.metamusic import MetaMusic
-from app.schemas import FileItem
+from app.schemas.file import FileItem
 from app.schemas.types import EventType, ScrapingPolicy
 
 
@@ -120,12 +121,18 @@ def test_music_cover_download_uses_bounded_external_response_cache() -> None:
     request.get_res.return_value = response
     ScrapingChain._request_music_cover.cache_clear()
 
-    with patch("app.chain.scraping.RequestUtils", return_value=request):
+    with patch("app.chain.scraping._scraping_http_snapshot") as snapshot:
+        snapshot.return_value.get.return_value = response
         first = ScrapingChain._download_music_cover("https://example.com/album.webp")
         second = ScrapingChain._download_music_cover("https://example.com/album.webp")
 
     assert first == second == (b"cover", "image/webp")
-    request.get_res.assert_called_once_with("https://example.com/album.webp")
+    snapshot.return_value.get.assert_called_once_with(
+        "https://example.com/album.webp",
+        proxies=None,
+        ua=get_chain_runtime_config_snapshot().normal_user_agent,
+        timeout=20,
+    )
     response.close.assert_called_once()
     ScrapingChain._request_music_cover.cache_clear()
 
@@ -181,9 +188,9 @@ def test_generic_scrape_dispatches_music_without_entering_video_handlers() -> No
     )
 
 
-def test_default_scraping_config_enables_missing_only_music_lyrics() -> None:
-    """新安装和未保存过该字段的用户应默认仅在缺失时下载歌词。"""
-    assert ScrapingConfig.get_default_config()["music_lyrics"] == ScrapingPolicy.MISSINGONLY
+def test_default_scraping_config_enables_music_lyrics_quality_upgrade() -> None:
+    """新安装和未保存过该字段的用户应默认升级歌词且不允许质量降级。"""
+    assert ScrapingConfig.get_default_config()["music_lyrics"] == ScrapingPolicy.UPGRADE
 
 
 def test_album_track_match_uses_disc_track_title_and_duration() -> None:
@@ -252,7 +259,7 @@ def test_music_scrape_can_run_lyrics_without_tags_or_cover() -> None:
     )
     music_chain = Mock()
 
-    with patch("app.chain.scraping.LrclibChain", return_value=music_chain):
+    with patch("app.chain.scraping.LyricsChain", return_value=music_chain):
         success, message = chain.scrape_music_metadata(
             FileItem(
                 storage="local",
@@ -265,7 +272,10 @@ def test_music_scrape_can_run_lyrics_without_tags_or_cover() -> None:
         )
 
     assert success is True
-    assert message == "已刮削 1 个音频文件，歌词新增 1 首、已存在 0 首、未匹配 0 首"
+    assert message == (
+        "已刮削 1 个音频文件，歌词新增 1 首、升级 0 首、已存在 0 首、"
+        "防降级保护 0 首、未匹配 0 首"
+    )
     call = chain._scrape_music_file.call_args
     assert call.kwargs["write_tags"] is False
     assert call.kwargs["with_cover"] is False

@@ -2,11 +2,10 @@ from typing import Optional
 
 from pydantic import Field
 
-from app.workflow.actions import BaseAction
-from app.runtime.config import global_vars
 from app.runtime.log import logger
-from app.schemas.workflow import ActionParams
-from app.schemas.workflow import ActionContext
+from app.runtime.stop import runtime_stop_state
+from app.schemas.workflow import ActionContext, ActionParams
+from app.workflow.actions import BaseAction
 
 
 class FilterMediasParams(ActionParams):
@@ -32,20 +31,9 @@ class FilterMediasAction(BaseAction):
         super().__init__(action_id)
         self._medias = []
 
-    @classmethod
-    @property
-    def name(cls) -> str: # noqa
-        return "过滤媒体数据"
-
-    @classmethod
-    @property
-    def description(cls) -> str: # noqa
-        return "对媒体数据列表进行过滤"
-
-    @classmethod
-    @property
-    def data(cls) -> dict: # noqa
-        return FilterMediasParams().model_dump()
+    name = "过滤媒体数据"
+    description = "对媒体数据列表进行过滤"
+    data = FilterMediasParams().model_dump()
 
     @property
     def success(self) -> bool:
@@ -57,7 +45,7 @@ class FilterMediasAction(BaseAction):
         """
         params = FilterMediasParams(**params)
         for media in context.medias:
-            if global_vars.is_workflow_stopped(workflow_id):
+            if runtime_stop_state.is_workflow_stopped(workflow_id):
                 break
             if params.type and media.type != params.type:
                 continue

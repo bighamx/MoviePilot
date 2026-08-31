@@ -1,11 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import Any, Union
+from typing import Any, ClassVar, Union
 
-from app.chain import ChainBase
-from app.application.configuration import get_configured_system_config as SystemConfigOper
-from app.schemas.workflow import ActionContext
-from app.schemas.workflow import ActionParams
-from app.schemas.workflow import ActionResult
+from app.application.configuration import get_configured_system_config
+from app.chain.base import ChainBase
+from app.schemas.workflow import ActionContext, ActionParams, ActionResult
 
 
 class ActionChain(ChainBase):
@@ -16,6 +14,11 @@ class BaseAction(ABC):
     """
     工作流动作基类
     """
+
+    # 工作流编辑器和运行管理器读取的动作级静态元数据。
+    name: ClassVar[str]
+    description: ClassVar[str]
+    data: ClassVar[dict[str, Any]]
 
     # 动作ID
     _action_id = None
@@ -32,25 +35,7 @@ class BaseAction(ABC):
         self._action_id = action_id
         self._done_flag = False
         self._message = ""
-        self.systemconfigoper = SystemConfigOper()
-
-    @classmethod
-    @property
-    @abstractmethod
-    def name(cls) -> str:  # noqa
-        pass
-
-    @classmethod
-    @property
-    @abstractmethod
-    def description(cls) -> str:  # noqa
-        pass
-
-    @classmethod
-    @property
-    @abstractmethod
-    def data(cls) -> dict:  # noqa
-        pass
+        self.systemconfigoper = get_configured_system_config()
 
     @classmethod
     def get_contract(cls) -> dict:

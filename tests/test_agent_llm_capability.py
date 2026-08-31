@@ -82,13 +82,17 @@ class AgentCapabilityManagerTest(unittest.TestCase):
             provider, "_build_client", return_value=fake_client
         ), patch.object(
             capability_module,
-            "settings",
-            SimpleNamespace(
+            "get_runtime_setting",
+            side_effect=lambda key, default=None: getattr(
+                SimpleNamespace(
                 TEMP_PATH=Path(temp_dir),
                 AUDIO_OUTPUT_MODEL="gpt-4o-audio-preview",
                 AUDIO_OUTPUT_VOICE="alloy",
                 AUDIO_OUTPUT_API_KEY="sk-test",
                 AUDIO_OUTPUT_BASE_URL="https://example.com/v1",
+                ),
+                key,
+                default,
             ),
         ), patch.object(provider, "_convert_wav_to_opus", return_value=None):
             output_path = provider.synthesize_speech("你好")
@@ -199,7 +203,7 @@ class AgentCapabilityManagerTest(unittest.TestCase):
         ]
 
         with patch(
-            "app.runtime.extensions.service_config.ServiceConfigHelper.get_notification_configs",
+            "app.agent.llm.capability.get_notification_configs",
             return_value=configs,
         ):
             self.assertTrue(
@@ -249,13 +253,17 @@ class AgentCapabilityManagerTest(unittest.TestCase):
             provider, "_build_client", return_value=fake_client
         ), patch.object(
             capability_module,
-            "settings",
-            SimpleNamespace(
+            "get_runtime_setting",
+            side_effect=lambda key, default=None: getattr(
+                SimpleNamespace(
                 TEMP_PATH=Path(temp_dir),
                 AUDIO_OUTPUT_MODEL="mimo-v2.5-tts",
                 AUDIO_OUTPUT_VOICE="冰糖",
                 AUDIO_OUTPUT_API_KEY="sk-test",
                 AUDIO_OUTPUT_BASE_URL="https://api.xiaomimimo.com/v1",
+                ),
+                key,
+                default,
             ),
         ), patch.object(provider, "_convert_wav_to_opus", return_value=None):
             output_path = provider.synthesize_speech("你好")
@@ -370,14 +378,18 @@ class AgentCapabilityManagerTest(unittest.TestCase):
             capability_module, "RequestUtils", return_value=request_utils
         ) as request_utils_cls, patch.object(
             capability_module,
-            "settings",
-            SimpleNamespace(
+            "get_runtime_setting",
+            side_effect=lambda key, default=None: getattr(
+                SimpleNamespace(
                 TEMP_PATH=Path(temp_dir),
                 PROXY={},
                 AUDIO_OUTPUT_MODEL="gpt-4o-mini-tts",
                 AUDIO_OUTPUT_VOICE="alloy",
                 AUDIO_OUTPUT_API_KEY="sk-test",
                 AUDIO_OUTPUT_BASE_URL="https://api.minimaxi.com/anthropic/v1",
+                ),
+                key,
+                default,
             ),
         ):
             output_path = provider.synthesize_speech("你好")

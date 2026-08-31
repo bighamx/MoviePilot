@@ -146,6 +146,10 @@ with stub_modules({"app.runtime.config": _config_stub, "app.runtime.log": _log_s
     llm_module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
     spec.loader.exec_module(llm_module)
+llm_module.settings = _config_stub.settings
+llm_module.get_runtime_setting = lambda key, default=None: getattr(
+    _config_stub.settings, key, default
+)
 
 
 class _OfflineProviderManager:
@@ -154,7 +158,7 @@ class _OfflineProviderManager:
     真实 ``LLMProviderManager.resolve_runtime`` 会请求 models.dev 目录、并按
     base_url 列模型，单测中走它会产生不可接受的网络 IO，且结果随外部可达性漂移。
     这里按 provider 直接给出运行时结构，provider→runtime 映射与
-    ``helper._build_legacy_runtime`` 保持一致：google/gemini→google、
+    Provider Runtime 的基础协议保持一致：google/gemini→google、
     deepseek→deepseek、其余→openai_compatible；``use_responses_api`` 等留空，
     交由 ``get_llm`` 自身逻辑（如 ChatGPT 官方推理模型）推导，避免改变被测行为。
     """

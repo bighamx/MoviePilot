@@ -1,51 +1,136 @@
 import os
 import re
+import threading
+import time
+from collections.abc import Iterator, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from threading import Lock
-from typing import Any, Iterable, List, Optional, Tuple, Union
+from typing import Any, Iterable, List, Optional, Protocol, Self, Tuple, Union
 
-from app.schemas.workflow import FileItem as _SchemaFileItem
-from app.chain import ChainBase
-from app.chain.lrclib import LrclibChain
+from app.application.audio import AudioMetadataHelper
+from app.application.configuration import (
+    get_chain_runtime_config_snapshot,
+    get_configured_system_config,
+)
+from app.chain.base import ChainBase
+from app.chain.lyrics import LyricsChain
+from app.chain.media import MediaChain
 from app.chain.storage import StorageChain
-from app.runtime.cache import cached
-from app.runtime.config import settings
 from app.domain.context import (
     MediaInfo,
     MusicAlbumInfo,
     MusicInfo,
     MusicLyrics,
 )
-from app.runtime.events import eventmanager, Event
 from app.domain.meta.metabase import MetaBase
 from app.domain.meta.metamusic import MetaMusic
 from app.domain.metainfo import MetaInfo, MetaInfoPath
-from app.application.configuration import get_configured_system_config
-from app.application.audio import AudioMetadataHelper
+from app.foundation.singleton import Singleton
+from app.runtime.cache import cached
+from app.runtime.events import Event, eventmanager
 from app.runtime.log import logger
-from app.schemas.workflow import FileItem
+from app.runtime.reload import ConfigReloadMixin
+from app.schemas.media import resolve_media_identity
 from app.schemas.types import (
     MUSIC_ENTITY_ALBUM,
     MUSIC_ENTITY_RECORDING,
     EventType,
     MediaSource,
     MediaType,
-    ScrapingTarget,
     ScrapingMetadata,
     ScrapingPolicy,
+    ScrapingTarget,
     SystemConfigKey,
 )
-from app.adapters.network.http import RequestUtils
-from app.schemas.media import resolve_media_identity
-from app.runtime.reload import ConfigReloadMixin
-from app.foundation.singleton import Singleton
+from app.schemas.workflow import FileItem
+from app.schemas.workflow import FileItem as _SchemaFileItem
 
 
+class ScrapingResponsePort(Protocol):
+    """刮削链读取封面所需的最小同步 HTTP 响应契约。"""
 
-from app.chain.media import MediaChain
+    status_code: int
+    content: bytes
+    headers: Mapping[str, str]
+
+    def close(self) -> None:
+        """释放响应与连接资源。"""
+        ...
+
+
+class ScrapingStreamResponsePort(Protocol):
+    """刮削链流式保存图片所需的最小响应契约。"""
+
+    status_code: int
+
+    def __enter__(self) -> Self:
+        """进入响应所有权上下文。"""
+        ...
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        """退出上下文并释放响应资源。"""
+        ...
+
+    def iter_content(self, *, chunk_size: int) -> Iterator[bytes]:
+        """按固定块大小迭代响应字节。"""
+        ...
+
+
+class ScrapingHttpPort(Protocol):
+    """刮削链下载普通封面与流式图片所需的同步 HTTP 端口。"""
+
+    def get(
+        self,
+        url: str,
+        *,
+        proxies: Optional[dict[str, str]],
+        ua: str,
+        timeout: int,
+    ) -> Optional[ScrapingResponsePort]:
+        """读取小型封面响应。"""
+        ...
+
+    def stream(
+        self,
+        url: str,
+        *,
+        proxies: Optional[dict[str, str]],
+        ua: str,
+    ) -> ScrapingStreamResponsePort:
+        """打开由上下文负责释放的流式图片响应。"""
+        ...
+
+
+_scraping_http_lock = threading.RLock()
+_scraping_http_port: Optional[ScrapingHttpPort] = None
+
+
+def configure_scraping_http_port(http: ScrapingHttpPort) -> Optional[ScrapingHttpPort]:
+    """由启动组合根装配刮削 HTTP 端口，并返回旧实现。"""
+    global _scraping_http_port
+    with _scraping_http_lock:
+        previous = _scraping_http_port
+        _scraping_http_port = http
+        return previous
+
+
+def reset_scraping_http_port(http: Optional[ScrapingHttpPort] = None) -> None:
+    """恢复指定刮削 HTTP 端口；省略参数时回到未装配状态。"""
+    global _scraping_http_port
+    with _scraping_http_lock:
+        _scraping_http_port = http
+
+
+def _scraping_http_snapshot() -> ScrapingHttpPort:
+    """读取刮削 HTTP 端口快照，未装配时稳定失败。"""
+    with _scraping_http_lock:
+        http = _scraping_http_port
+    if http is None:
+        raise RuntimeError("刮削 HTTP 端口尚未由启动组合根装配")
+    return http
 
 scraping_lock = Lock()
 
@@ -102,6 +187,11 @@ class ScrapingOption:
     def is_overwrite(self) -> bool:
         """是否覆盖模式"""
         return self.policy == ScrapingPolicy.OVERWRITE
+
+    @property
+    def is_upgrade(self) -> bool:
+        """是否只在歌词等产物质量更高时替换。"""
+        return self.policy == ScrapingPolicy.UPGRADE
 
 class ScrapingConfig:
     """媒体刮削配置"""
@@ -166,7 +256,9 @@ class ScrapingConfig:
             ]
             for md in mds
         ]
-        return {item: ScrapingPolicy.MISSINGONLY for item in config_items}
+        defaults = {item: ScrapingPolicy.MISSINGONLY for item in config_items}
+        defaults["music_lyrics"] = ScrapingPolicy.UPGRADE
+        return defaults
 
 
 class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
@@ -195,7 +287,7 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         "landscape": ["thumb"],
     }
 
-    MUSIC_LYRICS_EXTENSIONS = (".lrc", ".txt")
+    MUSIC_LYRICS_EXTENSIONS = (".lyricsfile.yaml", ".lrc", ".txt")
     _music_track_prefix_pattern = re.compile(
         r"^\s*(?:(?:cd|disc)\s*\d+\s*[-_. ]+)?(?:\d+\s*[-_. ]+)+",
         flags=re.IGNORECASE,
@@ -313,10 +405,13 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             return
         try:
             logger.info(f"正在下载图片：{url} ...")
-            request_utils = RequestUtils(
-                proxies=settings.PROXY, ua=settings.NORMAL_USER_AGENT
+            http = _scraping_http_snapshot()
+            response = http.stream(
+                url,
+                proxies=self.runtime_config.proxy,
+                ua=self.runtime_config.normal_user_agent,
             )
-            with request_utils.get_stream(url=url) as r:
+            with response as r:
                 if r and r.status_code == 200:
                     tmp_file_path = None
                     try:
@@ -932,7 +1027,7 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             or isinstance(meta, MetaMusic)
             or (
                 fileitem.type == "file"
-                and filepath.suffix.lower() in settings.RMT_AUDIOEXT
+                and filepath.suffix.lower() in self.runtime_config.audio_extensions
             )
         )
         if is_music:
@@ -953,7 +1048,8 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 **music_kwargs,
             )
         if fileitem.type == "file" and (
-                not filepath.suffix or filepath.suffix.lower() not in settings.RMT_MEDIAEXT
+                not filepath.suffix
+                or filepath.suffix.lower() not in self.runtime_config.video_extensions
         ):
             return False, "刮削路径不是支持的媒体文件"
 
@@ -1044,7 +1140,9 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         with_cover = not poster_option.is_skip
         lyrics_chain = None
         if not lyrics_option.is_skip:
-            lyrics_chain = LrclibChain()
+            lyrics_chain = LyricsChain(
+                deadline=time.monotonic() + max(self.runtime_config.lyrics_batch_timeout, 0)
+            )
         cover_cache: dict[str, tuple[Optional[bytes], str]] = {}
         album_cache: dict[tuple[str, str], Optional[MusicAlbumInfo]] = {}
 
@@ -1053,6 +1151,9 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             "saved": 0,
             "existing": 0,
             "missing": 0,
+            "upgraded": 0,
+            "protected": 0,
+            "budget_exceeded": 0,
             "failed": 0,
         }
         metadata_failure_label = (
@@ -1108,11 +1209,15 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         if not lyrics_option.is_skip:
             message += (
                 f"，歌词新增 {lyrics_counts['saved']} 首"
+                f"、升级 {lyrics_counts['upgraded']} 首"
                 f"、已存在 {lyrics_counts['existing']} 首"
+                f"、防降级保护 {lyrics_counts['protected']} 首"
                 f"、未匹配 {lyrics_counts['missing']} 首"
             )
             if lyrics_counts["failed"]:
                 message += f"、失败 {lyrics_counts['failed']} 首"
+            if lyrics_counts["budget_exceeded"]:
+                message += f"、预算耗尽 {lyrics_counts['budget_exceeded']} 首"
         if failures:
             return False, f"{message}；{'；'.join(failures[:3])}"
         return True, message
@@ -1130,14 +1235,19 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         )
 
     @staticmethod
-    @cached(maxsize=64, ttl=settings.CONF.meta, skip_none=True)
+    @cached(
+        maxsize=64,
+        ttl_provider=lambda: get_chain_runtime_config_snapshot().metadata_cache_ttl,
+        skip_none=True,
+    )
     def _request_music_cover(url: str) -> Optional[tuple[Optional[bytes], str]]:
         """下载并缓存音乐封面；仅稳定 404 与成功响应进入有界缓存。"""
-        response = RequestUtils(
-            proxies=settings.PROXY,
-            ua=settings.NORMAL_USER_AGENT,
+        response = _scraping_http_snapshot().get(
+            url,
+            proxies=get_chain_runtime_config_snapshot().proxy,
+            ua=get_chain_runtime_config_snapshot().normal_user_agent,
             timeout=20,
-        ).get_res(url)
+        )
         if response is None:
             return None
         try:
@@ -1161,7 +1271,7 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
     @staticmethod
     def _is_music_audio_file(path: str) -> bool:
         """判断路径是否指向系统支持的音频文件。"""
-        return Path(path).suffix.lower() in settings.RMT_AUDIOEXT
+        return Path(path).suffix.lower() in get_chain_runtime_config_snapshot().audio_extensions
 
     def _music_audio_fileitems(self, fileitem: _SchemaFileItem) -> list[_SchemaFileItem]:
         """展开待刮削目录并过滤系统支持的音频文件。"""
@@ -1235,7 +1345,7 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             cover: Optional[tuple[Optional[bytes], str]] = None,
             lyrics_option: Optional[ScrapingOption] = None,
             lyrics_overwrite: bool = False,
-            lyrics_chain: Optional[LrclibChain] = None,
+            lyrics_chain: Optional[LyricsChain] = None,
             album_info: Optional[MusicAlbumInfo] = None,
             media_source: Optional[MediaSource] = None,
     ) -> _MusicScrapeFileResult:
@@ -1301,7 +1411,7 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             cover: Optional[tuple[Optional[bytes], str]],
             lyrics_option: Optional[ScrapingOption],
             lyrics_overwrite: bool,
-            lyrics_chain: Optional[LrclibChain],
+            lyrics_chain: Optional[LyricsChain],
             album_info: Optional[MusicAlbumInfo],
             media_source: Optional[MediaSource],
     ) -> _MusicScrapeFileResult:
@@ -1490,14 +1600,14 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             scrape_info: Optional[MetaMusic | MusicInfo],
             lyrics_option: Optional[ScrapingOption],
             overwrite: bool,
-            lyrics_chain: Optional[LrclibChain],
+            lyrics_chain: Optional[LyricsChain],
             album_info: Optional[MusicAlbumInfo],
     ) -> str:
         """按歌词策略查询单个音轨并保存同名旁挂歌词文件。"""
         if not lyrics_option or lyrics_option.is_skip or not lyrics_chain:
             return "disabled"
         existing = self._find_music_lyrics_sidecar(fileitem)
-        if existing and not overwrite:
+        if existing and not overwrite and not getattr(lyrics_option, "is_upgrade", False):
             return "existing"
         if not scrape_info:
             return "missing"
@@ -1506,11 +1616,23 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         if album_info:
             local_meta = AudioMetadataHelper.read(local_path)
             lookup_info = self._match_music_album_track(local_meta, album_info) or scrape_info
-        lyrics = lyrics_chain.get_music_lyrics(lookup_info)
+        embedded = AudioMetadataHelper.read_lyrics(local_path)
+        lyrics = lyrics_chain.get_music_lyrics(
+            lookup_info,
+            local_candidates=[embedded] if embedded else None,
+        )
+        if lyrics_chain.budget_exceeded and not lyrics:
+            return "budget_exceeded"
         if not lyrics or lyrics.instrumental or not lyrics.content or not lyrics.extension:
             return "missing"
+        existing_quality = self._music_lyrics_sidecar_quality(existing)
+        if existing_quality > lyrics.quality_rank:
+            return "protected"
+        if existing and existing_quality == lyrics.quality_rank and not overwrite:
+            return "existing"
+        status = "upgraded" if existing and lyrics.quality_rank > existing_quality else "saved"
         return (
-            "saved"
+            status
             if self._write_music_lyrics_sidecar(
                 fileitem=fileitem,
                 local_path=local_path,
@@ -1527,13 +1649,33 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         """查找音轨旁已存在的同步或纯文本歌词文件。"""
         audio_path = Path(fileitem.path)
         for extension in self.MUSIC_LYRICS_EXTENSIONS:
+            target_path = self._music_lyrics_path(audio_path, extension)
             item = self.storagechain.get_file_item(
                 storage=fileitem.storage,
-                path=audio_path.with_suffix(extension),
+                path=target_path,
             )
             if item:
                 return item
         return None
+
+    @classmethod
+    def _music_lyrics_path(cls, audio_path: Path, extension: str) -> Path:
+        """构造普通歌词和双扩展名 Lyricsfile 的同名旁挂路径。"""
+        return audio_path.with_suffix(extension)
+
+    @staticmethod
+    def _music_lyrics_sidecar_quality(fileitem: Optional[_SchemaFileItem]) -> int:
+        """按旁挂扩展名估算质量，用于写入前执行防降级保护。"""
+        if not fileitem:
+            return 0
+        path = str(fileitem.path or "").casefold()
+        if path.endswith(".lyricsfile.yaml"):
+            return 4
+        if path.endswith(".lrc"):
+            return 3
+        if path.endswith(".txt"):
+            return 1
+        return 0
 
     def _write_music_lyrics_sidecar(
             self,
@@ -1576,6 +1718,13 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
                 ):
                     return False
 
+            if lyrics.lyricsfile and not self._write_music_lyricsfile_sidecar(
+                    fileitem=fileitem,
+                    local_path=local_path,
+                    content=lyrics.lyricsfile,
+            ):
+                return False
+
             if overwrite:
                 self._remove_alternate_music_lyrics(fileitem, keep_extension=extension)
             return True
@@ -1586,6 +1735,31 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             if temp_path and temp_path.exists() and temp_path != target_path:
                 self._cleanup_temp_file(temp_path)
 
+    def _write_music_lyricsfile_sidecar(
+            self,
+            fileitem: _SchemaFileItem,
+            local_path: Path,
+            content: str,
+    ) -> bool:
+        """保留来源返回的标准 Lyricsfile，同时由主写入流程生成播放器兼容歌词。"""
+        target_path = self._music_lyrics_path(Path(fileitem.path), ".lyricsfile.yaml")
+        try:
+            if fileitem.storage == "local":
+                target_path.write_text(f"{content.rstrip()}\n", encoding="utf-8")
+                return True
+            parent = self.storagechain.get_parent_item(fileitem)
+            if not parent:
+                return False
+            temp_path = local_path.with_suffix(".lyricsfile.yaml")
+            temp_path.write_text(f"{content.rstrip()}\n", encoding="utf-8")
+            try:
+                return bool(self.storagechain.upload_file(parent, temp_path, new_name=target_path.name))
+            finally:
+                self._cleanup_temp_file(temp_path)
+        except OSError as err:
+            logger.warning(f"保存 Lyricsfile 失败：{target_path} - {err}")
+            return False
+
     def _remove_alternate_music_lyrics(
             self,
             fileitem: _SchemaFileItem,
@@ -1594,11 +1768,12 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         """覆盖歌词格式后删除同音轨的旧扩展名文件，避免播放器优先读取过期内容。"""
         audio_path = Path(fileitem.path)
         for extension in self.MUSIC_LYRICS_EXTENSIONS:
-            if extension == keep_extension:
+            if extension in (keep_extension, ".lyricsfile.yaml"):
                 continue
+            target_path = self._music_lyrics_path(audio_path, extension)
             item = self.storagechain.get_file_item(
                 storage=fileitem.storage,
-                path=audio_path.with_suffix(extension),
+                path=target_path,
             )
             if item and not self.storagechain.delete_file(item):
                 logger.warning(f"删除旧歌词文件失败：{item.path}")
@@ -1803,7 +1978,7 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
             for file in files:
                 if (
                         file.type == "dir"
-                        and file.name not in settings.RENAME_FORMAT_S0_NAMES
+                        and file.name not in self.runtime_config.season_zero_names
                         and MetaInfo(file.name).begin_season is None
                 ):
                     # 电视剧不处理非季子目录
@@ -1843,7 +2018,7 @@ class ScrapingChain(ChainBase, ConfigReloadMixin, metaclass=Singleton):
         season_meta = MetaInfo(filepath.name)
 
         # 特殊季目录处理（Specials/SPs）
-        if filepath.name in settings.RENAME_FORMAT_S0_NAMES:
+        if filepath.name in self.runtime_config.season_zero_names:
             season_meta.begin_season = 0
         elif season_meta.name and season_meta.begin_season is not None:
             # 排除辅助词重新识别，避免误判根目录 (issue https://github.com/jxxghp/MoviePilot/issues/5501)

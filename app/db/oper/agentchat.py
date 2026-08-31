@@ -77,7 +77,9 @@ class AgentChatOper(DbOper):
         """
         获取 Agent 会话。
         """
-        return AgentChat.get_by_session(self._db, session_id, user_id)
+        return self._execute_sync_query(
+            lambda session: AgentChat.get_by_session(session, session_id, user_id)
+        )
 
     async def async_get(
         self, session_id: str, user_id: Optional[str] = None
@@ -85,7 +87,9 @@ class AgentChatOper(DbOper):
         """
         异步获取 Agent 会话。
         """
-        return await AgentChat.async_get_by_session(self._db, session_id, user_id)
+        return await self._execute_async_query(
+            lambda session: AgentChat.async_get_by_session(session, session_id, user_id)
+        )
 
     def ensure_session(
         self,
@@ -115,7 +119,7 @@ class AgentChatOper(DbOper):
         }
         payload = {key: value for key, value in payload.items() if value is not None}
         if chat:
-            chat.update(self._db, payload)
+            self._stage_update(chat, payload)
             return self.get(session_id=session_id, user_id=user_id) or self.get(session_id=session_id)
 
         chat = AgentChat(
@@ -134,7 +138,7 @@ class AgentChatOper(DbOper):
             created_at=now,
             updated_at=now,
         )
-        chat.create(self._db)
+        self._stage_create(chat)
         return self.get(session_id=session_id, user_id=user_id) or self.get(session_id=session_id)
 
     def save_agent_messages(
@@ -153,8 +157,8 @@ class AgentChatOper(DbOper):
             chat = self.ensure_session(session_id=session_id, user_id=user_id)
         if not chat:
             return
-        chat.update(
-            self._db,
+        self._stage_update(
+            chat,
             {
                 "agent_messages": messages or [],
                 "updated_at": self._now(),
@@ -192,8 +196,8 @@ class AgentChatOper(DbOper):
             return
         if self.has_custom_title(chat.title):
             return
-        chat.update(
-            self._db,
+        self._stage_update(
+            chat,
             {
                 "title": normalized_title,
                 "updated_at": self._now(),
@@ -232,8 +236,8 @@ class AgentChatOper(DbOper):
             if self.has_custom_title(chat.title)
             else self._normalize_title(title, normalized_messages)
         )
-        chat.update(
-            self._db,
+        self._stage_update(
+            chat,
             {
                 "title": normalized_title,
                 "preview": self._normalize_preview(normalized_messages),
@@ -269,7 +273,8 @@ class AgentChatOper(DbOper):
         )
         if not chat:
             return None
-        display_messages = self._normalize_messages(chat.display_messages)
+        # JSON 列不是 MutableList；必须复制旧列表，原地 extend 会让 SQLAlchemy 误认为字段未变化。
+        display_messages = list(self._normalize_messages(chat.display_messages))
         display_messages.extend(self._normalize_messages(messages))
         title = chat.title if self.has_custom_title(chat.title) else None
         return self.save_display_messages(
@@ -294,12 +299,14 @@ class AgentChatOper(DbOper):
         """
         异步分页获取 Agent 会话历史。
         """
-        return await AgentChat.async_list_by_page(
-            self._db,
-            page=page,
-            count=count,
-            user_id=user_id,
-            username=username,
+        return await self._execute_async_query(
+            lambda session: AgentChat.async_list_by_page(
+                session,
+                page=page,
+                count=count,
+                user_id=user_id,
+                username=username,
+            )
         )
 
     async def async_delete(
@@ -311,7 +318,26 @@ class AgentChatOper(DbOper):
         chat = await self.async_get(session_id=session_id, user_id=user_id)
         if not chat:
             return False
-        await AgentChat.async_delete(self._db, chat.id)
+        await self._stage_async_delete(AgentChat, chat.id)
+        return True
+
+    def delete_by_id(self, chat_id: int) -> None:
+        """在 Oper 事务边界内按主键删除 Agent 会话。"""
+        self._stage_delete(AgentChat, chat_id)
+
+    async def async_stage_delete(
+        self,
+        session_id: str,
+        user_id: Optional[str] = None,
+    ) -> bool:
+        """暂存 Agent 会话删除并 flush，不提交请求级事务。"""
+        if not isinstance(self._db, AsyncSession):
+            raise RuntimeError("Agent 会话暂存删除需要调用方提供 AsyncSession")
+        chat = await self.async_get(session_id=session_id, user_id=user_id)
+        if not chat:
+            return False
+        await self._db.delete(chat)
+        await self._db.flush()
         return True
 
     @staticmethod

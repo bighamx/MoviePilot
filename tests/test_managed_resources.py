@@ -13,18 +13,18 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from app.runtime import resources as managed_resource_facade
 from app.runtime.capabilities.errors import (
     CapabilityOperationError,
     CapabilityRuntimeClosedError,
 )
 from app.runtime.capabilities.runtime import CapabilityRuntime
-from app.runtime.extensions.managed_resource_adapter import (
+from app.runtime.extensions.resource import (
     AsyncManagedResourceAdapter,
     SyncManagedResourceAdapter,
     build_managed_resource_registry,
 )
-from app.runtime import managed_resources as managed_resource_facade
-from app.runtime.managed_resources import (
+from app.runtime.resources import (
     MANAGED_RESOURCE_ASYNC_KIND,
     MANAGED_RESOURCE_SYNC_KIND,
     acquire_managed_resource,
@@ -34,7 +34,6 @@ from app.runtime.managed_resources import (
     managed_resource_snapshot,
     shutdown_managed_resource_runtime,
 )
-
 
 PROJECT_ROOT = Path(__file__).parents[1]
 
@@ -143,7 +142,10 @@ def test_sync_managed_resource_is_single_flight(
         if observation.operation == "activate"
     ] == ["started", "succeeded"]
 
-    asyncio.run(shutdown_managed_resource_runtime(reason="test_shutdown"))
+    assert (
+        asyncio.run(shutdown_managed_resource_runtime(reason="test_shutdown"))
+        is True
+    )
 
     assert SyncResource.instances[0].stopped == 1
     with pytest.raises(CapabilityRuntimeClosedError):
@@ -196,6 +198,101 @@ def test_async_managed_resource_uses_async_adapter(
 
     assert resource.events == ["start", "stop"]
     assert AsyncResource.instances == [resource]
+
+
+def test_async_managed_resource_recreates_owner_across_event_loops(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """停止后的下一次激活必须在新事件循环创建新资源，不能复用旧 owner。"""
+    module_name = "fixture_loop_bound_managed_resource"
+    module = ModuleType(module_name)
+
+    class LoopBoundResource:
+        """记录资源实际启动和停止所在的事件循环。"""
+
+        def __init__(self) -> None:
+            self.loop = None
+
+        async def start(self) -> None:
+            self.loop = asyncio.get_running_loop()
+
+        async def stop(self) -> None:
+            assert asyncio.get_running_loop() is self.loop
+
+    module.LoopBoundResource = LoopBoundResource
+    monkeypatch.setitem(sys.modules, module_name, module)
+    _write_manifest(
+        tmp_path,
+        capability_id="fixture.loop_bound",
+        kind=MANAGED_RESOURCE_ASYNC_KIND,
+        entrypoint=f"{module_name}:LoopBoundResource",
+    )
+    runtime = _runtime(tmp_path)
+
+    async def exercise() -> LoopBoundResource:
+        """在当前事件循环完成一次资源启动与停止。"""
+        resource = await runtime.activate_async(
+            "fixture.loop_bound",
+            reason="loop_cycle",
+        )
+        await runtime.stop_async("fixture.loop_bound", reason="loop_cycle")
+        return resource
+
+    first = asyncio.run(exercise())
+    second = asyncio.run(exercise())
+
+    assert first is not second
+    assert first.loop is not second.loop
+
+
+def test_shutdown_propagates_stop_failure_and_retains_owner_for_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """托管资源关闭失败必须向 startup 传播，并保留同一 owner 重试。"""
+    module_name = "fixture_retry_stop_managed_resource"
+    module = ModuleType(module_name)
+
+    class RetryStopResource:
+        """首次停止失败、第二次停止收敛的同步资源。"""
+
+        def __init__(self) -> None:
+            self.stop_calls = 0
+            self.fail_stop = True
+
+        def start(self) -> None:
+            """资源启动无需额外动作。"""
+
+        def stop(self) -> None:
+            """按测试开关模拟资源释放失败。"""
+            self.stop_calls += 1
+            if self.fail_stop:
+                raise RuntimeError("stop failed")
+
+    module.RetryStopResource = RetryStopResource
+    monkeypatch.setitem(sys.modules, module_name, module)
+    _write_manifest(
+        tmp_path,
+        capability_id="fixture.retry_stop",
+        kind=MANAGED_RESOURCE_SYNC_KIND,
+        entrypoint=f"{module_name}:RetryStopResource",
+    )
+    configure_managed_resource_runtime(_runtime(tmp_path))
+    resource = acquire_managed_resource("fixture.retry_stop", reason="test")
+
+    assert (
+        asyncio.run(shutdown_managed_resource_runtime(reason="test_shutdown"))
+        is False
+    )
+    assert resource.stop_calls == 1
+
+    resource.fail_stop = False
+    assert (
+        asyncio.run(shutdown_managed_resource_runtime(reason="shutdown_retry"))
+        is True
+    )
+    assert resource.stop_calls == 2
 
 
 def test_failed_start_is_cleaned_before_explicit_retry(
@@ -294,7 +391,7 @@ def test_startup_initializer_discovers_manifest_without_importing_resource() -> 
     script = """
 import asyncio
 import sys
-from app.startup.managed_resources_initializer import (
+from app.startup.initializers.resources import (
     init_managed_resources,
     stop_managed_resources,
 )
@@ -320,20 +417,21 @@ assert "pyvirtualdisplay" not in sys.modules
 
 def test_startup_shutdown_without_init_does_not_build_registry(monkeypatch) -> None:
     """未执行启动装配时，关闭入口不得通过发现声明反向初始化 Runtime。"""
-    from app.startup import managed_resources_initializer
+    from app.startup.composition import resource as resource_composition
+    from app.startup.initializers import resources as managed_resources_initializer
 
     build_registry = MagicMock(side_effect=AssertionError("must not discover"))
     monkeypatch.setattr(
-        managed_resources_initializer,
+        resource_composition,
         "_managed_resource_runtime",
         None,
     )
     monkeypatch.setattr(
-        managed_resources_initializer,
+        resource_composition,
         "build_managed_resource_registry",
         build_registry,
     )
 
-    asyncio.run(managed_resources_initializer.stop_managed_resources())
+    assert asyncio.run(managed_resources_initializer.stop_managed_resources()) is True
 
     build_registry.assert_not_called()

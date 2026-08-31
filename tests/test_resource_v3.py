@@ -1,12 +1,14 @@
 from pathlib import Path
 
-from app.runtime.config import settings
+import pytest
+
 from app.adapters.system.resource import (
     ResourceHelper,
     configure_resource_version_provider,
 )
-from app.startup import modules_initializer
-
+from app.runtime.config import settings
+from app.startup.composition import resource as resource_composition
+from app.startup.initializers import modules as modules_initializer
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 
@@ -19,6 +21,33 @@ def test_resource_helper_uses_v3_only():
     assert ResourceHelper._files_api.endswith("/resources.v3")
     assert ResourceHelper._get_needed_files()[0] == "user.sites.v3.bin"
     assert ResourceHelper._resource_target == Path("app/application/site")
+
+
+@pytest.mark.parametrize(
+    ("system", "machine", "gil_disabled", "expected"),
+    [
+        ("Linux", "x86_64", 0, "sites.cpython-314-x86_64-linux-gnu.so"),
+        ("Linux", "aarch64", 1, "sites.cpython-314t-aarch64-linux-gnu.so"),
+        ("Darwin", "arm64", 1, "sites.cpython-314t-darwin.so"),
+        ("Windows", "AMD64", 1, "sites.cp314t-win_amd64.pyd"),
+    ],
+)
+def test_resource_helper_selects_runtime_abi(
+    monkeypatch,
+    system,
+    machine,
+    gil_disabled,
+    expected,
+):
+    """资源下载文件名必须区分普通解释器与 free-threaded ABI。"""
+    monkeypatch.setattr("app.adapters.system.resource.platform.system", lambda: system)
+    monkeypatch.setattr("app.adapters.system.resource.platform.machine", lambda: machine)
+    monkeypatch.setattr(
+        "app.adapters.system.resource.sysconfig.get_config_var",
+        lambda name: gil_disabled if name == "Py_GIL_DISABLED" else None,
+    )
+
+    assert ResourceHelper._get_needed_files()[-1] == expected
 
 
 def test_resource_helper_preserves_no_argument_check_contract(monkeypatch):
@@ -46,7 +75,7 @@ def test_startup_owns_restart_after_resource_update(monkeypatch):
     """资源适配器只返回更新结果，进程重启必须由启动组合层触发。"""
     restart_calls = []
     monkeypatch.setattr(
-        modules_initializer,
+        resource_composition,
         "ResourceHelper",
         lambda: type(
             "ResourceStub",
@@ -68,7 +97,7 @@ def test_startup_owns_restart_after_resource_update(monkeypatch):
 def test_startup_does_not_restart_without_resource_update(monkeypatch):
     """没有成功安装新资源时启动层不得请求重启。"""
     monkeypatch.setattr(
-        modules_initializer,
+        resource_composition,
         "ResourceHelper",
         lambda: type(
             "ResourceStub",

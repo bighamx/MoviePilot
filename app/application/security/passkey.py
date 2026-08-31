@@ -5,35 +5,29 @@ import base64
 import binascii
 import json
 import secrets
-import threading
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Protocol, Tuple
 from urllib.parse import urlparse
 
 from webauthn import (
-    generate_registration_options,
-    verify_registration_response,
     generate_authentication_options,
+    generate_registration_options,
+    options_to_json,
     verify_authentication_response,
-    options_to_json
+    verify_registration_response,
 )
-from webauthn.helpers import (
-    parse_registration_credential_json,
-    parse_authentication_credential_json
-)
-from webauthn.helpers.structs import (
-    PublicKeyCredentialDescriptor,
-    AuthenticatorTransport,
-    UserVerificationRequirement,
-    ResidentKeyRequirement,
-    AuthenticatorSelectionCriteria
-)
+from webauthn.helpers import parse_authentication_credential_json, parse_registration_credential_json
 from webauthn.helpers.cose import COSEAlgorithmIdentifier
 from webauthn.helpers.exceptions import InvalidRegistrationResponse
+from webauthn.helpers.structs import (
+    AuthenticatorSelectionCriteria,
+    AuthenticatorTransport,
+    PublicKeyCredentialDescriptor,
+    ResidentKeyRequirement,
+    UserVerificationRequirement,
+)
 
-from app.runtime.cache import TTLCache
-from app.runtime.config import settings
-from app.adapters.cache.redis import RedisHelper
+from app.application.configuration import get_api_runtime_config_snapshot
 from app.runtime.log import logger
 
 PASSKEY_CHALLENGE_TTL_SECONDS = 5 * 60
@@ -49,15 +43,27 @@ class PasskeyChallenge:
     user_id: Optional[int]
 
 
+class PasskeyChallengeCache(Protocol):
+    """PassKey 一次性 challenge 使用的严格原子缓存端口。"""
+
+    def store(self, key: str, value: Any) -> None:
+        """持久化 challenge，失败时抛出后端异常。"""
+
+    def consume(self, key: str) -> Any:
+        """原子领取 challenge，不存在时返回 None。"""
+
+
 class PasskeyChallengeStore:
     """使用当前缓存后端签发并原子消费短时 Passkey challenge。"""
 
-    _cache = TTLCache(
-        region="passkey_challenge",
-        maxsize=4096,
-        ttl=PASSKEY_CHALLENGE_TTL_SECONDS,
-    )
-    _memory_consume_lock = threading.Lock()
+    _cache: Optional[PasskeyChallengeCache] = None
+
+    @classmethod
+    def _get_cache(cls) -> PasskeyChallengeCache:
+        """返回已装配缓存，缺失时拒绝签发认证状态。"""
+        if cls._cache is None:
+            raise RuntimeError("PassKey challenge 缓存尚未配置")
+        return cls._cache
 
     @classmethod
     def issue(
@@ -69,7 +75,7 @@ class PasskeyChallengeStore:
     ) -> str:
         """保存 challenge 并返回不携带认证事实的随机事务 token。"""
         transaction_token = secrets.token_urlsafe(32)
-        cls._cache.set(
+        cls._get_cache().store(
             transaction_token,
             PasskeyChallenge(
                 challenge=challenge,
@@ -90,23 +96,18 @@ class PasskeyChallengeStore:
         if not transaction_token:
             return None
 
-        if cls._cache.is_redis():
-            challenge = RedisHelper().pop(
-                transaction_token,
-                region="passkey_challenge",
-            )
-        else:
-            with cls._memory_consume_lock:
-                try:
-                    challenge = cls._cache.pop(transaction_token)
-                except KeyError:
-                    challenge = None
+        challenge = cls._get_cache().consume(transaction_token)
 
         if not isinstance(challenge, PasskeyChallenge):
             return None
         if challenge.purpose != purpose:
             return None
         return challenge
+
+
+def configure_passkey_challenge_cache(cache: PasskeyChallengeCache) -> None:
+    """由启动组合根注入 PassKey challenge 的原子缓存。"""
+    PasskeyChallengeStore._cache = cache
 
 
 class PassKeyRegistrationVerificationError(Exception):
@@ -127,8 +128,9 @@ class PassKeyHelper:
         """
         获取 Relying Party ID
         """
-        if settings.APP_DOMAIN:
-            app_domain = settings.APP_DOMAIN.strip()
+        config = get_api_runtime_config_snapshot()
+        if config.app_domain:
+            app_domain = config.app_domain.strip()
             # 确保存在协议前缀，以便 urlparse 正确解析主机和端口
             if not app_domain.startswith(('http://', 'https://')):
                 app_domain = f'https://{app_domain}'
@@ -137,7 +139,7 @@ class PassKeyHelper:
             if host:
                 return host
             # 从 APP_DOMAIN 中提取域名
-            host = settings.APP_DOMAIN.replace('https://', '').replace('http://', '')
+            host = config.app_domain.replace('https://', '').replace('http://', '')
             # 移除端口号
             if ':' in host:
                 host = host.split(':')[0]
@@ -157,10 +159,11 @@ class PassKeyHelper:
         """
         获取源地址
         """
-        if settings.APP_DOMAIN:
-            return settings.APP_DOMAIN.rstrip('/')
+        config = get_api_runtime_config_snapshot()
+        if config.app_domain:
+            return config.app_domain.rstrip('/')
         # 如果未配置APP_DOMAIN，使用默认的localhost地址
-        return f'http://localhost:{settings.NGINX_PORT}'
+        return f'http://localhost:{config.nginx_port}'
 
     @staticmethod
     def standardize_credential_id(credential_id: str) -> str:
@@ -229,7 +232,7 @@ class PassKeyHelper:
         """
         if user_verification:
             return UserVerificationRequirement(user_verification)
-        return UserVerificationRequirement.REQUIRED if settings.PASSKEY_REQUIRE_UV \
+        return UserVerificationRequirement.REQUIRED if get_api_runtime_config_snapshot().passkey_require_uv \
             else UserVerificationRequirement.PREFERRED
 
     @staticmethod
@@ -337,7 +340,7 @@ class PassKeyHelper:
                 expected_challenge=challenge_bytes,
                 expected_rp_id=rp_id,
                 expected_origin=origin,
-                require_user_verification=settings.PASSKEY_REQUIRE_UV
+                require_user_verification=get_api_runtime_config_snapshot().passkey_require_uv
             )
 
             # 提取信息
@@ -441,7 +444,7 @@ class PassKeyHelper:
                 expected_origin=origin,
                 credential_public_key=public_key_bytes,
                 credential_current_sign_count=credential_current_sign_count,
-                require_user_verification=settings.PASSKEY_REQUIRE_UV
+                require_user_verification=get_api_runtime_config_snapshot().passkey_require_uv
             )
 
             return True, verification.new_sign_count
@@ -449,3 +452,98 @@ class PassKeyHelper:
         except Exception as e:
             logger.error(f"验证认证响应失败: {e}")
             return False, credential_current_sign_count
+
+
+class PasskeyRepository(Protocol):
+    """PassKey 用例需要的最小同步数据端口。"""
+
+    def list(self) -> list[Any]:
+        """列出全部启用凭证。"""
+
+    def list_by_user_id(self, user_id: int) -> List[Any]:
+        """列出指定用户凭证。"""
+
+    def get_by_credential_id(self, credential_id: str) -> Optional[Any]:
+        """按凭证 ID 查找凭证。"""
+
+    def create(self, payload: dict[str, Any]) -> Any:
+        """创建凭证。"""
+
+    def compare_and_update_sign_count(
+        self,
+        passkey_id: int,
+        expected_sign_count: int,
+        sign_count: int,
+    ) -> bool:
+        """仅在签名计数未被并发修改时记录本次认证。"""
+
+    def delete_by_id(self, passkey_id: int, user_id: int) -> bool:
+        """删除用户凭证。"""
+
+
+class PasskeyService:
+    """编排 PassKey 凭证生命周期。"""
+
+    def __init__(self, repository: PasskeyRepository) -> None:
+        """注入 PassKey 数据端口。"""
+        self._repository = repository
+
+    def list(self) -> list[Any]:
+        """列出全部启用凭证。"""
+        return self._repository.list()
+
+    def list_by_user_id(self, user_id: int) -> List[Any]:
+        """列出指定用户凭证。"""
+        return self._repository.list_by_user_id(user_id)
+
+    def get_by_credential_id(self, credential_id: str) -> Optional[Any]:
+        """按凭证 ID 查找凭证。"""
+        return self._repository.get_by_credential_id(credential_id)
+
+    def create(self, payload: dict[str, Any]) -> Any:
+        """创建凭证。"""
+        return self._repository.create(payload)
+
+    def compare_and_update_sign_count(
+        self,
+        passkey_id: int,
+        expected_sign_count: int,
+        sign_count: int,
+    ) -> bool:
+        """以验证时观察到的旧计数提交本次认证。"""
+        return self._repository.compare_and_update_sign_count(
+            passkey_id=passkey_id,
+            expected_sign_count=expected_sign_count,
+            sign_count=sign_count,
+        )
+
+    def delete_by_id(self, passkey_id: int, user_id: int) -> bool:
+        """删除用户凭证。"""
+        return self._repository.delete_by_id(passkey_id, user_id)
+
+
+_configured_passkey_service: Optional[PasskeyService] = None
+
+
+def configure_passkey_service(service: PasskeyService) -> None:
+    """由启动组合根登记 PassKey 应用服务。"""
+    global _configured_passkey_service
+    _configured_passkey_service = service
+
+
+def reset_passkey_challenge_cache() -> None:
+    """清除当前 lifespan 的 PassKey challenge 缓存。"""
+    PasskeyChallengeStore._cache = None
+
+
+def reset_passkey_service() -> None:
+    """清除当前 lifespan 的 PassKey 应用服务。"""
+    global _configured_passkey_service
+    _configured_passkey_service = None
+
+
+def get_configured_passkey_service() -> PasskeyService:
+    """返回启动阶段登记的 PassKey 应用服务。"""
+    if _configured_passkey_service is None:
+        raise RuntimeError("PassKey 服务尚未配置")
+    return _configured_passkey_service

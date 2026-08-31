@@ -6,10 +6,17 @@
 `run_count` 的自增必须留在 SQL 侧，否则并发执行会丢计数。
 """
 import asyncio
+from dataclasses import FrozenInstanceError
 
 import pytest
 
+from app.application.workflow import WorkflowSnapshot
+from app.db import base as db_base
+from app.db.adapters.workflow import TransactionalWorkflowQueryRepository
 from app.db.models.workflow import Workflow
+from app.db.oper.workflow import WorkflowOper
+from app.db.session import SessionFactory, async_session_scope
+from app.schemas.workflow import Workflow as WorkflowResponse
 
 
 @pytest.fixture(autouse=True)
@@ -26,6 +33,18 @@ def _flow(name: str, trigger_type: str = "timer", state: str = "W",
                     actions=[], flows=[], context={}, execution_state={})
 
 
+async def _stage_async_action(workflow_id: int, action_id: str) -> None:
+    """用独占异步会话提交一次模型级暂存，模拟 Application UoW 边界。"""
+    async with async_session_scope() as session:
+        await Workflow.async_update_current_action(
+            session,
+            wid=workflow_id,
+            action_id=action_id,
+            context={},
+        )
+        await session.commit()
+
+
 # --------------------------------------------------------------------------- #
 # 列表查询
 # --------------------------------------------------------------------------- #
@@ -37,12 +56,99 @@ def test_list_and_get_by_name_match_async_twins(db):
     created = db.add(_flow("wf-name"))
 
     assert Workflow.get_by_name(db.session, "wf-name").id == created.id
-    assert asyncio.run(Workflow.async_get_by_name(name="wf-name")).id == created.id
+    assert db.run_async_session(
+        lambda session: Workflow.async_get_by_name(session, "wf-name")
+    ).id == created.id
     assert Workflow.get_by_name(db.session, "wf-missing") is None
 
     sync_ids = sorted(w.id for w in Workflow.list(db.session))
-    async_ids = sorted(w.id for w in asyncio.run(Workflow.async_list()))
+    async_ids = sorted(w.id for w in db.run_async_session(Workflow.async_list))
     assert sync_ids == async_ids
+
+
+def test_workflow_oper_reuses_explicit_query_sessions(db, monkeypatch):
+    """WorkflowOper 绑定显式会话后不得再创建兼容查询会话。"""
+    created = db.add(_flow("wf-explicit-session"))
+    monkeypatch.setattr(
+        db_base,
+        "run_sync_transaction",
+        lambda _operation: (_ for _ in ()).throw(
+            AssertionError("不应创建额外同步事务")
+        ),
+    )
+
+    assert WorkflowOper(db.session).get_by_name(created.name).id == created.id
+
+    async def check() -> None:
+        """验证异步 Oper 同样复用调用方会话。"""
+        async with async_session_scope() as session:
+            monkeypatch.setattr(
+                db_base,
+                "run_async_transaction",
+                lambda _operation: (_ for _ in ()).throw(
+                    AssertionError("不应创建额外异步事务")
+                ),
+            )
+            assert (await WorkflowOper(session).async_get_by_name(created.name)).id == created.id
+
+    asyncio.run(check())
+
+
+def test_query_repository_returns_detached_deep_copied_snapshot(db):
+    """查询仓储必须在关闭短 Session 前投影，且 JSON 不与 ORM 记录共享。"""
+    workflow = _flow("wf-snapshot")
+    workflow.actions = [{"id": "action-1", "config": {"value": 1}}]
+    workflow.flows = [{"source": "action-1", "target": "end"}]
+    workflow.context = {"nested": {"value": 1}}
+    created = db.add(workflow)
+    repository = TransactionalWorkflowQueryRepository(
+        sync_session=SessionFactory,
+        async_session=async_session_scope,
+    )
+
+    snapshot = repository.get(created.id)
+
+    assert isinstance(snapshot, WorkflowSnapshot)
+    assert snapshot.name == "wf-snapshot"
+    with pytest.raises(FrozenInstanceError):
+        snapshot.name = "changed"
+    snapshot.actions[0]["config"]["value"] = 2
+    snapshot.context["nested"]["value"] = 2
+    refreshed = repository.get(created.id)
+    assert refreshed.actions[0]["config"]["value"] == 1
+    assert refreshed.context["nested"]["value"] == 1
+
+
+def test_query_repository_async_projection_survives_session_close(db):
+    """异步查询返回值在仓储退出 Session 作用域后仍可完整序列化。"""
+    created = db.add(_flow("wf-async-snapshot"))
+    repository = TransactionalWorkflowQueryRepository(
+        sync_session=SessionFactory,
+        async_session=async_session_scope,
+    )
+
+    snapshot = asyncio.run(repository.async_get(created.id))
+    listed = asyncio.run(repository.async_list())
+
+    assert isinstance(snapshot, WorkflowSnapshot)
+    assert snapshot.name == "wf-async-snapshot"
+    assert created.id in {item.id for item in listed}
+
+
+def test_workflow_snapshot_validates_against_api_response_contract(db):
+    """冻结快照可直接序列化为 API 合同且不会暴露内部执行上下文。"""
+    created = db.add(_flow("wf-api-snapshot"))
+    repository = TransactionalWorkflowQueryRepository(
+        sync_session=SessionFactory,
+        async_session=async_session_scope,
+    )
+
+    response = WorkflowResponse.model_validate(repository.get(created.id))
+    payload = response.model_dump()
+
+    assert payload["id"] == created.id
+    assert payload["name"] == "wf-api-snapshot"
+    assert "context" not in payload
 
 
 def test_enabled_workflows_exclude_paused(db):
@@ -58,8 +164,9 @@ def test_enabled_workflows_exclude_paused(db):
 
     assert {"wf-waiting", "wf-running"} <= names
     assert "wf-paused" not in names
-    assert "wf-paused" not in {w.name for w in
-                               asyncio.run(Workflow.async_get_enabled_workflows())}
+    assert "wf-paused" not in {
+        w.name for w in db.run_async_session(Workflow.async_get_enabled_workflows)
+    }
 
 
 def test_timer_triggered_includes_legacy_null_trigger_type(db):
@@ -103,9 +210,13 @@ def test_trigger_lists_match_async_twins(db):
     db.add(_flow("wf-t", trigger_type="timer"), _flow("wf-e", trigger_type="event"))
 
     assert sorted(w.id for w in Workflow.get_timer_triggered_workflows(db.session)) == \
-        sorted(w.id for w in asyncio.run(Workflow.async_get_timer_triggered_workflows()))
+        sorted(w.id for w in db.run_async_session(
+            Workflow.async_get_timer_triggered_workflows
+        ))
     assert sorted(w.id for w in Workflow.get_event_triggered_workflows(db.session)) == \
-        sorted(w.id for w in asyncio.run(Workflow.async_get_event_triggered_workflows()))
+        sorted(w.id for w in db.run_async_session(
+            Workflow.async_get_event_triggered_workflows
+        ))
 
 
 # --------------------------------------------------------------------------- #
@@ -228,8 +339,9 @@ def test_update_current_action_matches_async_twin(db):
 
     for action in ("a1", "a2", "a1"):
         Workflow.update_current_action(db.session, sync_flow.id, action, {})
-        asyncio.run(Workflow.async_update_current_action(
-            wid=async_flow.id, action_id=action, context={}))
+        # 同步 Model 方法只暂存 SQL；由测试持有的事务边界先提交，避免与异步会话争锁。
+        db.session.commit()
+        asyncio.run(_stage_async_action(async_flow.id, action))
 
     assert Workflow.get_by_name(db.session, "wf-sync-action").current_action == \
         Workflow.get_by_name(db.session, "wf-async-action").current_action

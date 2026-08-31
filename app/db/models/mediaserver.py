@@ -7,7 +7,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base, execute_dml, get_id_column
-from app.db.decorators import async_db_query, db_query, db_update
 from app.db.models._constraints import media_identity_constraint
 from app.schemas.types import MediaSource
 
@@ -53,28 +52,26 @@ class MediaServerItem(Base):
     )
 
     @classmethod
-    @db_query
     def get_by_itemid(cls, db: Session, item_id: str):
         return db.execute(select(cls).where(cls.item_id == item_id)).scalars().first()
 
     @classmethod
-    @db_query
     def get_by_server_itemid(cls, db: Session, server: str, item_id: str):
         return db.execute(
             select(cls).where(cls.server == server, cls.item_id == item_id)
         ).scalars().first()
 
     @classmethod
-    @db_update
     def empty(cls, db: Session, server: Optional[str] = None):
+        """在调用方事务中暂存媒体服务器条目清空操作。"""
         statement = delete(cls)
         if server is not None:
             statement = statement.where(cls.server == server)
         db.execute(statement, execution_options={"synchronize_session": False})
 
     @classmethod
-    @db_update
     def delete_stale(cls, db: Session, server: str, sync_time: str):
+        """在调用方事务中删除本轮同步未更新的条目。"""
         return execute_dml(
             db,
             delete(cls).where(
@@ -85,8 +82,8 @@ class MediaServerItem(Base):
         )
 
     @classmethod
-    @db_update
     def delete_excluded_servers(cls, db: Session, servers: List[str]):
+        """在调用方事务中删除不属于启用服务器的条目。"""
         statement = delete(cls)
         if servers:
             statement = statement.where(
@@ -97,7 +94,6 @@ class MediaServerItem(Base):
         )
 
     @classmethod
-    @db_query
     def exist_by_media_identity(
             cls, db: Session, media_source: MediaSource, media_id: str, mtype: str,
     ):
@@ -109,7 +105,6 @@ class MediaServerItem(Base):
         )).scalars().first()
 
     @classmethod
-    @db_query
     def exists_by_title(cls, db: Session, title: str, mtype: str, year: str):
         statement = select(cls).where(cls.title == title)
         if mtype:
@@ -119,13 +114,11 @@ class MediaServerItem(Base):
         return db.execute(statement).scalars().first()
 
     @classmethod
-    @async_db_query
     async def async_get_by_itemid(cls, db: AsyncSession, item_id: str):
         result = await db.execute(select(cls).filter(cls.item_id == item_id))
         return result.scalars().first()
 
     @classmethod
-    @async_db_query
     async def async_exist_by_media_identity(
             cls, db: AsyncSession, media_source: MediaSource, media_id: str, mtype: str,
     ):
@@ -138,7 +131,6 @@ class MediaServerItem(Base):
         return result.scalars().first()
 
     @classmethod
-    @async_db_query
     async def async_exists_by_title(cls, db: AsyncSession, title: str, mtype: str, year: str):
         if not mtype and not year:
             result = await db.execute(select(cls).filter(cls.title == title))

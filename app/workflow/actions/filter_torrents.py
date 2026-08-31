@@ -1,13 +1,12 @@
-from typing import Optional, List
+from typing import List, Optional
 
 from pydantic import Field
 
-from app.workflow.actions import BaseAction, ActionChain
-from app.runtime.config import global_vars
-from app.application.torrent import TorrentHelper
+from app.application.torrent.download import TorrentHelper
 from app.runtime.log import logger
-from app.schemas.workflow import ActionParams
-from app.schemas.workflow import ActionContext
+from app.runtime.stop import runtime_stop_state
+from app.schemas.workflow import ActionContext, ActionParams
+from app.workflow.actions import ActionChain, BaseAction
 
 
 class FilterTorrentsParams(ActionParams):
@@ -37,20 +36,9 @@ class FilterTorrentsAction(BaseAction):
         super().__init__(action_id)
         self._torrents = []
 
-    @classmethod
-    @property
-    def name(cls) -> str: # noqa
-        return "过滤资源"
-
-    @classmethod
-    @property
-    def description(cls) -> str: # noqa
-        return "对资源列表数据进行过滤"
-
-    @classmethod
-    @property
-    def data(cls) -> dict: # noqa
-        return FilterTorrentsParams().model_dump()
+    name = "过滤资源"
+    description = "对资源列表数据进行过滤"
+    data = FilterTorrentsParams().model_dump()
 
     @property
     def success(self) -> bool:
@@ -62,7 +50,7 @@ class FilterTorrentsAction(BaseAction):
         """
         params = FilterTorrentsParams(**params)
         for torrent in context.torrents:
-            if global_vars.is_workflow_stopped(workflow_id):
+            if runtime_stop_state.is_workflow_stopped(workflow_id):
                 break
             if TorrentHelper().filter_torrent(
                     torrent_info=torrent.torrent_info,

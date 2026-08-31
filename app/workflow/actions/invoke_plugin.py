@@ -1,10 +1,9 @@
 from pydantic import Field
 
-from app.workflow.actions import BaseAction
-from app.application.plugin.runtime import get_plugin_manager as PluginManager
+from app.application.plugin.runtime import get_plugin_manager
 from app.runtime.log import logger
-from app.schemas.workflow import ActionParams
-from app.schemas.workflow import ActionContext
+from app.schemas.workflow import ActionContext, ActionParams
+from app.workflow.actions import BaseAction
 
 
 class InvokePluginParams(ActionParams):
@@ -27,20 +26,9 @@ class InvokePluginAction(BaseAction):
         super().__init__(action_id)
         self._success = False
 
-    @classmethod
-    @property
-    def name(cls) -> str: # noqa
-        return "调用插件"
-
-    @classmethod
-    @property
-    def description(cls) -> str: # noqa
-        return "调用插件提供的动作"
-
-    @classmethod
-    @property
-    def data(cls) -> dict: # noqa
-        return InvokePluginParams().model_dump()
+    name = "调用插件"
+    description = "调用插件提供的动作"
+    data = InvokePluginParams().model_dump()
 
     @property
     def success(self) -> bool:
@@ -54,7 +42,7 @@ class InvokePluginAction(BaseAction):
         if not params.plugin_id or not params.action_id:
             return context
         try:
-            plugin_actions = PluginManager().get_plugin_actions(params.plugin_id)
+            plugin_actions = get_plugin_manager().get_plugin_actions(params.plugin_id)
             if not plugin_actions:
                 logger.error(f"插件不存在: {params.plugin_id}")
                 return context

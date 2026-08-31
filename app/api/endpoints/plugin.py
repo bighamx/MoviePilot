@@ -1,97 +1,92 @@
 import asyncio
 import mimetypes
-import shutil
 from typing import Annotated, Any, Dict, List, Optional
 
 import aiofiles
 from anyio import Path as AsyncPath
 from fastapi import Depends, Header, HTTPException, Security
-from fastapi.concurrency import run_in_threadpool
 from starlette import status
 from starlette.responses import StreamingResponse
 
-from app.schemas.common import JsonObject as _SchemaJsonObject
-from app.schemas.plugin import Plugin as _SchemaPlugin
-from app.schemas.plugin import PluginDashboard as _SchemaPluginDashboard
-from app.schemas.plugin import PluginDashboardMetaItem as _SchemaPluginDashboardMetaItem
-from app.schemas.plugin import PluginFoldersData as _SchemaPluginFoldersData
-from app.schemas.plugin import PluginRating as _SchemaPluginRating
-from app.schemas.plugin import PluginRatingMap as _SchemaPluginRatingMap
-from app.schemas.plugin import PluginRatingRequest as _SchemaPluginRatingRequest
-from app.schemas.plugin import PluginReleaseData as _SchemaPluginReleaseData
-from app.schemas.plugin import PluginRemoteInfo as _SchemaPluginRemoteInfo
-from app.schemas.plugin import PluginSidebarNavItem as _SchemaPluginSidebarNavItem
-from app.schemas.response import Response as _SchemaResponse
-from app.schemas.token import TokenPayload as _SchemaTokenPayload
-from app.api.response import ResponseAPIRouter
-from app.application.plugin.folders import remove_plugin_from_folders
-from app.application.plugin.routes import register_plugin_api, remove_plugin_api
-from app.application.plugin.install import PluginInstallCommand
-from app.application.plugin.config import PluginConfigCommand
-from app.application.commands import init_commands
-from app.application.scheduling import remove_plugin_job, update_plugin_job
-from app.runtime.cache import async_fresh
-from app.runtime.config import settings
-from app.application.plugin.runtime import get_plugin_manager as PluginManager
-from app.runtime.extensions.plugin.contracts import (
-    PluginDashboardError,
-    PluginNotFoundError,
-)
 from app.adapters.web.security.access import (
     resource_token_cookie,
     verify_resource_token,
     verify_token,
 )
-from app.api.principal import ApiPrincipal
-from app.application.configuration import get_configured_system_config
-from app.api.deps import (
+from app.api.context import get_background_task_registry, resolve_background_task_registry
+from app.api.dependencies.auth import (
     get_current_active_superuser,
     get_current_active_superuser_async,
+)
+from app.api.dependencies.plugin import (
     get_plugin_config_command,
 )
-from app.adapters.external.server import MoviePilotServerHelper
-from app.adapters.external.market import PluginHelper
-from app.adapters.system.plugin.package import PluginPackageManager
+from app.api.principal import ApiPrincipal
+from app.api.response import ResponseAPIRouter
+from app.application.commands import init_commands
+from app.application.configuration import get_api_runtime_config_snapshot, get_configured_system_config
+from app.application.plugin.catalog import get_plugin_catalog_query
+from app.application.plugin.config import PluginConfigCommand
+from app.application.plugin.folders import (
+    add_clone_to_plugin_folder,
+    get_plugin_folder_service,
+    remove_plugin_from_folders,
+)
+from app.application.plugin.gateway import get_plugin_install_service
+from app.application.plugin.rating import (
+    PluginNotInstalledError,
+    get_plugin_rating_service,
+)
+from app.application.plugin.release import get_plugin_release_service
+from app.application.plugin.routes import register_plugin_api, remove_plugin_api
+from app.application.plugin.runtime import get_plugin_manager
+from app.application.plugin.transaction import get_plugin_persistence
+from app.application.scheduling import remove_plugin_job, update_plugin_job
+from app.runtime.extensions.plugin.contracts import (
+    PluginDashboardError,
+    PluginNotFoundError,
+)
 from app.runtime.log import logger
+from app.runtime.tasks import TaskRegistry
+from app.schemas.common import JsonObject as _SchemaJsonObject
+from app.schemas.exception import PluginMutationRejectedError
+from app.schemas.plugin import Plugin as _SchemaPlugin
+from app.schemas.plugin import PluginCloneRequest as _SchemaPluginCloneRequest
+from app.schemas.plugin import PluginDashboard as _SchemaPluginDashboard
+from app.schemas.plugin import PluginDashboardMetaItem as _SchemaPluginDashboardMetaItem
+from app.schemas.plugin import PluginFoldersData as _SchemaPluginFoldersData
+from app.schemas.plugin import PluginInstallOutcome as _SchemaPluginInstallOutcome
+from app.schemas.plugin import PluginRating as _SchemaPluginRating
+from app.schemas.plugin import PluginRatingMap as _SchemaPluginRatingMap
+from app.schemas.plugin import PluginRatingRequest as _SchemaPluginRatingRequest
+from app.schemas.plugin import PluginReleaseData as _SchemaPluginReleaseData
+from app.schemas.plugin import PluginRemoteInfo as _SchemaPluginRemoteInfo
+from app.schemas.plugin import PluginRuntimeStatus as _SchemaPluginRuntimeStatus
+from app.schemas.plugin import PluginRuntimeSummary as _SchemaPluginRuntimeSummary
+from app.schemas.plugin import PluginSidebarNavItem as _SchemaPluginSidebarNavItem
+from app.schemas.plugin import PluginSourceCandidate as _SchemaPluginSourceCandidate
+from app.schemas.plugin import PluginSourceChangeRequest as _SchemaPluginSourceChangeRequest
+from app.schemas.plugin import PluginSourceIdentity as _SchemaPluginSourceIdentity
+from app.schemas.plugin import PluginSourceInstallRequest as _SchemaPluginSourceInstallRequest
+from app.schemas.plugin import PluginSourceOptions as _SchemaPluginSourceOptions
+from app.schemas.response import Response as _SchemaResponse
+from app.schemas.token import TokenPayload as _SchemaTokenPayload
 from app.schemas.types import SystemConfigKey
 
 router = ResponseAPIRouter()
 _plugin_release_refresh_tasks: set[asyncio.Task] = set()
 
 
-async def _get_market_plugin_from_repo(
-    plugin_manager: PluginManager,
-    plugin_id: str,
-    repo_url: str,
-    force: bool,
-) -> Optional[_SchemaPlugin]:
-    """
-    只读取指定插件仓库的市场元数据，避免单插件详情触发全部市场刷新。
-    """
-    market_plugins = await plugin_manager.async_get_plugins_from_market(
-        repo_url, settings.VERSION_FLAG, force
-    )
-    market_plugin = next(
-        (
-            plugin
-            for plugin in market_plugins or []
-            if plugin.id == plugin_id
-        ),
-        None,
-    )
-    if market_plugin or not settings.VERSION_FLAG:
-        return market_plugin
-
-    compatible_plugins = await plugin_manager.async_get_plugins_from_market(
-        repo_url, None, force
-    )
-    return next(
-        (
-            plugin
-            for plugin in compatible_plugins or []
-            if plugin.id == plugin_id
-        ),
-        None,
+def _plugin_source_identity_schema(identity: Any) -> _SchemaPluginSourceIdentity:
+    """把持久化身份映射为公共来源确认 DTO。"""
+    return _SchemaPluginSourceIdentity(
+        plugin_id=identity.plugin_id,
+        trusted_source_type=identity.trusted_source_type.value,
+        trusted_source_key=identity.trusted_source_key,
+        binding_basis=identity.binding_basis.value,
+        payload_source_type=identity.payload_source_type.value,
+        payload_source_key=identity.payload_source_key,
+        revision=identity.revision,
     )
 
 
@@ -100,17 +95,22 @@ async def _refresh_plugin_release_versions(plugin_id: str, repo_url: str) -> Non
     后台强制刷新 Release 缓存，接口响应路径优先返回已有缓存。
     """
     try:
-        async with async_fresh(True):
-            await PluginHelper().async_get_plugin_release_versions(plugin_id, repo_url)
+        await get_plugin_release_service().refresh(plugin_id, repo_url)
     except Exception as e:
         logger.warning(f"后台刷新插件 {plugin_id} Release 列表失败：{e}")
 
 
-def _schedule_plugin_release_refresh(plugin_id: str, repo_url: str) -> None:
+def _schedule_plugin_release_refresh(
+    plugin_id: str, repo_url: str, task_registry: TaskRegistry | None = None
+) -> None:
     """
     保留后台任务引用，避免任务被回收，同时让 helper 负责同仓库强刷合并。
     """
-    task = asyncio.create_task(_refresh_plugin_release_versions(plugin_id, repo_url))
+    registry = resolve_background_task_registry(task_registry)
+    task = registry.create(
+        _refresh_plugin_release_versions(plugin_id, repo_url),
+        owner="api.plugin.release_refresh",
+    )
     _plugin_release_refresh_tasks.add(task)
 
     def _discard_task(completed_task: asyncio.Task) -> None:
@@ -131,24 +131,6 @@ def register_plugin(plugin_id: str):
     register_plugin_api(plugin_id)
 
 
-def _merge_plugin_market_metadata(
-    plugin: _SchemaPlugin, market_plugin: _SchemaPlugin
-) -> _SchemaPlugin:
-    """
-    合并插件市场中的远端元数据，供已安装插件按需展示更新说明。
-    """
-    plugin.repo_url = market_plugin.repo_url or plugin.repo_url
-    plugin.history = market_plugin.history or {}
-    plugin.release = market_plugin.release
-    plugin.has_update = market_plugin.has_update
-    plugin.system_version = market_plugin.system_version or plugin.system_version
-    plugin.system_version_compatible = market_plugin.system_version_compatible
-    plugin.system_version_message = (
-        market_plugin.system_version_message or plugin.system_version_message
-    )
-    return plugin
-
-
 def _is_plugin_auth_remote_file(plugin_id: str, filepath: str) -> bool:
     """
     判断静态文件是否属于插件声明的匿名登录认证远程组件。
@@ -158,7 +140,7 @@ def _is_plugin_auth_remote_file(plugin_id: str, filepath: str) -> bool:
     """
     path = filepath.lstrip("/")
     normalized_plugin_id = plugin_id.lower()
-    plugin_manager = PluginManager()
+    plugin_manager = get_plugin_manager()
     for provider in plugin_manager.get_plugin_auth_providers():
         remote = provider.get("remote") or {}
         if str(remote.get("id") or "").lower() != normalized_plugin_id:
@@ -191,54 +173,6 @@ def _verify_plugin_static_file_access(
     verify_resource_token(resource_token)
 
 
-async def _get_plugin_history_detail(
-    plugin_id: str, force: bool = True
-) -> Optional[_SchemaPlugin]:
-    """
-    按需获取插件远端元数据，避免插件列表加载时批量访问网络。
-    """
-    plugin_manager = PluginManager()
-    installed_plugin = next(
-        (
-            plugin
-            for plugin in plugin_manager.get_local_plugins()
-            if plugin.id == plugin_id and plugin.installed
-        ),
-        None,
-    )
-    if not installed_plugin:
-        return None
-
-    local_repo_plugin = next(
-        (plugin for plugin in plugin_manager.get_local_repo_plugins() if plugin.id == plugin_id),
-        None,
-    )
-    if local_repo_plugin:
-        return _merge_plugin_market_metadata(installed_plugin, local_repo_plugin)
-
-    if installed_plugin.repo_url:
-        market_plugin = await _get_market_plugin_from_repo(
-            plugin_manager, plugin_id, installed_plugin.repo_url, force
-        )
-        if not market_plugin:
-            logger.debug(f"插件 {plugin_id} 未从来源仓库获取到更新说明，返回本地插件信息")
-            return installed_plugin
-        return _merge_plugin_market_metadata(installed_plugin, market_plugin)
-
-    market_plugin = next(
-        (
-            plugin
-            for plugin in await plugin_manager.async_get_online_plugins(force=force)
-            if plugin.id == plugin_id
-        ),
-        None,
-    )
-    if not market_plugin:
-        return installed_plugin
-
-    return _merge_plugin_market_metadata(installed_plugin, market_plugin)
-
-
 @router.get("/", summary="所有插件", response_model=List[_SchemaPlugin])
 async def all_plugins(
     _: ApiPrincipal = Depends(get_current_active_superuser_async),
@@ -248,54 +182,10 @@ async def all_plugins(
     """
     查询所有插件清单，包括本地插件和在线插件，插件状态：installed, market, all
     """
-    # 本地插件
-    plugin_manager = PluginManager()
-    local_plugins = plugin_manager.get_local_plugins()
-    # 已安装插件
-    installed_plugins = [plugin for plugin in local_plugins if plugin.installed]
-    if state == "installed":
-        return installed_plugins
-
-    # 未安装的本地插件
-    not_installed_plugins = [plugin for plugin in local_plugins if not plugin.installed]
-    # 本地插件仓库目录中的插件
-    local_repo_plugins = plugin_manager.get_local_repo_plugins()
-    # 在线插件
-    online_plugins = await plugin_manager.async_get_online_plugins(force)
-    candidate_plugins = (
-        plugin_manager.process_plugins_list(online_plugins + local_repo_plugins, [])
-        if online_plugins or local_repo_plugins
-        else []
+    return await get_plugin_catalog_query().query(
+        state=state or "all",
+        force=force,
     )
-    if not candidate_plugins:
-        # 没有获取在线插件
-        if state == "market":
-            # 返回未安装的本地插件
-            return not_installed_plugins
-        return local_plugins
-
-    # 插件市场插件清单
-    market_plugins = []
-    # 已安装插件IDS
-    _installed_ids = [plugin.id for plugin in installed_plugins]
-    # 未安装的线上插件或者有更新的插件
-    for plugin in candidate_plugins:
-        if plugin.id not in _installed_ids:
-            market_plugins.append(plugin)
-        elif plugin.has_update:
-            market_plugins.append(plugin)
-    # 未安装的本地插件，且不在线上插件中
-    _plugin_ids = [plugin.id for plugin in market_plugins]
-    for plugin in not_installed_plugins:
-        if plugin.id not in _plugin_ids:
-            market_plugins.append(plugin)
-    # 返回插件清单
-    if state == "market":
-        # 返回未安装的插件
-        return market_plugins
-
-    # 返回所有插件
-    return installed_plugins + market_plugins
 
 
 @router.get("/installed", summary="已安装插件", response_model=List[str])
@@ -304,6 +194,51 @@ async def installed(_: ApiPrincipal = Depends(get_current_active_superuser_async
     查询用户已安装插件清单
     """
     return get_configured_system_config().get(SystemConfigKey.UserInstalledPlugins) or []
+
+
+@router.get(
+    "/runtime",
+    summary="插件运行时收敛状态",
+    response_model=_SchemaPluginRuntimeSummary,
+)
+async def runtime_status(
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> _SchemaPluginRuntimeSummary:
+    """返回插件页轮询所需的轻量状态摘要。"""
+    plugin_manager = get_plugin_manager()
+    statuses = plugin_manager.get_plugin_runtime_statuses()
+    installed_plugin_ids = {
+        plugin_id.lower()
+        for plugin_id in (
+            get_configured_system_config().get(
+                SystemConfigKey.UserInstalledPlugins
+            )
+            or []
+        )
+    }
+    restart_requirements = {
+        plugin_id: distributions
+        for plugin_id, distributions in (
+            plugin_manager.get_plugin_restart_requirements().items()
+        )
+        if plugin_id.lower() in installed_plugin_ids
+    }
+    pending = {
+        _SchemaPluginRuntimeStatus.SOURCE_MISSING,
+        _SchemaPluginRuntimeStatus.DEPENDENCY_PENDING,
+        _SchemaPluginRuntimeStatus.READY,
+    }
+    failed = {
+        _SchemaPluginRuntimeStatus.BLOCKED_BY_POLICY,
+        _SchemaPluginRuntimeStatus.LOAD_FAILED,
+    }
+    return _SchemaPluginRuntimeSummary(
+        ready=not plugin_manager.is_plugin_settling(),
+        generation=plugin_manager.get_plugin_runtime_generation(),
+        pending_count=sum(status in pending for status in statuses.values()),
+        failed_count=sum(status in failed for status in statuses.values()),
+        restart_required_plugin_ids=sorted(restart_requirements),
+    )
 
 
 @router.get("/history/{plugin_id}", summary="获取插件更新说明", response_model=_SchemaPlugin)
@@ -315,7 +250,7 @@ async def plugin_history(
     """
     按需获取指定插件的更新说明。
     """
-    plugin = await _get_plugin_history_detail(plugin_id=plugin_id, force=force)
+    plugin = await get_plugin_release_service().history(plugin_id, force=force)
     if not plugin:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -334,56 +269,29 @@ async def plugin_releases(
     _: ApiPrincipal = Depends(get_current_active_superuser_async),
     repo_url: Optional[str] = "",
     force: bool = False,
+    task_registry: TaskRegistry = Depends(get_background_task_registry),
 ) -> dict:
     """
     查询指定插件可直接安装的 GitHub Release 版本。
 
     市场元数据只读取请求仓库的当前 package，避免版本历史请求触发全部市场缓存读取。
     """
-    if not repo_url:
-        return {
-            "release_supported": False,
-            "latest_version": None,
-            "current_version": None,
-            "items": [],
-        }
-
-    plugin_manager = PluginManager()
-    market_plugin = await _get_market_plugin_from_repo(
-        plugin_manager, plugin_id, repo_url, force
+    snapshot = await get_plugin_release_service().versions(
+        plugin_id,
+        repo_url or "",
+        force=force,
     )
-    latest_version = market_plugin.plugin_version if market_plugin else None
-    current_version = plugin_manager.get_local_plugin_version(plugin_id)
-    if not getattr(market_plugin, "release", False):
-        return {
-            "release_supported": False,
-            "latest_version": latest_version,
-            "current_version": current_version,
-            "items": [],
-        }
-
-    plugin_helper = PluginHelper()
-    has_release_cache = (
-        await plugin_helper.async_has_plugin_release_cache(repo_url)
-        if force
-        else False
-    )
-    release_items = await plugin_helper.async_get_plugin_release_versions(plugin_id, repo_url)
-    if force and has_release_cache:
-        _schedule_plugin_release_refresh(plugin_id, repo_url)
-    items = []
-    for item in release_items:
-        version = item.get("version")
-        copied_item = item.copy()
-        copied_item["is_latest"] = bool(latest_version and version == latest_version)
-        copied_item["is_current"] = bool(current_version and version == current_version)
-        items.append(copied_item)
-
+    if snapshot.refresh_required:
+        _schedule_plugin_release_refresh(
+            plugin_id,
+            repo_url or "",
+            resolve_background_task_registry(task_registry),
+        )
     return {
-        "release_supported": bool(items),
-        "latest_version": latest_version,
-        "current_version": current_version,
-        "items": items,
+        "release_supported": snapshot.release_supported,
+        "latest_version": snapshot.latest_version,
+        "current_version": snapshot.current_version,
+        "items": list(snapshot.items),
     }
 
 
@@ -396,7 +304,7 @@ async def statistic(_: _SchemaTokenPayload = Depends(verify_token)) -> Any:
     """
     插件安装统计
     """
-    return await MoviePilotServerHelper.async_get_plugin_statistic()
+    return await get_plugin_rating_service().statistic()
 
 
 @router.get(
@@ -412,7 +320,7 @@ async def plugin_ratings(
     批量查询插件平均分、评分人数和当前安装实例评分。
     """
     requested_ids = plugin_ids.split(",") if plugin_ids is not None else None
-    ratings = await MoviePilotServerHelper.async_get_plugin_ratings(requested_ids)
+    ratings = await get_plugin_rating_service().ratings(requested_ids)
     return {
         plugin_id: _SchemaPluginRating.model_validate(rating)
         for plugin_id, rating in ratings.items()
@@ -431,7 +339,7 @@ async def plugin_rating(
     """
     查询单个插件平均分、评分人数和当前安装实例评分。
     """
-    rating = await MoviePilotServerHelper.async_get_plugin_rating(plugin_id)
+    rating = await get_plugin_rating_service().rating(plugin_id)
     return _SchemaPluginRating.model_validate(rating)
 
 
@@ -448,17 +356,13 @@ async def rate_plugin(
     """
     为已安装插件新增或更新当前安装实例评分。
     """
-    installed_plugins = get_configured_system_config().get(SystemConfigKey.UserInstalledPlugins) or []
-    if plugin_id not in installed_plugins:
+    try:
+        rating = await get_plugin_rating_service().submit(plugin_id, payload.rating)
+    except PluginNotInstalledError as error:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"插件 {plugin_id} 未安装，无法评分",
-        )
-
-    rating = await MoviePilotServerHelper.async_submit_plugin_rating(
-        plugin_id,
-        payload.rating,
-    )
+            detail=str(error),
+        ) from error
     if rating is None:
         return _SchemaResponse(success=False, message="连接MoviePilot服务器失败")
     return _SchemaResponse(success=True, data=rating)
@@ -473,14 +377,32 @@ def reload_plugin(
     """
     重新加载插件
     """
-    # 重新加载插件
-    PluginManager().reload_plugin(plugin_id)
-    # 注册插件服务
-    register_plugin(plugin_id)
-    return _SchemaResponse(success=True)
+    plugin_manager = get_plugin_manager()
+    try:
+        with plugin_manager.mutation(f"重载插件 {plugin_id}"):
+            # 重新加载插件
+            runtime_status = plugin_manager.reload_plugin(plugin_id)
+            # 注册插件服务
+            register_plugin(plugin_id)
+    except PluginMutationRejectedError as error:
+        return _SchemaResponse(success=False, message=str(error))
+    if runtime_status is _SchemaPluginRuntimeStatus.ACTIVE:
+        return _SchemaResponse(success=True)
+    return _SchemaResponse(
+        success=False,
+        message=(
+            "未通过用户认证，请查看日志"
+            if runtime_status is _SchemaPluginRuntimeStatus.BLOCKED_BY_POLICY
+            else "插件加载失败，请查看插件日志"
+        ),
+    )
 
 
-@router.get("/install/{plugin_id}", summary="安装插件", response_model=_SchemaResponse[None])
+@router.get(
+    "/install/{plugin_id}",
+    summary="安装插件",
+    response_model=_SchemaResponse[_SchemaPluginInstallOutcome],
+)
 async def install(
     plugin_id: str,
     repo_url: Optional[str] = "",
@@ -491,67 +413,143 @@ async def install(
     """
     安装插件
     """
-    plugin_helper = PluginHelper()
-    package_manager = PluginPackageManager(plugin_helper)
-
-    async def save_installed_plugins(plugin_ids: List[str]) -> object:
-        """保存安装用例确认后的插件列表。"""
-        return await get_configured_system_config().async_set(
-            SystemConfigKey.UserInstalledPlugins,
-            plugin_ids,
-        )
-
-    async def install_package(
-        target_id: str,
-        target_repo: str,
-        target_release: Optional[str],
-        force_install: bool,
-    ) -> tuple[bool, str]:
-        """调用插件包适配器执行异步安装。"""
-        return await package_manager.async_install(
-            plugin_id=target_id,
-            repo_url=target_repo,
-            release_version=target_release,
-            force_install=force_install,
-        )
-
-    async def reload_runtime(target_id: str) -> object:
-        """在线程池中重建插件实例并广播重载事件。"""
-        return await run_in_threadpool(PluginManager().reload_plugin, target_id)
-
-    async def refresh_registrations(target_id: str) -> object:
-        """在线程池中刷新插件服务、命令和动态路由。"""
-        return await run_in_threadpool(register_plugin, target_id)
-
-    command = PluginInstallCommand(
-        installed_plugins_reader=lambda: get_configured_system_config().get(
-            SystemConfigKey.UserInstalledPlugins
-        ) or [],
-        installed_plugins_writer=save_installed_plugins,
-        plugin_ids_provider=lambda: PluginManager().get_plugin_ids(),
-        compatibility_checker=plugin_helper.async_get_plugin_system_version_check_message,
-        package_installer=install_package,
-        package_checkpointer=package_manager.async_checkpoint,
-        package_committer=package_manager.async_commit,
-        package_rollback=package_manager.async_rollback,
-        install_reporter=lambda target_id, target_repo: (
-            MoviePilotServerHelper.async_install_plugin_reg(
-                plugin_id=target_id,
-                repo_url=target_repo,
-            )
-        ),
-        plugin_reloader=reload_runtime,
-        registration_refresher=refresh_registrations,
-    )
-    result = await command.execute(
+    result = await get_plugin_install_service().install(
         plugin_id=plugin_id,
-        repo_url=repo_url,
+        repo_url=repo_url or None,
         release_version=release_version,
         force=bool(force),
+        explicit_source=False,
     )
     if not result.success:
         return _SchemaResponse(success=False, message=result.message)
-    return _SchemaResponse(success=True)
+    return _SchemaResponse(
+        success=True,
+        message=result.message,
+        data=_SchemaPluginInstallOutcome(
+            restart_required=result.restart_required,
+        ),
+    )
+
+
+@router.get(
+    "/source/{plugin_id}",
+    summary="获取插件来源身份",
+    response_model=_SchemaResponse[_SchemaPluginSourceIdentity],
+)
+async def get_plugin_source_identity(
+    plugin_id: str,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> Any:
+    """返回显式换源确认所需的当前可信来源和 revision。"""
+    identity = await get_plugin_persistence().get_identity(plugin_id)
+    if identity is None:
+        return _SchemaResponse(success=False, message="未找到该插件的仓库绑定信息")
+    return _SchemaResponse(
+        success=True,
+        data=_plugin_source_identity_schema(identity),
+    )
+
+
+@router.get(
+    "/source/{plugin_id}/options",
+    summary="获取插件来源候选",
+    response_model=_SchemaResponse[_SchemaPluginSourceOptions],
+)
+async def get_plugin_source_options(
+    plugin_id: str,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+    force: bool = False,
+) -> Any:
+    """返回与真实安装相同库存中的脱敏候选和当前准入状态。"""
+    inspection = await get_plugin_install_service().inspect_source(
+        plugin_id=plugin_id,
+        force=force,
+    )
+    candidates = [
+        _SchemaPluginSourceCandidate.model_validate(candidate.public_dict())
+        for candidate in inspection.online_candidates
+    ]
+    if inspection.local_candidate is not None:
+        candidates.append(
+            _SchemaPluginSourceCandidate.model_validate(
+                inspection.local_candidate.public_dict()
+            )
+        )
+    return _SchemaResponse(
+        success=True,
+        data=_SchemaPluginSourceOptions(
+            plugin_id=inspection.plugin_id,
+            inventory_complete=inspection.inventory_complete,
+            selection_status=inspection.selection.status.value,
+            selection_reason=inspection.selection.reason,
+            identity=(
+                _plugin_source_identity_schema(inspection.identity)
+                if inspection.identity is not None
+                else None
+            ),
+            candidates=candidates,
+        ),
+    )
+
+
+@router.post(
+    "/source/{plugin_id}/install",
+    summary="按明确来源安装插件",
+    response_model=_SchemaResponse[_SchemaPluginInstallOutcome],
+)
+async def install_plugin_from_source(
+    plugin_id: str,
+    request: _SchemaPluginSourceInstallRequest,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> Any:
+    """安装管理员明确选择的初始在线来源，不承担已绑定插件换源。"""
+    result = await get_plugin_install_service().install(
+        plugin_id=plugin_id,
+        repo_url=request.repo_url,
+        release_version=request.release_version,
+        force=request.force,
+        explicit_source=True,
+    )
+    if not result.success:
+        return _SchemaResponse(success=False, message=result.message)
+    return _SchemaResponse(
+        success=True,
+        message=result.message,
+        data=_SchemaPluginInstallOutcome(
+            restart_required=result.restart_required,
+        ),
+    )
+
+
+@router.post(
+    "/source/{plugin_id}",
+    summary="切换插件来源",
+    response_model=_SchemaResponse[_SchemaPluginInstallOutcome],
+)
+async def change_plugin_source(
+    plugin_id: str,
+    request: _SchemaPluginSourceChangeRequest,
+    _: ApiPrincipal = Depends(get_current_active_superuser_async),
+) -> Any:
+    """按精确身份 revision 安装明确选择的新在线来源。"""
+    result = await get_plugin_install_service().install(
+        plugin_id=plugin_id,
+        repo_url=request.repo_url,
+        release_version=request.release_version,
+        force=True,
+        explicit_source=True,
+        source_change=True,
+        expected_revision=request.expected_revision,
+    )
+    if not result.success:
+        return _SchemaResponse(success=False, message=result.message)
+    return _SchemaResponse(
+        success=True,
+        message=result.message,
+        data=_SchemaPluginInstallOutcome(
+            restart_required=result.restart_required,
+        ),
+    )
 
 
 @router.get(
@@ -565,7 +563,7 @@ async def remotes(token: str) -> Any:
     """
     if token != "moviepilot":
         raise HTTPException(status_code=403, detail="Forbidden")
-    return PluginManager().get_plugin_remotes()
+    return get_plugin_manager().get_plugin_remotes()
 
 
 @router.get(
@@ -577,7 +575,7 @@ def plugin_sidebar_nav(_: _SchemaTokenPayload = Depends(verify_token)) -> Any:
     """
     聚合已启用 Vue 插件声明的侧栏入口（get_sidebar_nav），供前端主界面侧栏展示。
     """
-    return PluginManager().get_plugin_sidebar_nav()
+    return get_plugin_manager().get_plugin_sidebar_nav()
 
 
 @router.get(
@@ -591,7 +589,7 @@ def plugin_form(
     """
     根据插件ID获取插件配置表单或Vue组件URL
     """
-    plugin_manager = PluginManager()
+    plugin_manager = get_plugin_manager()
     plugin_instance = plugin_manager.running_plugins.get(plugin_id)
     if not plugin_instance:
         raise HTTPException(
@@ -627,7 +625,7 @@ def plugin_page(
     """
     根据插件ID获取插件数据页面
     """
-    plugin_instance = PluginManager().running_plugins.get(plugin_id)
+    plugin_instance = get_plugin_manager().running_plugins.get(plugin_id)
     if not plugin_instance:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -655,7 +653,7 @@ def plugin_dashboard_meta(
     """
     获取所有插件仪表板元信息
     """
-    return PluginManager().get_plugin_dashboard_meta()
+    return get_plugin_manager().get_plugin_dashboard_meta()
 
 
 @router.get("/dashboard/{plugin_id}/{key}", summary="获取插件仪表板配置")
@@ -669,7 +667,7 @@ def plugin_dashboard_by_key(
     根据插件ID获取插件仪表板
     """
     try:
-        return PluginManager().get_plugin_dashboard(plugin_id, key, user_agent)
+        return get_plugin_manager().get_plugin_dashboard(plugin_id, key, user_agent)
     except PluginNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
     except PluginDashboardError as error:
@@ -736,8 +734,12 @@ async def plugin_static_file(
         )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
 
+    source_plugin_id = get_plugin_manager().get_plugin_source_id(plugin_id)
     plugin_base_dir = (
-        AsyncPath(settings.ROOT_PATH) / "app" / "plugins" / plugin_id.lower()
+        AsyncPath(get_api_runtime_config_snapshot().root_path)
+        / "app"
+        / "plugins"
+        / source_plugin_id.lower()
     )
     plugin_file_path = plugin_base_dir / filepath.lstrip("/")
 
@@ -809,12 +811,7 @@ async def get_plugin_folders(
     """
     获取插件文件夹分组配置
     """
-    try:
-        result = get_configured_system_config().get(SystemConfigKey.PluginFolders) or {}
-        return result
-    except Exception as e:
-        logger.error(f"[文件夹API] 获取文件夹配置失败: {str(e)}")
-        return {}
+    return get_plugin_folder_service().get_or_empty()
 
 
 @router.post("/folders", summary="保存插件文件夹配置", response_model=_SchemaResponse[None])
@@ -824,12 +821,8 @@ async def save_plugin_folders(
     """
     保存插件文件夹分组配置
     """
-    try:
-        get_configured_system_config().set(SystemConfigKey.PluginFolders, folders)
-        return _SchemaResponse(success=True)
-    except Exception as e:
-        logger.error(f"[文件夹API] 保存文件夹配置失败: {str(e)}")
-        return _SchemaResponse(success=False, message=str(e))
+    result = await get_plugin_folder_service().save(folders)
+    return _SchemaResponse(success=result.success, message=result.message)
 
 
 @router.post(
@@ -841,15 +834,8 @@ async def create_plugin_folder(
     """
     创建新的插件文件夹
     """
-    folders = get_configured_system_config().get(SystemConfigKey.PluginFolders) or {}
-    if folder_name not in folders:
-        folders[folder_name] = []
-        get_configured_system_config().set(SystemConfigKey.PluginFolders, folders)
-        return _SchemaResponse(
-            success=True, message=f"文件夹 '{folder_name}' 创建成功"
-        )
-    else:
-        return _SchemaResponse(success=False, message=f"文件夹 '{folder_name}' 已存在")
+    result = await get_plugin_folder_service().create(folder_name)
+    return _SchemaResponse(success=result.success, message=result.message)
 
 
 @router.delete(
@@ -861,15 +847,8 @@ async def delete_plugin_folder(
     """
     删除插件文件夹
     """
-    folders = get_configured_system_config().get(SystemConfigKey.PluginFolders) or {}
-    if folder_name in folders:
-        del folders[folder_name]
-        await get_configured_system_config().async_set(SystemConfigKey.PluginFolders, folders)
-        return _SchemaResponse(
-            success=True, message=f"文件夹 '{folder_name}' 删除成功"
-        )
-    else:
-        return _SchemaResponse(success=False, message=f"文件夹 '{folder_name}' 不存在")
+    result = await get_plugin_folder_service().delete(folder_name)
+    return _SchemaResponse(success=result.success, message=result.message)
 
 
 @router.put(
@@ -885,40 +864,39 @@ async def update_folder_plugins(
     """
     更新指定文件夹中的插件列表
     """
-    folders = get_configured_system_config().get(SystemConfigKey.PluginFolders) or {}
-    folders[folder_name] = plugin_ids
-    await get_configured_system_config().async_set(SystemConfigKey.PluginFolders, folders)
-    return _SchemaResponse(
-        success=True, message=f"文件夹 '{folder_name}' 中的插件已更新"
-    )
+    result = await get_plugin_folder_service().update_plugins(folder_name, plugin_ids)
+    return _SchemaResponse(success=result.success, message=result.message)
 
 
 @router.post(
     "/clone/{plugin_id}", summary="创建插件分身", response_model=_SchemaResponse[None]
 )
 def clone_plugin(
-    plugin_id: str, clone_data: dict, _: ApiPrincipal = Depends(get_current_active_superuser)
+    plugin_id: str,
+    clone_data: _SchemaPluginCloneRequest,
+    _: ApiPrincipal = Depends(get_current_active_superuser),
 ) -> Any:
     """
     创建插件分身
     """
+    plugin_manager = get_plugin_manager()
     try:
-        success, message = PluginManager().clone_plugin(
-            plugin_id=plugin_id,
-            suffix=clone_data.get("suffix", ""),
-            name=clone_data.get("name", ""),
-            description=clone_data.get("description", ""),
-            version=clone_data.get("version", ""),
-            icon=clone_data.get("icon", ""),
-        )
+        with plugin_manager.mutation(f"创建插件 {plugin_id} 分身"):
+            success, message = plugin_manager.clone_plugin(
+                plugin_id=plugin_id,
+                suffix=clone_data.suffix,
+                name=clone_data.name,
+                description=clone_data.description,
+                version=clone_data.version,
+                icon=clone_data.icon,
+            )
 
-        if success:
-            # 注册插件服务
-            reload_plugin(message)
-            # 将分身插件添加到原插件所在的文件夹中
-            _add_clone_to_plugin_folder(plugin_id, message)
-            return _SchemaResponse(success=True, message="插件分身创建成功")
-        else:
+            if success:
+                # 分身服务已完成运行态加载，此处只补齐宿主注册。
+                register_plugin(message)
+                # 将分身插件添加到原插件所在的文件夹中
+                add_clone_to_plugin_folder(plugin_id, message)
+                return _SchemaResponse(success=True, message="插件分身创建成功")
             return _SchemaResponse(success=False, message=message)
     except Exception as e:
         logger.error(f"创建插件分身失败：{str(e)}")
@@ -936,7 +914,7 @@ async def plugin_config(
     """
     根据插件ID获取插件配置信息
     """
-    return PluginManager().get_plugin_config(plugin_id)
+    return get_plugin_manager().get_plugin_config(plugin_id)
 
 
 @router.put("/{plugin_id}", summary="更新插件配置", response_model=_SchemaResponse[None])
@@ -960,90 +938,46 @@ def uninstall_plugin(
     """
     卸载插件
     """
-    config_oper = get_configured_system_config()
-    # 删除已安装信息
-    install_plugins = config_oper.get(SystemConfigKey.UserInstalledPlugins) or []
-    for plugin in install_plugins:
-        if plugin == plugin_id:
-            install_plugins.remove(plugin)
-            break
-    config_oper.set(SystemConfigKey.UserInstalledPlugins, install_plugins)
-    # 移除插件API
-    remove_plugin_api(plugin_id)
-    # 移除插件服务
-    remove_plugin_job(plugin_id)
-    # 判断是否为分身
-    plugin_manager = PluginManager()
-    plugin_class = plugin_manager.plugins.get(plugin_id)
-    if getattr(plugin_class, "is_clone", False):
-        # 如果是分身插件，则删除分身数据和配置
-        plugin_manager.delete_plugin_config(plugin_id)
-        plugin_manager.delete_plugin_data(plugin_id)
-        # 删除分身文件
-        plugin_base_dir = settings.ROOT_PATH / "app" / "plugins" / plugin_id.lower()
-        if plugin_base_dir.exists():
-            try:
-                shutil.rmtree(plugin_base_dir)
-                plugin_manager.plugins.pop(plugin_id, None)
-            except Exception as e:
-                logger.error(f"删除插件分身目录 {plugin_base_dir} 失败: {str(e)}")
-    # 从插件文件夹中移除该插件
-    remove_plugin_from_folders(plugin_id)
-    # 移除插件
-    plugin_manager.remove_plugin(plugin_id)
-    return _SchemaResponse(success=True)
-
-
-def _add_clone_to_plugin_folder(original_plugin_id: str, clone_plugin_id: str):
-    """
-    将分身插件添加到原插件所在的文件夹中
-    :param original_plugin_id: 原插件ID
-    :param clone_plugin_id: 分身插件ID
-    """
+    plugin_manager = get_plugin_manager()
     try:
-        config_oper = get_configured_system_config()
-        # 获取插件文件夹配置
-        folders = config_oper.get(SystemConfigKey.PluginFolders) or {}
-
-        # 查找原插件所在的文件夹
-        target_folder = None
-        for folder_name, folder_data in folders.items():
-            if isinstance(folder_data, dict) and "plugins" in folder_data:
-                # 新格式：{"plugins": [...], "order": ..., "icon": ...}
-                if original_plugin_id in folder_data["plugins"]:
-                    target_folder = folder_name
+        with plugin_manager.mutation(f"卸载插件 {plugin_id}"):
+            virtual_instance = plugin_manager.get_plugin_instance(plugin_id)
+            source_instances = plugin_manager.get_plugin_source_instances(plugin_id)
+            if not virtual_instance and source_instances:
+                instance_ids = "、".join(item.instance_id for item in source_instances)
+                return _SchemaResponse(
+                    success=False,
+                    message=f"请先卸载该插件的分身：{instance_ids}",
+                )
+            config_oper = get_configured_system_config()
+            # 删除已安装信息
+            install_plugins = config_oper.get(SystemConfigKey.UserInstalledPlugins) or []
+            for plugin in install_plugins:
+                if plugin == plugin_id:
+                    install_plugins.remove(plugin)
                     break
-            elif isinstance(folder_data, list):
-                # 旧格式：直接是插件列表
-                if original_plugin_id in folder_data:
-                    target_folder = folder_name
-                    break
-
-        # 如果找到了原插件所在的文件夹，则将分身插件也添加到该文件夹中
-        if target_folder:
-            folder_data = folders[target_folder]
-            if isinstance(folder_data, dict) and "plugins" in folder_data:
-                # 新格式
-                if clone_plugin_id not in folder_data["plugins"]:
-                    folder_data["plugins"].append(clone_plugin_id)
-                    logger.info(
-                        f"已将分身插件 {clone_plugin_id} 添加到文件夹 '{target_folder}' 中"
-                    )
-            elif isinstance(folder_data, list):
-                # 旧格式
-                if clone_plugin_id not in folder_data:
-                    folder_data.append(clone_plugin_id)
-                    logger.info(
-                        f"已将分身插件 {clone_plugin_id} 添加到文件夹 '{target_folder}' 中"
-                    )
-
-            # 保存更新后的文件夹配置
-            config_oper.set(SystemConfigKey.PluginFolders, folders)
-        else:
-            logger.info(
-                f"原插件 {original_plugin_id} 不在任何文件夹中，分身插件 {clone_plugin_id} 将保持独立"
-            )
-
-    except Exception as e:
-        logger.error(f"处理插件文件夹时出错：{str(e)}")
-        # 文件夹处理失败不影响插件分身创建的整体流程
+            config_oper.set(SystemConfigKey.UserInstalledPlugins, install_plugins)
+            # 移除插件API
+            remove_plugin_api(plugin_id)
+            # 移除插件服务
+            remove_plugin_job(plugin_id)
+            # 判断是否为分身
+            plugin_class = plugin_manager.plugins.get(plugin_id)
+            if virtual_instance:
+                plugin_manager.delete_plugin_config(plugin_id, force=True)
+                plugin_manager.delete_plugin_data(plugin_id, force=True)
+                plugin_manager.delete_plugin_instance(plugin_id)
+            elif getattr(plugin_class, "is_clone", False):
+                # 如果是分身插件，则删除分身数据和配置
+                plugin_manager.delete_plugin_config(plugin_id)
+                plugin_manager.delete_plugin_data(plugin_id)
+                # 分身物理目录只能由包文件 owner 删除。
+                if plugin_manager.remove_plugin_package(plugin_id):
+                    plugin_manager.plugins.pop(plugin_id, None)
+            # 从插件文件夹中移除该插件
+            remove_plugin_from_folders(plugin_id)
+            # 移除插件
+            plugin_manager.remove_plugin(plugin_id)
+            return _SchemaResponse(success=True)
+    except PluginMutationRejectedError as error:
+        return _SchemaResponse(success=False, message=str(error))

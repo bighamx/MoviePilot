@@ -6,7 +6,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base, get_id_column
-from app.db.decorators import db_query, db_update, async_db_query, async_db_update
 
 
 class Site(Base):
@@ -58,55 +57,73 @@ class Site(Base):
     downloader: Mapped[Optional[str]] = mapped_column(String)
 
     @classmethod
-    @db_query
     def get_by_domain(cls, db: Session, domain: str):
+        """在调用方 Session 中按域名查询站点。"""
         return db.execute(select(cls).where(cls.domain == domain)).scalars().first()
 
     @classmethod
-    @async_db_query
-    async def async_get_by_domain(cls, db: AsyncSession, domain: str):
+    async def async_get_by_domain(
+        cls,
+        db: AsyncSession,
+        domain: str,
+    ):
+        """在调用方 AsyncSession 中按域名查询站点。"""
         result = await db.execute(select(cls).where(cls.domain == domain))
         return result.scalar_one_or_none()
 
     @classmethod
-    @async_db_query
-    async def async_get_by_name(cls, db: AsyncSession, name: str):
+    async def async_get_by_name(
+        cls,
+        db: AsyncSession,
+        name: str,
+    ):
+        """在调用方 AsyncSession 中按站点名称查询。"""
         result = await db.execute(select(cls).where(cls.name == name))
         return result.scalar_one_or_none()
 
     @classmethod
-    @db_query
     def get_actives(cls, db: Session):
-        return list(db.execute(select(cls).where(cls.is_active.is_(True))).scalars().all())
+        """在调用方 Session 中查询启用站点。"""
+        return list(db.execute(
+            select(cls).where(cls.is_active.is_(True))
+        ).scalars().all())
 
     @classmethod
-    @async_db_query
     async def async_get_actives(cls, db: AsyncSession):
+        """在调用方 AsyncSession 中查询启用站点。"""
         result = await db.execute(select(cls).where(cls.is_active.is_(True)))
         return list(result.scalars().all())
 
     @classmethod
-    @db_query
     def list_order_by_pri(cls, db: Session):
+        """在调用方 Session 中按优先级升序查询站点。"""
         return list(db.execute(select(cls).order_by(cls.pri)).scalars().all())
 
     @classmethod
-    @async_db_query
     async def async_list_order_by_pri(cls, db: AsyncSession):
+        """在调用方 AsyncSession 中按优先级升序查询站点。"""
         result = await db.execute(select(cls).order_by(cls.pri))
         return list(result.scalars().all())
 
     @classmethod
-    @db_query
-    def get_domains_by_ids(cls, db: Session, ids: list):
-        return list(db.execute(select(cls.domain).where(cls.id.in_(ids))).scalars().all())
+    def get_domains_by_ids(
+        cls,
+        db: Session,
+        ids: list[int],
+    ):
+        """在调用方 Session 中按 ID 查询域名。"""
+        if not ids:
+            return []
+        return list(db.execute(
+            select(cls.domain).where(cls.id.in_(ids))
+        ).scalars().all())
 
     @classmethod
-    @db_update
     def reset(cls, db: Session):
+        """在调用方持有的同步事务中暂存清空操作。"""
         db.execute(delete(cls))
 
     @classmethod
-    @async_db_update
     async def async_reset(cls, db: AsyncSession):
+        """在调用方持有的异步事务中暂存清空操作。"""
         await db.execute(delete(cls))

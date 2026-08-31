@@ -7,7 +7,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from app.application.maintenance import CleanupPolicy, DataCleanupService
-from app.scheduler import SchedulerChain
+from app.scheduler import chain as scheduler_chain
+from app.scheduler.chain import SchedulerChain
 
 
 class FakeCleanupRepository:
@@ -18,10 +19,24 @@ class FakeCleanupRepository:
         self.failing_table = failing_table
         self.calls: list[str] = []
         self._message_results = iter((2, 1, 0))
+        self.commits = 0
+        self.rollbacks = 0
 
     def session(self):
         """返回无需真实数据库的上下文。"""
         return nullcontext(object())
+
+    def unit_of_work(self, db):
+        """返回记录提交和回滚次数的测试事务边界。"""
+        return self
+
+    def commit(self) -> None:
+        """记录一个成功清理批次。"""
+        self.commits += 1
+
+    def rollback(self) -> None:
+        """记录一个失败清理批次。"""
+        self.rollbacks += 1
 
     def _delete(self, name: str) -> int:
         """记录删除调用并按配置模拟结果或异常。"""
@@ -56,6 +71,26 @@ class FakeCleanupRepository:
         """模拟下载失败记录删除。"""
         return self._delete("downloadfailure")
 
+    def delete_subscribe_history(self, db, cutoff: str, limit: int) -> int:
+        """模拟订阅历史删除。"""
+        return self._delete("subscribehistory")
+
+    def delete_agent_chats(self, db, cutoff: str, limit: int) -> int:
+        """模拟 Agent 会话删除。"""
+        return self._delete("agentchat")
+
+    def delete_agent_task_runs(self, db, cutoff: str, limit: int) -> int:
+        """模拟 Agent 运行历史删除。"""
+        return self._delete("agenttaskrun")
+
+    def delete_outbox_completed(self, db, cutoff: str, limit: int) -> int:
+        """模拟 Outbox 已完成记录删除。"""
+        return self._delete("outbox_completed")
+
+    def delete_outbox_dead(self, db, cutoff: str, limit: int) -> int:
+        """模拟 Outbox 死信记录删除。"""
+        return self._delete("outbox_dead")
+
 
 def _policy(**overrides) -> CleanupPolicy:
     """构造所有表默认启用的测试策略。"""
@@ -66,6 +101,11 @@ def _policy(**overrides) -> CleanupPolicy:
         "site_userdata_days": 1,
         "transfer_history_days": 1,
         "download_failure_days": 1,
+        "subscribe_history_days": 1,
+        "agent_chat_days": 1,
+        "agent_task_run_days": 1,
+        "outbox_completed_days": 1,
+        "outbox_dead_days": 1,
     }
     values.update(overrides)
     return CleanupPolicy(**values)
@@ -87,6 +127,8 @@ def test_cleanup_service_owns_batching_report_and_progress() -> None:
     assert report["tables"]["message"]["deleted"] == 3
     assert report["tables"]["message"]["batches"] == 2
     assert report["total_deleted"] == 3
+    assert repository.commits == 2
+    assert repository.rollbacks == 0
     assert repository.calls == [
         "message",
         "message",
@@ -96,6 +138,11 @@ def test_cleanup_service_owns_batching_report_and_progress() -> None:
         "siteuserdata",
         "transferhistory",
         "downloadfailure",
+        "subscribehistory",
+        "agentchat",
+        "agenttaskrun",
+        "outbox_completed",
+        "outbox_dead",
     ]
     assert progress.call_args.kwargs["value"] == 100
 
@@ -112,20 +159,21 @@ def test_cleanup_service_finishes_other_tables_before_raising_partial_failure() 
     with pytest.raises(RuntimeError, match="downloadhistory: boom"):
         service.execute(batch_size=2)
 
-    assert repository.calls[-1] == "downloadfailure"
+    assert repository.calls[-1] == "outbox_dead"
+    assert repository.rollbacks == 1
 
 
 def test_scheduler_cleanup_is_a_compatibility_delegate() -> None:
     """旧 SchedulerChain 入口应原样转发参数和返回值。"""
-    service = MagicMock()
-    service.execute.return_value = {"enabled": True}
+    governance = MagicMock()
+    governance.cleanup.return_value = {"enabled": True}
     progress = MagicMock()
 
-    with patch("app.scheduler.build_cleanup_service", return_value=service):
+    with patch.object(scheduler_chain, "get_database_governance", return_value=governance):
         result = SchedulerChain().cleanup(batch_size=7, progress_callback=progress)
 
     assert result == {"enabled": True}
-    service.execute.assert_called_once_with(
+    governance.cleanup.assert_called_once_with(
         batch_size=7,
         progress_callback=progress,
     )
@@ -133,10 +181,14 @@ def test_scheduler_cleanup_is_a_compatibility_delegate() -> None:
 
 def test_scheduler_does_not_reclaim_database_cleanup_ownership() -> None:
     """调度模块不得重新导入清理模型或数据库会话。"""
-    scheduler_path = Path(__file__).parents[1] / "app" / "scheduler.py"
-    tree = ast.parse(scheduler_path.read_text(encoding="utf-8"))
+    scheduler_root = Path(__file__).parents[1] / "app" / "scheduler"
+    trees = [
+        ast.parse(path.read_text(encoding="utf-8"))
+        for path in scheduler_root.glob("*.py")
+    ]
     imports = {
         node.module
+        for tree in trees
         for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom) and node.module
     }

@@ -1,31 +1,33 @@
-from typing import List, Any, Optional
+from typing import Any, List, Optional
 
 from fastapi import Depends
 
+from app.adapters.external.server import MoviePilotServerHelper
+from app.api.dependencies.auth import (
+    get_current_active_manage_user,
+    get_current_active_manage_user_async,
+)
+from app.api.dependencies.workflow import (
+    get_workflow_definition_command,
+    get_workflow_mutation_command,
+    get_workflow_query_service,
+)
+from app.api.response import ResponseAPIRouter
+from app.application.plugin.runtime import get_plugin_manager
+from app.application.workflow import (
+    WorkflowDefinitionCommand,
+    WorkflowMutationCommand,
+    WorkflowQueryService,
+    get_workflow_manager,
+)
+from app.chain.workflow import WorkflowChain
 from app.schemas.response import Response as _SchemaResponse
+from app.schemas.types import EVENT_TYPE_NAMES, EventType
 from app.schemas.workflow import NameValueOption as _SchemaNameValueOption
 from app.schemas.workflow import PluginWorkflowActionGroup as _SchemaPluginWorkflowActionGroup
 from app.schemas.workflow import Workflow as _SchemaWorkflow
 from app.schemas.workflow import WorkflowActionDefinition as _SchemaWorkflowActionDefinition
 from app.schemas.workflow import WorkflowShare as _SchemaWorkflowShare
-from app.api.response import ResponseAPIRouter
-from app.application.workflow import (
-    WorkflowDefinitionCommand,
-    WorkflowMutationCommand,
-    WorkflowQueryService,
-)
-from app.chain.workflow import WorkflowChain
-from app.application.plugin.runtime import get_plugin_manager as PluginManager
-from app.workflow import WorkFlowManager
-from app.api.deps import (
-    get_current_active_manage_user,
-    get_current_active_manage_user_async,
-    get_workflow_definition_command,
-    get_workflow_mutation_command,
-    get_workflow_query_service,
-)
-from app.adapters.external.server import MoviePilotServerHelper
-from app.schemas.types import EventType, EVENT_TYPE_NAMES
 
 router = ResponseAPIRouter()
 
@@ -64,7 +66,7 @@ def list_plugin_actions(
     """
     获取所有动作
     """
-    return PluginManager().get_plugin_actions(plugin_id)
+    return get_plugin_manager().get_plugin_actions(plugin_id)
 
 
 @router.get(
@@ -76,7 +78,7 @@ async def list_actions(_: Any = Depends(get_current_active_manage_user_async)) -
     """
     获取所有动作
     """
-    return WorkFlowManager().list_actions()
+    return get_workflow_manager().list_actions()
 
 
 @router.get(

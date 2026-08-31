@@ -8,39 +8,80 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from app import schemas
-from app.agent import ReplyMode, agent_manager
-from app.api.endpoints.agent import (
-    _WebAgentEventPublisher,
+from app.agent.contracts import ReplyMode
+from app.agent.orchestrator import agent_manager
+from app.agent.web import _get_web_agent_type
+from app.api.endpoints import agent as agent_endpoint
+from app.api.endpoints.agent import web_agent_stream
+from app.application.messaging import agent as agent_application
+from app.application.messaging.agent import (
     _WEB_AGENT_FILE_REGISTRY,
-    _WEB_AGENT_MESSAGE_QUEUES,
-    _apply_web_agent_display_event,
-    _build_web_agent_input_attachments,
-    _build_web_agent_message_events,
-    _build_web_agent_command_items,
-    _build_web_agent_session_id,
-    _build_web_agent_traditional_callback_payload,
-    _build_web_agent_display_message_from_events,
-    _collect_web_agent_traditional_events,
-    _dispatch_web_agent_message_event,
-    _extract_web_agent_message_from_event_data,
-    _get_web_agent_type,
-    _has_web_agent_traditional_interaction,
-    _prepare_web_agent_audio_attachment_path,
-    _transcribe_web_agent_audio_refs,
-    web_agent_stream,
-    _resolve_web_agent_choice_payload,
-    _split_web_agent_output,
+    AgentInteractionOption,
+    agent_interaction_manager,
+    attach_web_agent_message_queue,
+    build_web_agent_message_update_event,
+    configure_web_agent_message_runtime,
+    detach_web_agent_message_queue,
+    dispatch_web_agent_message_event,
+    extract_web_agent_message_from_event_data,
+    reset_web_agent_message_runtime,
+    wait_web_agent_background_tasks,
 )
-from app.runtime.events import Event
-from app.db.oper.agentchat import AgentChatOper
-from app.db.models.agentchat import AgentChat
+from app.application.messaging.agent import (
+    WebAgentEventPublisher as _WebAgentEventPublisher,
+)
+from app.application.messaging.agent import (
+    apply_web_agent_display_event as _apply_web_agent_display_event,
+)
+from app.application.messaging.agent import (
+    build_web_agent_command_items as _build_web_agent_command_items,
+)
+from app.application.messaging.agent import (
+    build_web_agent_display_message_from_events as _build_web_agent_display_message_from_events,
+)
+from app.application.messaging.agent import (
+    build_web_agent_input_attachments as _build_web_agent_input_attachments,
+)
+from app.application.messaging.agent import (
+    build_web_agent_message_events as _build_web_agent_message_events,
+)
+from app.application.messaging.agent import (
+    build_web_agent_session_id as _build_web_agent_session_id,
+)
+from app.application.messaging.agent import (
+    build_web_agent_session_id_async as _build_web_agent_session_id_async,
+)
+from app.application.messaging.agent import (
+    build_web_agent_traditional_callback_payload as _build_web_agent_traditional_callback_payload,
+)
+from app.application.messaging.agent import (
+    collect_web_agent_traditional_events as _collect_web_agent_traditional_events,
+)
+from app.application.messaging.agent import (
+    has_web_agent_traditional_interaction as _has_web_agent_traditional_interaction,
+)
+from app.application.messaging.agent import (
+    prepare_web_agent_audio_attachment_path_async as _prepare_web_agent_audio_attachment_path_async,
+)
+from app.application.messaging.agent import (
+    resolve_web_agent_audio_refs as _resolve_web_agent_audio_refs,
+)
+from app.application.messaging.agent import (
+    resolve_web_agent_choice_payload as _resolve_web_agent_choice_payload,
+)
+from app.application.messaging.agent import (
+    split_web_agent_output as _split_web_agent_output,
+)
+from app.application.messaging.agent import (
+    transcribe_web_agent_audio_files as _transcribe_web_agent_audio_files,
+)
 from app.application.messaging.chat import AgentChatService, configure_agent_chat_service
-from app.application.messaging.agent import build_web_agent_message_update_event
-from app.application.messaging.agent import AgentInteractionOption, agent_interaction_manager
 from app.application.messaging.skill import skill_interaction_manager
 from app.chain.message import MessageChain
+from app.db.oper.agentchat import AgentChatOper
+from app.runtime.events import Event
 from app.schemas.notification import ChannelCapability, ChannelCapabilityManager
-from app.schemas.types import EventType, NotificationChannel, MessageType
+from app.schemas.types import EventType, MessageType, NotificationChannel
 
 
 @pytest.fixture(autouse=True)
@@ -49,18 +90,50 @@ def _running_agent_service():
     was_accepting = agent_manager._accepting_tasks
     agent_manager._accepting_tasks = True
     MessageChain._user_sessions.clear()
+    configure_web_agent_message_runtime(
+        message_handler=lambda **kwargs: MessageChain().handle_message(**kwargs),
+        session_binder=lambda user_id, session_id: MessageChain().bind_user_session(user_id, session_id),
+    )
     try:
-        with patch(
-            "app.api.endpoints.agent.get_running_agent_manager",
-            return_value=agent_manager,
-        ), patch(
-            "app.chain.message.get_running_agent_manager",
-            return_value=agent_manager,
+        with (
+            patch(
+                "app.application.agent.get_running_agent_manager",
+                return_value=agent_manager,
+            ),
+            patch(
+                "app.application.agent.get_web_agent_type",
+                side_effect=_get_web_agent_type,
+            ),
+            patch(
+                "app.chain.message.get_running_agent_manager",
+                return_value=agent_manager,
+            ),
         ):
             yield
     finally:
+        reset_web_agent_message_runtime()
         MessageChain._user_sessions.clear()
         agent_manager._accepting_tasks = was_accepting
+
+
+def test_web_agent_non_transport_helpers_are_application_owned():
+    """附件、音频、事件投影和会话写入不得回流到 FastAPI 端点。"""
+    ownership = {
+        "WebAgentEventPublisher",
+        "apply_web_agent_display_event",
+        "build_web_agent_input_attachments",
+        "build_web_agent_message_events_async",
+        "build_web_agent_session_id_async",
+        "build_web_agent_stream",
+        "collect_web_agent_traditional_events",
+        "get_web_agent_registered_file",
+        "prepare_web_agent_audio_attachment_path_async",
+        "save_web_agent_display_snapshot",
+        "transcribe_web_agent_audio_input",
+    }
+
+    assert all(hasattr(agent_application, name) for name in ownership)
+    assert all(not hasattr(agent_endpoint, name) for name in ownership)
 
 
 def test_split_web_agent_output_extracts_verbose_tool_message():
@@ -135,9 +208,7 @@ def test_web_agent_event_publisher_rejects_events_after_close():
     async def scenario():
         publisher = _WebAgentEventPublisher()
         await publisher.aclose()
-        return publisher.publish(
-            {"type": "interaction-protected", "content": "secret"}
-        )
+        return publisher.publish({"type": "interaction-protected", "content": "secret"})
 
     assert asyncio.run(scenario()) is False
 
@@ -170,6 +241,29 @@ def test_build_web_agent_session_id_reuses_accessible_history():
     configure_agent_chat_service(AgentChatService(repository=AgentChatOper()))
 
     assert _build_web_agent_session_id(user, "telegram-session") == "telegram-session"
+
+
+def test_build_web_agent_session_id_async_uses_native_async_persistence():
+    """异步 Web 会话解析应通过 native async 会话服务读取历史。"""
+    user = SimpleNamespace(id=1, name="admin", is_superuser=True)
+    service = SimpleNamespace(
+        get=AsyncMock(
+            return_value=SimpleNamespace(
+                user_id="telegram-user",
+                username="tester",
+                agent_messages=[],
+            )
+        )
+    )
+
+    with patch(
+        "app.application.messaging.agent.get_configured_agent_chat_service",
+        return_value=service,
+    ):
+        session_id = asyncio.run(_build_web_agent_session_id_async(user, "telegram-session"))
+
+    assert session_id == "telegram-session"
+    service.get.assert_awaited_once_with("telegram-session")
 
 
 def test_apply_web_agent_display_event_updates_snapshot():
@@ -221,9 +315,7 @@ def test_agent_chat_display_schema_preserves_ordered_segments():
                 "content": "先检查检查完成",
                 "createdAt": 1,
                 "status": "done",
-                "tools": [
-                    {"id": "tool-1", "message": "执行检查", "status": "done"}
-                ],
+                "tools": [{"id": "tool-1", "message": "执行检查", "status": "done"}],
                 "segments": [
                     {"type": "text", "content": "先检查"},
                     {"type": "tool", "toolIndex": 0},
@@ -262,14 +354,12 @@ def test_build_web_agent_input_attachments_marks_kinds():
 def test_build_web_agent_command_items_returns_slash_commands():
     """WebAgent 命令建议应返回可展示的斜杠命令。"""
     with patch(
-        "app.api.endpoints.agent.Command",
-        return_value=SimpleNamespace(
-            get_commands=lambda: {
-                "/sites": {"description": "管理站点", "category": "站点"},
-                "hidden": {"description": "忽略", "category": "其他"},
-                "/hidden": {"description": "隐藏", "category": "其他", "show": False},
-            }
-        ),
+        "app.application.messaging.agent.get_commands",
+        return_value={
+            "/sites": {"description": "管理站点", "category": "站点"},
+            "hidden": {"description": "忽略", "category": "其他"},
+            "/hidden": {"description": "隐藏", "category": "其他", "show": False},
+        },
     ):
         commands = _build_web_agent_command_items()
 
@@ -286,7 +376,12 @@ def test_build_web_agent_command_items_returns_slash_commands():
 
 def test_build_web_agent_command_items_includes_sites_command():
     """WebAgent 命令建议应包含内建站点管理命令。"""
-    with patch("app.command.Scheduler"), patch("app.command.ThreadHelper"):
+    with patch(
+        "app.application.messaging.agent.get_commands",
+        return_value={
+            "/sites": {"description": "管理站点", "category": "站点"},
+        },
+    ):
         commands = _build_web_agent_command_items()
 
     assert any(command["command"] == "/sites" for command in commands)
@@ -315,16 +410,29 @@ def test_web_agent_stream_returns_error_for_unknown_command():
     request = SimpleNamespace()
     user = SimpleNamespace(id=1, name="admin", is_superuser=True)
 
-    with patch(
-        "app.api.endpoints.agent.Command",
-        return_value=SimpleNamespace(get=lambda _: {}),
-    ), patch("app.api.endpoints.agent.MessageChain.handle_message") as handle_message:
+    with (
+        patch(
+            "app.application.messaging.agent.get_command",
+            return_value=None,
+        ),
+        patch("app.chain.message.MessageChain.handle_message") as handle_message,
+    ):
         response = asyncio.run(web_agent_stream(payload, request, user))
         body = "".join(asyncio.run(_collect_streaming_response(response)))
 
     assert "error" in body
     assert "命令不存在：/missing_command" in body
     handle_message.assert_not_called()
+
+
+def test_web_agent_stream_does_not_bind_request_scoped_chat_service():
+    """流式路由不能把请求级 Agent 会话服务捕获到后台任务。"""
+    from app.api.dependencies.agent import get_agent_chat_service
+    from app.api.endpoints import agent as agent_endpoint
+
+    route = next(route for route in agent_endpoint.router.routes if getattr(route, "name", None) == "web_agent_stream")
+
+    assert all(dependency.call is not get_agent_chat_service for dependency in route.dependant.dependencies)
 
 
 def test_build_web_agent_message_update_event_converts_buttons():
@@ -345,17 +453,19 @@ def test_build_web_agent_message_update_event_converts_buttons():
 
 def test_build_web_agent_display_message_from_events_marks_done():
     """传统消息事件应聚合为完成态助手展示消息。"""
-    message = _build_web_agent_display_message_from_events([
-        {"type": "delta", "content": "菜单"},
-        {
-            "type": "choice",
-            "choice": {
-                "id": "choice-1",
-                "prompt": "请选择",
-                "buttons": [{"label": "返回", "callback_data": "back"}],
+    message = _build_web_agent_display_message_from_events(
+        [
+            {"type": "delta", "content": "菜单"},
+            {
+                "type": "choice",
+                "choice": {
+                    "id": "choice-1",
+                    "prompt": "请选择",
+                    "buttons": [{"label": "返回", "callback_data": "back"}],
+                },
             },
-        },
-    ])
+        ]
+    )
 
     assert message["content"] == "菜单"
     assert message["status"] == "done"
@@ -392,10 +502,9 @@ def test_web_agent_admin_context_uses_current_user_id():
 
     lookup_fn = Mock(return_value=SimpleNamespace(is_superuser=True))
     with patch(
-        "app.api.endpoints.agent.get_configured_user_id_lookup",
+        "app.agent.web.get_configured_user_id_lookup",
         return_value=lookup_fn,
     ) as lookup:
-
         assert asyncio.run(agent._is_system_admin_context()) is True
         lookup.assert_called_once_with()
         lookup_fn.assert_called_once_with(7)
@@ -457,24 +566,14 @@ def test_web_agent_tool_summary_is_emitted_before_following_text():
 
 def test_web_agent_channel_supports_streaming_and_attachments():
     """WebAgent 渠道应声明流式、多媒体和文件发送能力。"""
-    assert ChannelCapabilityManager.supports_capability(
-        NotificationChannel.WebAgent, ChannelCapability.INLINE_BUTTONS
-    )
+    assert ChannelCapabilityManager.supports_capability(NotificationChannel.WebAgent, ChannelCapability.INLINE_BUTTONS)
     assert ChannelCapabilityManager.supports_capability(
         NotificationChannel.WebAgent, ChannelCapability.CALLBACK_QUERIES
     )
-    assert ChannelCapabilityManager.supports_capability(
-        NotificationChannel.WebAgent, ChannelCapability.MESSAGE_EDITING
-    )
-    assert ChannelCapabilityManager.supports_capability(
-        NotificationChannel.WebAgent, ChannelCapability.IMAGES
-    )
-    assert ChannelCapabilityManager.supports_capability(
-        NotificationChannel.WebAgent, ChannelCapability.AUDIO_OUTPUT
-    )
-    assert ChannelCapabilityManager.supports_capability(
-        NotificationChannel.WebAgent, ChannelCapability.FILE_SENDING
-    )
+    assert ChannelCapabilityManager.supports_capability(NotificationChannel.WebAgent, ChannelCapability.MESSAGE_EDITING)
+    assert ChannelCapabilityManager.supports_capability(NotificationChannel.WebAgent, ChannelCapability.IMAGES)
+    assert ChannelCapabilityManager.supports_capability(NotificationChannel.WebAgent, ChannelCapability.AUDIO_OUTPUT)
+    assert ChannelCapabilityManager.supports_capability(NotificationChannel.WebAgent, ChannelCapability.FILE_SENDING)
 
 
 def test_build_web_agent_message_events_extracts_image():
@@ -513,9 +612,7 @@ def test_extract_web_agent_message_supports_wrapped_message_event():
         userid="1",
     )
 
-    extracted = _extract_web_agent_message_from_event_data(
-        {"message": message, "current_time": "2026-06-26 09:18:38"}
-    )
+    extracted = extract_web_agent_message_from_event_data({"message": message, "current_time": "2026-06-26 09:18:38"})
 
     assert extracted == message
 
@@ -523,7 +620,7 @@ def test_extract_web_agent_message_supports_wrapped_message_event():
 def test_dispatch_web_agent_message_event_accepts_wrapped_message_event():
     """WebAgent 等待队列应接收 message 包装格式的 NoticeMessage 事件。"""
     notice_queue = Queue()
-    _WEB_AGENT_MESSAGE_QUEUES["1"] = [notice_queue]
+    attach_web_agent_message_queue("1", notice_queue)
     message = schemas.Message(
         channel=NotificationChannel.WebAgent,
         source="web-agent",
@@ -532,14 +629,14 @@ def test_dispatch_web_agent_message_event_accepts_wrapped_message_event():
     )
 
     try:
-        _dispatch_web_agent_message_event(
+        dispatch_web_agent_message_event(
             Event(
                 EventType.NoticeMessage,
                 {"message": message, "current_time": "2026-06-26 09:18:38"},
             )
         )
     finally:
-        _WEB_AGENT_MESSAGE_QUEUES.pop("1", None)
+        detach_web_agent_message_queue("1", notice_queue)
 
     assert notice_queue.get_nowait() == message
 
@@ -548,14 +645,18 @@ def test_collect_web_agent_traditional_events_does_not_emit_submit_hint():
     """传统命令未产生通知时不应返回“命令已提交”的兜底提示。"""
     user = SimpleNamespace(id=1, name="admin")
 
-    with patch(
-        "app.api.endpoints.agent.MessageChain.handle_message",
-    ), patch(
-        "app.api.endpoints.agent.WEB_AGENT_TRADITIONAL_IDLE_TIMEOUT_SECONDS",
-        0.01,
-    ), patch(
-        "app.api.endpoints.agent.WEB_AGENT_TRADITIONAL_MAX_WAIT_SECONDS",
-        0.05,
+    with (
+        patch(
+            "app.chain.message.MessageChain.handle_message",
+        ),
+        patch(
+            "app.application.messaging.agent.WEB_AGENT_TRADITIONAL_IDLE_TIMEOUT_SECONDS",
+            0.01,
+        ),
+        patch(
+            "app.application.messaging.agent.WEB_AGENT_TRADITIONAL_MAX_WAIT_SECONDS",
+            0.05,
+        ),
     ):
         events = asyncio.run(
             _collect_web_agent_traditional_events(
@@ -616,29 +717,287 @@ def test_build_web_agent_message_events_registers_voice_attachment(tmp_path):
     assert attachment["url"].startswith("message/agent/file/")
 
 
-def test_prepare_web_agent_audio_attachment_converts_unsupported_audio(tmp_path):
-    """WebAgent 会把浏览器不稳定支持的语音格式转为 WAV 供面板播放。"""
+def test_prepare_web_agent_audio_attachment_async_keeps_loop_responsive(tmp_path):
+    """异步转码等待期间事件循环仍应可调度其它任务。"""
     source_path = tmp_path / "reply.opus"
     source_path.write_bytes(b"opus-bytes")
     converted_path = tmp_path / "voice" / "reply_web_abcdef12.wav"
+    started = asyncio.Event()
+    release = asyncio.Event()
 
-    with patch("app.api.endpoints.agent.shutil.which", return_value="/usr/bin/ffmpeg"), patch(
-        "app.api.endpoints.agent.uuid.uuid4",
-        return_value=SimpleNamespace(hex="abcdef1234567890"),
-    ), patch("app.api.endpoints.agent.subprocess.run") as run:
-        def write_converted_file(*args, **kwargs):
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            started.set()
+            await release.wait()
             converted_path.write_bytes(b"wav-bytes")
-            return SimpleNamespace(returncode=0, stderr="")
+            return b"", b""
 
-        run.side_effect = write_converted_file
-        with patch("app.api.endpoints.agent.settings", SimpleNamespace(TEMP_PATH=tmp_path)):
-            output_path = _prepare_web_agent_audio_attachment_path(str(source_path))
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        assert args[0] == "/usr/bin/ffmpeg"
+        return FakeProcess()
+
+    async def scenario():
+        with (
+            patch(
+                "app.application.messaging.agent.shutil.which",
+                return_value="/usr/bin/ffmpeg",
+            ),
+            patch(
+                "app.application.messaging.agent.uuid.uuid4",
+                return_value=SimpleNamespace(hex="abcdef1234567890"),
+            ),
+            patch(
+                "app.application.messaging.agent.asyncio.create_subprocess_exec",
+                side_effect=fake_create_subprocess_exec,
+            ),
+            patch(
+                "app.application.messaging.agent.get_api_runtime_config_snapshot",
+                return_value=SimpleNamespace(temp_path=tmp_path),
+            ),
+        ):
+            conversion_task = asyncio.create_task(_prepare_web_agent_audio_attachment_path_async(str(source_path)))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            heartbeat = asyncio.create_task(asyncio.sleep(0))
+            await heartbeat
+            assert not conversion_task.done()
+            release.set()
+            return await conversion_task
+
+    output_path = asyncio.run(scenario())
 
     assert output_path == converted_path
     assert output_path.read_bytes() == b"wav-bytes"
 
 
-def test_transcribe_web_agent_audio_refs_reads_registered_upload(tmp_path):
+def test_prepare_web_agent_audio_attachment_async_cancellation_reaps_process(tmp_path):
+    """取消 WebAgent 转码时应终止并回收 ffmpeg，不能留下半成品。"""
+    source_path = tmp_path / "reply.opus"
+    source_path.write_bytes(b"opus-bytes")
+    output_path = tmp_path / "voice" / "reply_web_abcdef12.wav"
+    started = asyncio.Event()
+    killed = False
+
+    class FakeProcess:
+        returncode = None
+        _release = asyncio.Event()
+
+        def kill(self):
+            nonlocal killed
+            killed = True
+            self.returncode = -9
+            self._release.set()
+
+        async def communicate(self):
+            started.set()
+            if self.returncode is None:
+                await self._release.wait()
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return FakeProcess()
+
+    async def scenario():
+        with (
+            patch(
+                "app.application.messaging.agent.shutil.which",
+                return_value="/usr/bin/ffmpeg",
+            ),
+            patch(
+                "app.application.messaging.agent.uuid.uuid4",
+                return_value=SimpleNamespace(hex="abcdef1234567890"),
+            ),
+            patch(
+                "app.application.messaging.agent.asyncio.create_subprocess_exec",
+                side_effect=fake_create_subprocess_exec,
+            ),
+            patch(
+                "app.application.messaging.agent.get_api_runtime_config_snapshot",
+                return_value=SimpleNamespace(temp_path=tmp_path),
+            ),
+        ):
+            conversion_task = asyncio.create_task(_prepare_web_agent_audio_attachment_path_async(str(source_path)))
+            await asyncio.wait_for(started.wait(), timeout=5)
+            conversion_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await conversion_task
+
+    asyncio.run(scenario())
+
+    assert killed is True
+    assert not output_path.exists()
+
+
+def test_prepare_web_agent_audio_attachment_async_communicate_error_reaps_process(tmp_path):
+    """ffmpeg 通信异常时应终止仍运行的进程并回退原文件。"""
+    source_path = tmp_path / "reply.opus"
+    source_path.write_bytes(b"opus-bytes")
+    started = asyncio.Event()
+    killed = False
+    communicate_calls = 0
+
+    class FakeProcess:
+        returncode = None
+
+        def kill(self):
+            nonlocal killed
+            killed = True
+            self.returncode = -9
+
+        async def communicate(self):
+            nonlocal communicate_calls
+            communicate_calls += 1
+            started.set()
+            if self.returncode is None:
+                raise OSError("pipe closed")
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return FakeProcess()
+
+    async def scenario():
+        with (
+            patch(
+                "app.application.messaging.agent.shutil.which",
+                return_value="/usr/bin/ffmpeg",
+            ),
+            patch(
+                "app.application.messaging.agent.asyncio.create_subprocess_exec",
+                side_effect=fake_create_subprocess_exec,
+            ),
+            patch(
+                "app.application.messaging.agent.get_api_runtime_config_snapshot",
+                return_value=SimpleNamespace(temp_path=tmp_path),
+            ),
+        ):
+            output_path = await _prepare_web_agent_audio_attachment_path_async(str(source_path))
+            return output_path
+
+    output_path = asyncio.run(scenario())
+
+    assert output_path == source_path
+    assert killed is True
+    assert communicate_calls == 2
+
+
+def test_prepare_web_agent_audio_attachment_async_cancellation_cleans_completed_output(
+    tmp_path,
+):
+    """转码完成后检查产物期间取消，也应清理未登记的 WAV。"""
+    source_path = tmp_path / "reply.opus"
+    source_path.write_bytes(b"opus-bytes")
+    output_path = tmp_path / "voice" / "reply_web_abcdef12.wav"
+    exists_started = asyncio.Event()
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self):
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"wav-bytes")
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return FakeProcess()
+
+    async def fake_run_in_threadpool(func, *args, **kwargs):
+        if getattr(func, "__name__", "") == "exists":
+            exists_started.set()
+            await asyncio.Event().wait()
+        return await asyncio.to_thread(func, *args, **kwargs)
+
+    async def scenario():
+        with (
+            patch(
+                "app.application.messaging.agent.shutil.which",
+                return_value="/usr/bin/ffmpeg",
+            ),
+            patch(
+                "app.application.messaging.agent.uuid.uuid4",
+                return_value=SimpleNamespace(hex="abcdef1234567890"),
+            ),
+            patch(
+                "app.application.messaging.agent.asyncio.create_subprocess_exec",
+                side_effect=fake_create_subprocess_exec,
+            ),
+            patch(
+                "app.application.messaging.agent.get_api_runtime_config_snapshot",
+                return_value=SimpleNamespace(temp_path=tmp_path),
+            ),
+            patch(
+                "app.application.messaging.agent.run_in_threadpool",
+                side_effect=fake_run_in_threadpool,
+            ),
+        ):
+            conversion_task = asyncio.create_task(_prepare_web_agent_audio_attachment_path_async(str(source_path)))
+            await asyncio.wait_for(exists_started.wait(), timeout=1)
+            assert output_path.exists()
+            conversion_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await conversion_task
+
+    asyncio.run(scenario())
+
+    assert not output_path.exists()
+
+
+def test_prepare_web_agent_audio_attachment_async_timeout_falls_back(tmp_path):
+    """转码超时应回退原文件并回收 ffmpeg。"""
+    source_path = tmp_path / "reply.opus"
+    source_path.write_bytes(b"opus-bytes")
+    started = asyncio.Event()
+    killed = False
+
+    class FakeProcess:
+        returncode = None
+        _release = asyncio.Event()
+
+        def kill(self):
+            nonlocal killed
+            killed = True
+            self.returncode = -9
+            self._release.set()
+
+        async def communicate(self):
+            started.set()
+            if self.returncode is None:
+                await self._release.wait()
+            return b"", b""
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        return FakeProcess()
+
+    async def scenario():
+        with (
+            patch(
+                "app.application.messaging.agent.shutil.which",
+                return_value="/usr/bin/ffmpeg",
+            ),
+            patch(
+                "app.application.messaging.agent.asyncio.create_subprocess_exec",
+                side_effect=fake_create_subprocess_exec,
+            ),
+            patch(
+                "app.application.messaging.agent.get_api_runtime_config_snapshot",
+                return_value=SimpleNamespace(temp_path=tmp_path),
+            ),
+            patch(
+                "app.application.messaging.agent.WEB_AGENT_AUDIO_CONVERSION_TIMEOUT_SECONDS",
+                0.01,
+            ),
+        ):
+            conversion_task = asyncio.create_task(_prepare_web_agent_audio_attachment_path_async(str(source_path)))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            return await conversion_task
+
+    output_path = asyncio.run(scenario())
+
+    assert output_path == source_path
+    assert killed is True
+
+
+def test_transcribe_web_agent_audio_files_reads_registered_upload(tmp_path):
     """WebAgent 上传录音应从临时附件登记表读取并转写为文本。"""
     voice_path = tmp_path / "recording.webm"
     voice_path.write_bytes(b"webm-bytes")
@@ -650,14 +1009,19 @@ def test_transcribe_web_agent_audio_refs_reads_registered_upload(tmp_path):
     }
 
     try:
-        with patch(
-            "app.api.endpoints.agent.AgentCapabilityManager.is_audio_input_available",
-            return_value=True,
-        ), patch(
-            "app.api.endpoints.agent.AgentCapabilityManager.transcribe_audio",
-            return_value="帮我推荐一部电影",
-        ) as transcribe_audio:
-            transcript = _transcribe_web_agent_audio_refs(["message/agent/file/audio-test"])
+        with (
+            patch(
+                "app.application.messaging.agent.is_audio_input_available",
+                return_value=True,
+            ),
+            patch(
+                "app.application.messaging.agent.transcribe_audio",
+                return_value="帮我推荐一部电影",
+            ) as transcribe_audio,
+        ):
+            audio_files = _resolve_web_agent_audio_refs(["message/agent/file/audio-test"])
+            _WEB_AGENT_FILE_REGISTRY.pop("audio-test", None)
+            transcript = _transcribe_web_agent_audio_files(audio_files)
     finally:
         _WEB_AGENT_FILE_REGISTRY.pop("audio-test", None)
 
@@ -678,14 +1042,69 @@ def test_web_agent_stream_returns_error_when_voice_transcription_fails():
     request = SimpleNamespace()
     user = SimpleNamespace(id=1, name="admin")
 
-    with patch("app.api.endpoints.agent.settings.AI_AGENT_ENABLE", True), patch(
-        "app.api.endpoints.agent._transcribe_web_agent_audio_refs",
-        return_value=None,
+    with (
+        patch(
+            "app.application.messaging.agent.get_api_runtime_config_snapshot",
+            return_value=SimpleNamespace(ai_agent_enable=True),
+        ),
+        patch(
+            "app.application.messaging.agent.transcribe_web_agent_audio_files",
+            return_value=None,
+        ) as transcribe_audio,
     ):
         response = asyncio.run(web_agent_stream(payload, request, user))
         body = "".join(asyncio.run(_collect_streaming_response(response)))
 
+    transcribe_audio.assert_not_called()
     assert "error" in body
+    assert "语音识别失败" in body
+
+
+def test_web_agent_stream_does_not_block_event_loop_during_transcription():
+    """同步音频 provider 等待时，事件循环仍应让其他任务获得执行机会。"""
+    payload = schemas.AgentWebChatRequest(
+        text="",
+        session_id="browser-session",
+        audio_refs=["message/agent/file/audio-test"],
+    )
+    request = SimpleNamespace(headers={})
+    user = SimpleNamespace(id=1, name="admin")
+
+    transcription_started = ThreadEvent()
+    transcription_release = ThreadEvent()
+
+    def blocking_transcription(_audio_refs):
+        transcription_started.set()
+        assert transcription_release.wait(timeout=2)
+        return None
+
+    async def scenario():
+        stream_task = asyncio.create_task(web_agent_stream(payload, request, user))
+        assert await asyncio.to_thread(transcription_started.wait, 1)
+        assert stream_task.done() is False
+        transcription_release.set()
+        return await stream_task
+
+    try:
+        with (
+            patch(
+                "app.application.messaging.agent.get_api_runtime_config_snapshot",
+                return_value=SimpleNamespace(ai_agent_enable=True),
+            ),
+            patch(
+                "app.application.messaging.agent.resolve_web_agent_audio_refs",
+                return_value=[Mock()],
+            ),
+            patch(
+                "app.application.messaging.agent.transcribe_web_agent_audio_files",
+                side_effect=blocking_transcription,
+            ),
+        ):
+            response = asyncio.run(scenario())
+    finally:
+        transcription_release.set()
+
+    body = "".join(asyncio.run(_collect_streaming_response(response)))
     assert "语音识别失败" in body
 
 
@@ -740,9 +1159,15 @@ def test_web_agent_stream_binds_session_to_agent_manager():
         return "".join(await _collect_streaming_response(response))
 
     try:
-        with patch("app.api.endpoints.agent.settings.AI_AGENT_ENABLE", True), patch(
-            "app.api.endpoints.agent._get_web_agent_type",
-            return_value=FakeWebAgent,
+        with (
+            patch(
+                "app.application.messaging.agent.get_api_runtime_config_snapshot",
+                return_value=SimpleNamespace(ai_agent_enable=True),
+            ),
+            patch(
+                "app.application.agent.get_web_agent_type",
+                return_value=FakeWebAgent,
+            ),
         ):
             body = asyncio.run(scenario())
 
@@ -836,12 +1261,20 @@ def test_web_agent_stream_emits_secret_result_only_as_protected_event():
         return "".join(await _collect_streaming_response(response))
 
     try:
-        with patch("app.api.endpoints.agent.settings.AI_AGENT_ENABLE", True), patch(
-            "app.api.endpoints.agent._get_web_agent_type",
-            return_value=FakeProtectedAgent,
-        ), patch(
-            "app.api.endpoints.agent._save_web_agent_display_snapshot",
-        ) as save_snapshot:
+        with (
+            patch(
+                "app.application.messaging.agent.get_api_runtime_config_snapshot",
+                return_value=SimpleNamespace(ai_agent_enable=True),
+            ),
+            patch(
+                "app.application.agent.get_web_agent_type",
+                return_value=FakeProtectedAgent,
+            ),
+            patch(
+                "app.application.messaging.agent.save_web_agent_display_snapshot",
+                new_callable=AsyncMock,
+            ) as save_snapshot,
+        ):
             body = asyncio.run(scenario())
 
         assert "event: interaction-protected\n" in body
@@ -859,7 +1292,7 @@ def test_web_agent_stream_emits_secret_result_only_as_protected_event():
         worker = agent_manager._session_workers.pop(session_id, None)
         if worker:
             worker.cancel()
-        AgentChat.delete(rid=existing_chat.id)
+        AgentChatOper().delete_by_id(existing_chat.id)
 
 
 def test_web_agent_cancel_keeps_existing_display_history():
@@ -894,17 +1327,26 @@ def test_web_agent_cancel_keeps_existing_display_history():
         return "".join(await _collect_streaming_response(response))
 
     try:
-        with patch("app.api.endpoints.agent.settings.AI_AGENT_ENABLE", True), patch.object(
-            agent_manager,
-            "matches_secret_confirmation",
-            return_value=True,
-        ), patch.object(
-            agent_manager,
-            "process_message",
-            new=AsyncMock(return_value="已取消敏感设置读取。"),
-        ), patch(
-            "app.api.endpoints.agent._save_web_agent_display_snapshot",
-        ) as save_snapshot:
+        with (
+            patch(
+                "app.application.messaging.agent.get_api_runtime_config_snapshot",
+                return_value=SimpleNamespace(ai_agent_enable=True),
+            ),
+            patch.object(
+                agent_manager,
+                "matches_secret_confirmation",
+                return_value=True,
+            ),
+            patch.object(
+                agent_manager,
+                "process_message",
+                new=AsyncMock(return_value="已取消敏感设置读取。"),
+            ),
+            patch(
+                "app.application.messaging.agent.save_web_agent_display_snapshot",
+                new_callable=AsyncMock,
+            ) as save_snapshot,
+        ):
             body = asyncio.run(scenario())
 
         assert '"type": "done"' in body
@@ -914,7 +1356,7 @@ def test_web_agent_cancel_keeps_existing_display_history():
         assert preserved_chat.message_count == 2
         assert preserved_chat.preview == "保留的回答"
     finally:
-        AgentChat.delete(rid=existing_chat.id)
+        AgentChatOper().delete_by_id(existing_chat.id)
 
 
 def test_web_agent_stream_rejects_confirmation_without_protected_capability():
@@ -934,11 +1376,18 @@ def test_web_agent_stream_rejects_confirmation_without_protected_capability():
         response = await web_agent_stream(payload, request, user)
         return "".join(await _collect_streaming_response(response))
 
-    with patch("app.api.endpoints.agent.settings.AI_AGENT_ENABLE", True), patch.object(
-        agent_manager,
-        "matches_secret_confirmation",
-        return_value=True,
-    ), patch.object(agent_manager, "process_message", new=AsyncMock()) as process:
+    with (
+        patch(
+            "app.application.messaging.agent.get_api_runtime_config_snapshot",
+            return_value=SimpleNamespace(ai_agent_enable=True),
+        ),
+        patch.object(
+            agent_manager,
+            "matches_secret_confirmation",
+            return_value=True,
+        ),
+        patch.object(agent_manager, "process_message", new=AsyncMock()) as process,
+    ):
         body = asyncio.run(scenario())
 
     assert "不支持安全交付" in body
@@ -960,11 +1409,17 @@ def test_web_agent_stream_keeps_confirmation_without_pending_on_normal_path():
         body = "".join(await _collect_streaming_response(response))
         return response, body
 
-    with patch("app.api.endpoints.agent.settings.AI_AGENT_ENABLE", True), patch.object(
-        agent_manager,
-        "process_message",
-        new=AsyncMock(return_value="普通回复"),
-    ) as process:
+    with (
+        patch(
+            "app.application.messaging.agent.get_api_runtime_config_snapshot",
+            return_value=SimpleNamespace(ai_agent_enable=True),
+        ),
+        patch.object(
+            agent_manager,
+            "process_message",
+            new=AsyncMock(return_value="普通回复"),
+        ) as process,
+    ):
         response, body = asyncio.run(scenario())
 
     assert "不支持安全交付" not in body
@@ -983,6 +1438,7 @@ def test_web_agent_stream_drops_secret_result_after_disconnect():
     agent_started = asyncio.Event()
     release_agent = asyncio.Event()
     agent_completed = asyncio.Event()
+
     async def disconnect_after_agent_starts():
         """等待确认进入处理流程后再模拟浏览器断线。"""
         await agent_started.wait()
@@ -1014,31 +1470,43 @@ def test_web_agent_stream_drops_secret_result_after_disconnect():
         """断线后继续完成只读任务，并尝试向已关闭发布器投递。"""
         agent_started.set()
         await release_agent.wait()
-        delivery_results.append(
-            kwargs["protected_output_callback"]("DISCONNECTED_SECRET_MARKER")
-        )
+        delivery_results.append(kwargs["protected_output_callback"]("DISCONNECTED_SECRET_MARKER"))
         agent_completed.set()
 
     async def scenario():
         response = await web_agent_stream(payload, request, user)
-        body = "".join(await _collect_streaming_response(response))
+        body = "".join(
+            await _collect_streaming_response(
+                response,
+                wait_for_background=False,
+            )
+        )
         release_agent.set()
         await asyncio.wait_for(agent_completed.wait(), timeout=1)
-        await asyncio.sleep(0)
+        await wait_web_agent_background_tasks()
         return body
 
     try:
-        with patch("app.api.endpoints.agent.settings.AI_AGENT_ENABLE", True), patch.object(
-            agent_manager,
-            "matches_secret_confirmation",
-            return_value=True,
-        ), patch.object(
-            agent_manager,
-            "process_message",
-            new=AsyncMock(side_effect=finish_after_disconnect),
-        ) as process, patch(
-            "app.api.endpoints.agent._save_web_agent_display_snapshot",
-        ) as save_snapshot:
+        with (
+            patch(
+                "app.application.messaging.agent.get_api_runtime_config_snapshot",
+                return_value=SimpleNamespace(ai_agent_enable=True),
+            ),
+            patch.object(
+                agent_manager,
+                "matches_secret_confirmation",
+                return_value=True,
+            ),
+            patch.object(
+                agent_manager,
+                "process_message",
+                new=AsyncMock(side_effect=finish_after_disconnect),
+            ) as process,
+            patch(
+                "app.application.messaging.agent.save_web_agent_display_snapshot",
+                new_callable=AsyncMock,
+            ) as save_snapshot,
+        ):
             body = asyncio.run(scenario())
 
         assert '"type": "start"' in body
@@ -1050,7 +1518,7 @@ def test_web_agent_stream_drops_secret_result_after_disconnect():
         assert preserved_chat.message_count == 2
         assert preserved_chat.preview == "断线前的回答"
     finally:
-        AgentChat.delete(rid=existing_chat.id)
+        AgentChatOper().delete_by_id(existing_chat.id)
 
 
 def test_web_agent_stream_emits_heartbeat_during_idle_tool_wait():
@@ -1068,27 +1536,40 @@ def test_web_agent_stream_emits_heartbeat_during_idle_tool_wait():
         response = await web_agent_stream(payload, request, user)
         return "".join(await _collect_streaming_response(response))
 
-    with patch("app.api.endpoints.agent.settings.AI_AGENT_ENABLE", True), patch(
-        "app.api.endpoints.agent.WEB_AGENT_STREAM_HEARTBEAT_SECONDS",
-        0.01,
-    ), patch(
-        "app.api.endpoints.agent._is_web_agent_traditional_message",
-        return_value=False,
-    ), patch(
-        "app.api.endpoints.agent._has_web_agent_traditional_interaction",
-        return_value=False,
-    ), patch(
-        "app.api.endpoints.agent._build_web_agent_session_id",
-        return_value="web-agent:heartbeat",
-    ), patch.object(
-        MessageChain,
-        "bind_user_session",
-    ), patch.object(
-        agent_manager,
-        "process_message",
-        side_effect=slow_process_message,
-    ), patch(
-        "app.api.endpoints.agent._save_web_agent_display_snapshot",
+    with (
+        patch(
+            "app.application.messaging.agent.get_api_runtime_config_snapshot",
+            return_value=SimpleNamespace(ai_agent_enable=True),
+        ),
+        patch(
+            "app.application.messaging.agent.WEB_AGENT_STREAM_HEARTBEAT_SECONDS",
+            0.01,
+        ),
+        patch(
+            "app.application.messaging.agent.is_web_agent_traditional_message",
+            return_value=False,
+        ),
+        patch(
+            "app.application.messaging.agent.has_web_agent_traditional_interaction",
+            return_value=False,
+        ),
+        patch(
+            "app.application.messaging.agent.build_web_agent_session_id_async",
+            return_value="web-agent:heartbeat",
+        ),
+        patch.object(
+            MessageChain,
+            "bind_user_session",
+        ),
+        patch.object(
+            agent_manager,
+            "process_message",
+            side_effect=slow_process_message,
+        ),
+        patch(
+            "app.application.messaging.agent.save_web_agent_display_snapshot",
+            new_callable=AsyncMock,
+        ),
     ):
         body = asyncio.run(scenario())
 
@@ -1131,32 +1612,43 @@ def test_web_agent_stop_finishes_stream_without_error():
         received = [await asyncio.wait_for(anext(iterator), timeout=1)]
         await asyncio.wait_for(BlockingWebAgent.started.wait(), timeout=1)
 
-        assert await asyncio.wait_for(
-            agent_manager.stop_current_task(session_id), timeout=1
-        ) is True
+        assert await asyncio.wait_for(agent_manager.stop_current_task(session_id), timeout=1) is True
         while '"type": "done"' not in "".join(received):
             received.append(await asyncio.wait_for(anext(iterator), timeout=1))
         await iterator.aclose()
+        await wait_web_agent_background_tasks()
         return "".join(received)
 
     try:
-        with patch("app.api.endpoints.agent.settings.AI_AGENT_ENABLE", True), patch(
-            "app.api.endpoints.agent._is_web_agent_traditional_message",
-            return_value=False,
-        ), patch(
-            "app.api.endpoints.agent._has_web_agent_traditional_interaction",
-            return_value=False,
-        ), patch(
-            "app.api.endpoints.agent._build_web_agent_session_id",
-            return_value=session_id,
-        ), patch.object(
-            MessageChain,
-            "bind_user_session",
-        ), patch(
-            "app.api.endpoints.agent._get_web_agent_type",
-            return_value=BlockingWebAgent,
-        ), patch(
-            "app.api.endpoints.agent._save_web_agent_display_snapshot",
+        with (
+            patch(
+                "app.application.messaging.agent.get_api_runtime_config_snapshot",
+                return_value=SimpleNamespace(ai_agent_enable=True),
+            ),
+            patch(
+                "app.application.messaging.agent.is_web_agent_traditional_message",
+                return_value=False,
+            ),
+            patch(
+                "app.application.messaging.agent.has_web_agent_traditional_interaction",
+                return_value=False,
+            ),
+            patch(
+                "app.application.messaging.agent.build_web_agent_session_id_async",
+                return_value=session_id,
+            ),
+            patch.object(
+                MessageChain,
+                "bind_user_session",
+            ),
+            patch(
+                "app.application.agent.get_web_agent_type",
+                return_value=BlockingWebAgent,
+            ),
+            patch(
+                "app.application.messaging.agent.save_web_agent_display_snapshot",
+                new_callable=AsyncMock,
+            ),
         ):
             body = asyncio.run(scenario())
     finally:
@@ -1182,17 +1674,27 @@ def test_web_agent_stream_rechecks_running_service_before_enqueue():
         response = await web_agent_stream(payload, request, user)
         return "".join(await _collect_streaming_response(response))
 
-    with patch("app.api.endpoints.agent.settings.AI_AGENT_ENABLE", True), patch(
-        "app.api.endpoints.agent._is_web_agent_traditional_message",
-        return_value=False,
-    ), patch(
-        "app.api.endpoints.agent._has_web_agent_traditional_interaction",
-        return_value=False,
-    ), patch(
-        "app.api.endpoints.agent.get_running_agent_manager",
-        side_effect=[stale_manager, None],
-    ), patch(
-        "app.api.endpoints.agent._save_web_agent_display_snapshot",
+    with (
+        patch(
+            "app.application.messaging.agent.get_api_runtime_config_snapshot",
+            return_value=SimpleNamespace(ai_agent_enable=True),
+        ),
+        patch(
+            "app.application.messaging.agent.is_web_agent_traditional_message",
+            return_value=False,
+        ),
+        patch(
+            "app.application.messaging.agent.has_web_agent_traditional_interaction",
+            return_value=False,
+        ),
+        patch(
+            "app.application.agent.get_running_agent_manager",
+            side_effect=[stale_manager, None],
+        ),
+        patch(
+            "app.application.messaging.agent.save_web_agent_display_snapshot",
+            new_callable=AsyncMock,
+        ),
     ):
         body = asyncio.run(scenario())
 
@@ -1215,11 +1717,11 @@ def test_web_agent_traditional_stream_keeps_alive_and_saves_after_done():
         await asyncio.sleep(0.035)
         return [{"type": "delta", "content": "状态正常"}]
 
-    def slow_snapshot(**_kwargs):
+    async def slow_snapshot(**_kwargs):
         """阻塞快照写入，便于断言 done 不等待落库。"""
-        snapshot_started.set()
-        snapshot_release.wait(timeout=2)
-        snapshot_finished.set()
+        await asyncio.to_thread(snapshot_started.set)
+        await asyncio.to_thread(snapshot_release.wait, 2)
+        await asyncio.to_thread(snapshot_finished.set)
 
     async def scenario():
         response = await web_agent_stream(payload, request, user)
@@ -1240,41 +1742,117 @@ def test_web_agent_traditional_stream_keeps_alive_and_saves_after_done():
         assert snapshot_started.is_set()
         assert not snapshot_finished.is_set()
         await iterator.aclose()
+        assert not snapshot_finished.is_set()
+        snapshot_release.set()
+        await asyncio.to_thread(snapshot_finished.wait, 1)
+        await wait_web_agent_background_tasks()
         return "".join(received)
 
     try:
-        with patch(
-            "app.api.endpoints.agent.WEB_AGENT_STREAM_HEARTBEAT_SECONDS",
-            0.01,
-        ), patch(
-            "app.api.endpoints.agent._is_web_agent_traditional_message",
-            return_value=True,
-        ), patch(
-            "app.api.endpoints.agent._ensure_web_agent_command_allowed",
-            return_value=None,
-        ), patch(
-            "app.api.endpoints.agent._get_web_agent_unknown_command_message",
-            return_value=None,
-        ), patch(
-            "app.api.endpoints.agent._build_web_agent_session_id",
-            return_value="web-agent:traditional-heartbeat",
-        ), patch(
-            "app.api.endpoints.agent._collect_web_agent_traditional_events",
-            side_effect=slow_collect,
-        ), patch(
-            "app.api.endpoints.agent._save_web_agent_display_snapshot",
-            side_effect=slow_snapshot,
+        with (
+            patch(
+                "app.application.messaging.agent.WEB_AGENT_STREAM_HEARTBEAT_SECONDS",
+                0.01,
+            ),
+            patch(
+                "app.application.messaging.agent.is_web_agent_traditional_message",
+                return_value=True,
+            ),
+            patch(
+                "app.application.messaging.agent.ensure_web_agent_command_allowed",
+                return_value=None,
+            ),
+            patch(
+                "app.application.messaging.agent.get_web_agent_unknown_command_message",
+                return_value=None,
+            ),
+            patch(
+                "app.application.messaging.agent.build_web_agent_session_id_async",
+                return_value="web-agent:traditional-heartbeat",
+            ),
+            patch(
+                "app.application.messaging.agent.collect_web_agent_traditional_events",
+                side_effect=slow_collect,
+            ),
+            patch(
+                "app.application.messaging.agent.save_web_agent_display_snapshot",
+                new_callable=AsyncMock,
+                side_effect=slow_snapshot,
+            ),
         ):
             body = asyncio.run(scenario())
 
         assert ": heartbeat\n\n" in body
         assert '"type": "delta"' in body
         assert '"type": "done"' in body
-        assert not snapshot_finished.is_set()
     finally:
         snapshot_release.set()
 
     assert snapshot_finished.wait(timeout=1)
+
+
+def test_web_agent_traditional_stream_drains_collection_on_cancellation():
+    """传统 SSE 被取消时必须等待请求级 collection 子任务完成清理。"""
+    payload = schemas.AgentWebChatRequest(text="/状态", session_id="traditional-cancel")
+    request = SimpleNamespace(is_disconnected=AsyncMock(return_value=False))
+    user = SimpleNamespace(id=1, name="admin", is_superuser=True)
+
+    async def scenario():
+        """取消正在等待的 SSE 读取，并观察 collection 的清理时序。"""
+        started = asyncio.Event()
+        cancelling = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        cleanup_finished = asyncio.Event()
+
+        async def blocked_collect(**_kwargs):
+            """阻塞传统消息收集，并在取消后等待测试释放清理。"""
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelling.set()
+                await release_cleanup.wait()
+                cleanup_finished.set()
+                raise
+
+        with (
+            patch(
+                "app.application.messaging.agent.is_web_agent_traditional_message",
+                return_value=True,
+            ),
+            patch(
+                "app.application.messaging.agent.ensure_web_agent_command_allowed",
+                return_value=None,
+            ),
+            patch(
+                "app.application.messaging.agent.get_web_agent_unknown_command_message",
+                return_value=None,
+            ),
+            patch(
+                "app.application.messaging.agent.build_web_agent_session_id_async",
+                return_value="web-agent:traditional-cancel",
+            ),
+            patch(
+                "app.application.messaging.agent.collect_web_agent_traditional_events",
+                side_effect=blocked_collect,
+            ),
+        ):
+            response = await web_agent_stream(payload, request, user)
+            iterator = response.body_iterator.__aiter__()
+            await asyncio.wait_for(anext(iterator), timeout=1)
+            pending_chunk = asyncio.create_task(anext(iterator))
+            await asyncio.wait_for(started.wait(), timeout=1)
+            pending_chunk.cancel()
+            await asyncio.wait_for(cancelling.wait(), timeout=1)
+            assert pending_chunk.done() is False
+            assert cleanup_finished.is_set() is False
+
+            release_cleanup.set()
+            result = await asyncio.gather(pending_chunk, return_exceptions=True)
+            assert isinstance(result[0], StopAsyncIteration)
+            assert cleanup_finished.is_set() is True
+
+    asyncio.run(scenario())
 
 
 def test_web_agent_stream_sends_done_before_snapshot_persistence_finishes():
@@ -1290,11 +1868,11 @@ def test_web_agent_stream_sends_done_before_snapshot_persistence_finishes():
         """立即生成一段文本，随后进入终态。"""
         kwargs["output_callback"]("检查完成")
 
-    def slow_snapshot(**_kwargs):
+    async def slow_snapshot(**_kwargs):
         """阻塞快照写入，便于验证 done 的发送时机。"""
-        snapshot_started.set()
-        snapshot_release.wait(timeout=2)
-        snapshot_finished.set()
+        await asyncio.to_thread(snapshot_started.set)
+        await asyncio.to_thread(snapshot_release.wait, 2)
+        await asyncio.to_thread(snapshot_finished.set)
 
     async def scenario():
         response = await web_agent_stream(payload, request, user)
@@ -1315,44 +1893,67 @@ def test_web_agent_stream_sends_done_before_snapshot_persistence_finishes():
         assert not snapshot_finished.is_set()
 
         await iterator.aclose()
+        assert not snapshot_finished.is_set()
+        snapshot_release.set()
+        await asyncio.to_thread(snapshot_finished.wait, 1)
+        await wait_web_agent_background_tasks()
         return "".join(received)
 
     try:
-        with patch("app.api.endpoints.agent.settings.AI_AGENT_ENABLE", True), patch(
-            "app.api.endpoints.agent._is_web_agent_traditional_message",
-            return_value=False,
-        ), patch(
-            "app.api.endpoints.agent._has_web_agent_traditional_interaction",
-            return_value=False,
-        ), patch(
-            "app.api.endpoints.agent._build_web_agent_session_id",
-            return_value="web-agent:snapshot",
-        ), patch.object(
-            MessageChain,
-            "bind_user_session",
-        ), patch.object(
-            agent_manager,
-            "process_message",
-            side_effect=immediate_process_message,
-        ), patch(
-            "app.api.endpoints.agent._save_web_agent_display_snapshot",
-            side_effect=slow_snapshot,
+        with (
+            patch(
+                "app.application.messaging.agent.get_api_runtime_config_snapshot",
+                return_value=SimpleNamespace(ai_agent_enable=True),
+            ),
+            patch(
+                "app.application.messaging.agent.is_web_agent_traditional_message",
+                return_value=False,
+            ),
+            patch(
+                "app.application.messaging.agent.has_web_agent_traditional_interaction",
+                return_value=False,
+            ),
+            patch(
+                "app.application.messaging.agent.build_web_agent_session_id_async",
+                return_value="web-agent:snapshot",
+            ),
+            patch.object(
+                MessageChain,
+                "bind_user_session",
+            ),
+            patch.object(
+                agent_manager,
+                "process_message",
+                side_effect=immediate_process_message,
+            ),
+            patch(
+                "app.application.messaging.agent.save_web_agent_display_snapshot",
+                new_callable=AsyncMock,
+                side_effect=slow_snapshot,
+            ),
         ):
             body = asyncio.run(scenario())
 
         assert '"type": "done"' in body
-        assert not snapshot_finished.is_set()
     finally:
         snapshot_release.set()
 
     assert snapshot_finished.wait(timeout=1)
 
 
-async def _collect_streaming_response(response):
-    """读取 StreamingResponse，便于断言 SSE 内容。"""
+async def _collect_streaming_response(
+    response,
+    *,
+    wait_for_background: bool = True,
+):
+    """读取 StreamingResponse，并按用例语义等待生产 owner 完成收尾。"""
     chunks = []
-    async for chunk in response.body_iterator:
-        chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+    try:
+        async for chunk in response.body_iterator:
+            chunks.append(chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk)
+    finally:
+        if wait_for_background:
+            await wait_web_agent_background_tasks()
     return chunks
 
 

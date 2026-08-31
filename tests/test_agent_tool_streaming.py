@@ -7,14 +7,14 @@ import langchain.agents as langchain_agents
 if not hasattr(langchain_agents, "create_agent"):
     langchain_agents.create_agent = lambda *args, **kwargs: None
 
-from app.agent import _ThinkTagStripper
+from app.agent.orchestrator import _ThinkTagStripper
 from app.agent.callback import StreamingHandler
 from app.agent.middleware.subagents import is_subagent_stream_metadata
 from app.agent.tools.base import MoviePilotTool
 from app.agent.tools.impl.send_voice_message import SendVoiceMessageTool
 from app.api.endpoints.openai import _get_openai_streaming_handler_type
 from app.runtime.config import settings
-from app.schemas.message import MessageResponse
+from app.schemas.message import Message, MessageResponse
 from app.schemas.types import NotificationChannel, MessageType
 
 
@@ -76,6 +76,31 @@ class AdminOnlyDummyTool(MoviePilotTool):
 
 class TestAgentToolStreaming:
     """Agent 工具流式输出测试。"""
+
+    def test_web_message_callback_can_await_async_delivery(self):
+        """WebAgent 通知回调支持异步附件准备并保持发送顺序。"""
+        received = []
+
+        async def scenario():
+            tool = DummyTool(session_id="session-1", user_id="10001")
+            tool.set_message_attr("WebAgent", "web-agent", "admin")
+
+            async def callback(message):
+                await asyncio.sleep(0)
+                received.append(message.text)
+
+            tool.set_agent_context({"message_callback": callback})
+            await tool.send_message(
+                Message(
+                    text="异步通知",
+                    channel=NotificationChannel.WebAgent,
+                    mtype=MessageType.Agent,
+                )
+            )
+
+        asyncio.run(scenario())
+
+        assert received == ["异步通知"]
 
     async def _run_tool(self, initial_buffer: str) -> tuple[str, str]:
         """运行测试工具并返回工具结果与缓冲内容。"""
@@ -154,12 +179,19 @@ class TestAgentToolStreaming:
 
         assert buffered_message == "好的，我来帮您执行\n抱歉，您没有执行此工具的权限"
 
-    def test_non_verbose_tool_call_reuses_existing_newline_before_summary(self):
-        """校验非详细模式复用已有换行追加工具摘要。"""
+    def test_non_verbose_tool_call_completes_blank_line_before_summary(self):
+        """校验非详细模式在摘要前补足空行，保证工具摘要独立成段。"""
         result, buffered_message = asyncio.run(self._run_tool("prefix\n"))
 
         assert result == "ok"
-        assert buffered_message == "prefix\n（调用了 1 次工具）\n\n"
+        assert buffered_message == "prefix\n\n（调用了 1 次工具）\n\n"
+
+    def test_non_verbose_tool_call_keeps_existing_blank_line_before_summary(self):
+        """校验缓冲区已有空行时摘要不再追加多余换行。"""
+        result, buffered_message = asyncio.run(self._run_tool("prefix\n\n"))
+
+        assert result == "ok"
+        assert buffered_message == "prefix\n\n（调用了 1 次工具）\n\n"
 
     def test_non_verbose_tool_call_emits_summary_even_when_buffer_was_empty(self):
         """校验空缓冲区仍会输出工具调用摘要。"""
@@ -365,8 +397,60 @@ class TestAgentToolStreaming:
 
         assert run_in_threadpool_mock.await_count == 1
         assert run_in_threadpool_mock.await_args.args[0].__name__ == "send_direct_message"
-        assert run_in_threadpool_mock.await_args.args[1].mtype == MessageType.Agent
+        notification = run_in_threadpool_mock.await_args.args[1]
+        assert notification.mtype == MessageType.Agent
+        assert notification.text == "hello"
+        assert notification.rich_message == "hello"
         assert handler.has_sent_message
+
+    def test_rich_message_quotes_tool_summary_lines_for_telegram(self):
+        """校验 Telegram 富文本将工具摘要行转换为引用块，与正文视觉分隔。"""
+        handler = StreamingHandler()
+        handler._channel = NotificationChannel.Telegram.value
+        handler._source = "telegram"
+        handler.record_tool_call(
+            tool_name="list_directory",
+            tool_message="查看目录",
+            tool_kwargs={"path": "/tmp"},
+        )
+        handler.flush_pending_tool_summary()
+        text = handler._buffer
+
+        rich_message = handler._get_rich_message(text)
+
+        assert text == "（查看了 1 个目录）\n\n"
+        assert rich_message == "> （查看了 1 个目录）\n\n"
+
+    def test_rich_message_keeps_body_text_unquoted_for_telegram(self):
+        """校验 Telegram 富文本只转换工具摘要行，正文保持原样。"""
+        handler = StreamingHandler()
+        handler._channel = NotificationChannel.Telegram.value
+        handler.emit("正文内容\n\n")
+        handler.record_tool_call(
+            tool_name="execute_command",
+            tool_message="执行命令",
+            tool_kwargs={},
+        )
+        handler.emit("后续结论")
+
+        rich_message = handler._get_rich_message(handler._buffer)
+
+        assert rich_message == "正文内容\n\n> （执行了 1 条命令）\n\n后续结论"
+
+    def test_rich_message_returns_none_for_non_telegram_channels(self):
+        """校验非 Telegram 渠道不启用富文本，摘要保持原有纯文本格式。"""
+        handler = StreamingHandler()
+        handler._channel = NotificationChannel.Feishu.value
+        handler._source = "feishu-main"
+        handler.record_tool_call(
+            tool_name="execute_command",
+            tool_message="执行命令",
+            tool_kwargs={},
+        )
+        handler.flush_pending_tool_summary()
+
+        assert handler._get_rich_message(handler._buffer) is None
+        assert handler._buffer == "（执行了 1 条命令）\n\n"
 
     def test_flush_edits_message_via_threadpool(self):
         """校验刷新时通过线程池编辑已有消息。"""
@@ -392,6 +476,12 @@ class TestAgentToolStreaming:
 
         assert run_in_threadpool_mock.await_count == 1
         assert run_in_threadpool_mock.await_args.args[0].__name__ == "edit_message"
+        assert (
+            run_in_threadpool_mock.await_args.kwargs["metadata"][
+                "telegram_rich_message"
+            ]
+            == "hello world"
+        )
         assert handler._sent_text == "hello world"
 
     def test_stop_streaming_waits_inflight_initial_flush_before_final_edit(self):

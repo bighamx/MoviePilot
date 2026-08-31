@@ -1,9 +1,21 @@
 from pathlib import Path
-from typing import Any, List, Optional, Annotated
+from typing import Annotated, Any, List, Optional
 
 from fastapi import Depends
-from fastapi.concurrency import run_in_threadpool
 
+from app.adapters.system.host import SystemUtils
+from app.adapters.web.security.access import verify_apitoken
+from app.api.context import get_api_runtime_config, resolve_api_runtime_config
+from app.api.dependencies.auth import get_current_active_superuser
+from app.api.dependencies.history import get_dashboard_query_service
+from app.api.response import ResponseAPIRouter
+from app.application.configuration import ApiRuntimeConfig
+from app.application.dashboard import DashboardQueryService
+from app.application.directory import DirectoryHelper
+from app.application.scheduling import get_scheduler
+from app.chain.dashboard import DashboardChain
+from app.chain.storage import StorageChain
+from app.runtime.execution import run_in_threadpool
 from app.schemas.dashboard import DashboardMemoryInfo as _SchemaDashboardMemoryInfo
 from app.schemas.dashboard import DashboardSystemInfo as _SchemaDashboardSystemInfo
 from app.schemas.dashboard import DownloaderInfo as _SchemaDownloaderInfo
@@ -13,17 +25,7 @@ from app.schemas.dashboard import ScheduleProgress as _SchemaScheduleProgress
 from app.schemas.dashboard import Statistic as _SchemaStatistic
 from app.schemas.dashboard import Storage as _SchemaStorage
 from app.schemas.response import Response as _SchemaResponse
-from app.api.response import ResponseAPIRouter
-from app.chain.dashboard import DashboardChain
-from app.chain.storage import StorageChain
-from app.runtime.config import settings
-from app.adapters.web.security.access import verify_apitoken
-from app.api.deps import get_current_active_superuser, get_dashboard_query_service
-from app.application.dashboard import DashboardQueryService
 from app.schemas.types import StorageAction
-from app.application.directory import DirectoryHelper
-from app.application.scheduling import Scheduler
-from app.adapters.system.host import SystemUtils
 
 router = ResponseAPIRouter()
 
@@ -52,7 +54,11 @@ def _build_storage() -> _SchemaStorage:
     return _SchemaStorage(total_storage=total, used_storage=total - available)
 
 
-def _build_downloader(name: Optional[str] = None) -> _SchemaDownloaderInfo:
+def _build_downloader(
+    name: Optional[str] = None,
+    *,
+    btrfs_fsid_dedup: bool = False,
+) -> _SchemaDownloaderInfo:
     """
     构建下载器统计信息。
     """
@@ -60,7 +66,7 @@ def _build_downloader(name: Optional[str] = None) -> _SchemaDownloaderInfo:
     download_dirs = DirectoryHelper().get_local_download_dirs()
     _, free_space = SystemUtils.space_usage(
         [Path(d.download_path) for d in download_dirs],
-        btrfs_fsid_dedup=settings.BTRFS_FSID_DEDUP,
+        btrfs_fsid_dedup=btrfs_fsid_dedup,
     )
     # 下载器信息
     downloader_info = _SchemaDownloaderInfo()
@@ -136,12 +142,18 @@ def system_info(_: Any = Depends(get_current_active_superuser)) -> Any:
 
 @router.get("/downloader", summary="下载器信息", response_model=_SchemaDownloaderInfo)
 def downloader(
-    name: Optional[str] = None, _: Any = Depends(get_current_active_superuser)
+    name: Optional[str] = None,
+    runtime_config: ApiRuntimeConfig = Depends(get_api_runtime_config),
+    _: Any = Depends(get_current_active_superuser),
 ) -> Any:
     """
     查询下载器信息
     """
-    return _build_downloader(name)
+    runtime_config = resolve_api_runtime_config(runtime_config)
+    return _build_downloader(
+        name,
+        btrfs_fsid_dedup=runtime_config.btrfs_fsid_dedup,
+    )
 
 
 @router.get(
@@ -149,11 +161,17 @@ def downloader(
     summary="下载器信息（API_TOKEN）",
     response_model=_SchemaDownloaderInfo,
 )
-def downloader2(_: Annotated[str, Depends(verify_apitoken)]) -> Any:
+def downloader2(
+    _: Annotated[str, Depends(verify_apitoken)],
+    runtime_config: ApiRuntimeConfig = Depends(get_api_runtime_config),
+) -> Any:
     """
     查询下载器信息 API_TOKEN认证（?token=xxx）
     """
-    return _build_downloader()
+    runtime_config = resolve_api_runtime_config(runtime_config)
+    return _build_downloader(
+        btrfs_fsid_dedup=runtime_config.btrfs_fsid_dedup,
+    )
 
 
 @router.get("/schedule", summary="后台服务", response_model=List[_SchemaScheduleInfo])
@@ -162,7 +180,7 @@ async def schedule(_: Any = Depends(get_current_active_superuser)) -> Any:
     查询后台服务信息
     """
     # 同步 list() 内含同步进度读取，放到线程池执行避免阻塞事件循环
-    return await run_in_threadpool(Scheduler().list)
+    return await run_in_threadpool(get_scheduler().list)
 
 
 @router.get(
@@ -177,7 +195,7 @@ async def schedule_progress(
     查询指定后台服务的执行进度。
     """
     # 异步进度后端读取，避免同步 Redis 调用阻塞事件循环
-    progress = await Scheduler().aget_progress(job_id)
+    progress = await get_scheduler().aget_progress(job_id)
     if not progress:
         return _SchemaResponse(success=False, message="后台服务不存在")
     return _SchemaResponse(success=True, data=progress.model_dump())
@@ -193,7 +211,7 @@ async def schedule2(_: Annotated[str, Depends(verify_apitoken)]) -> Any:
     查询下载器信息 API_TOKEN认证（?token=xxx）
     """
     # 同步 list() 内含同步进度读取，放到线程池执行避免阻塞事件循环
-    return await run_in_threadpool(Scheduler().list)
+    return await run_in_threadpool(get_scheduler().list)
 
 
 @router.get(
@@ -208,7 +226,7 @@ async def schedule_progress2(
     查询指定后台服务的执行进度 API_TOKEN认证（?token=xxx）
     """
     # 异步进度后端读取，避免同步 Redis 调用阻塞事件循环
-    progress = await Scheduler().aget_progress(job_id)
+    progress = await get_scheduler().aget_progress(job_id)
     if not progress:
         return _SchemaResponse(success=False, message="后台服务不存在")
     return _SchemaResponse(success=True, data=progress.model_dump())

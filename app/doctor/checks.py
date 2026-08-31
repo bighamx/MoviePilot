@@ -18,10 +18,12 @@ from urllib.request import Request, urlopen
 
 import psutil
 
-from app.runtime.config import settings
-from app.doctor.models import DoctorFinding, DoctorFindingStatus, DoctorReport, DoctorSeverity
+from app.adapters.system.backup.database import verify_database_backup
+from app.adapters.system.backup.files import BackupFiles
 from app.adapters.system.host import SystemUtils
-
+from app.doctor.models import DoctorFinding, DoctorFindingStatus, DoctorReport, DoctorSeverity
+from app.runtime.settings import get_runtime_setting, update_runtime_setting
+from app.runtime.topology import process_topology_issue
 
 CheckFunc = Callable[["DoctorRunnerProtocol"], None]
 
@@ -67,23 +69,23 @@ SENSITIVE_PATTERNS = (
 
 
 def _backend_runtime_file() -> Path:
-    return settings.TEMP_PATH / "moviepilot.runtime.json"
+    return get_runtime_setting('TEMP_PATH') / "moviepilot.runtime.json"
 
 
 def _frontend_runtime_file() -> Path:
-    return settings.TEMP_PATH / "moviepilot.frontend.runtime.json"
+    return get_runtime_setting('TEMP_PATH') / "moviepilot.frontend.runtime.json"
 
 
 def _backend_stdio_log_file() -> Path:
-    return settings.LOG_PATH / "moviepilot.stdout.log"
+    return get_runtime_setting('LOG_PATH') / "moviepilot.stdout.log"
 
 
 def _backend_app_log_file() -> Path:
-    return settings.LOG_PATH / "moviepilot.log"
+    return get_runtime_setting('LOG_PATH') / "moviepilot.log"
 
 
 def _frontend_stdio_log_file() -> Path:
-    return settings.LOG_PATH / "moviepilot.frontend.stdout.log"
+    return get_runtime_setting('LOG_PATH') / "moviepilot.frontend.stdout.log"
 
 
 class DoctorRunnerProtocol:
@@ -134,6 +136,7 @@ def default_checks() -> list[CheckFunc]:
     return [
         _check_runtime_paths,
         _check_config,
+        _check_process_topology,
         _check_processes_and_ports,
         _check_dependencies,
         _check_database,
@@ -152,6 +155,49 @@ def _mask_text(text: str) -> str:
         else:
             masked = pattern.sub("<REDACTED>", masked)
     return masked
+
+
+def _check_process_topology(runner: DoctorRunnerProtocol) -> None:
+    """诊断 API worker 配置是否会复制全功能控制面。"""
+    issue = process_topology_issue(
+        workers=get_runtime_setting('API_WORKERS'),
+        safe_mode=get_runtime_setting('MOVIEPILOT_SAFE_MODE'),
+    )
+    context = {
+        "api_workers": get_runtime_setting('API_WORKERS'),
+        "safe_mode": get_runtime_setting('MOVIEPILOT_SAFE_MODE'),
+    }
+    if issue:
+        runner.add(
+            finding_id="startup.process_topology",
+            severity=DoctorSeverity.Error,
+            status=DoctorFindingStatus.Failed,
+            title="进程拓扑不受支持",
+            detail=issue,
+            recommendation="将 API_WORKERS 设为 1 后重启 MoviePilot。",
+            context=context,
+        )
+        return
+    if get_runtime_setting('API_WORKERS') != 1:
+        runner.add(
+            finding_id="startup.process_topology",
+            severity=DoctorSeverity.Warn,
+            status=DoctorFindingStatus.Degraded,
+            title="安全模式临时使用多 worker",
+            detail="安全模式不会启动插件、调度器、监控器和工作流，因此当前不会复制完整控制面。",
+            recommendation="故障排除后恢复 API_WORKERS=1，再退出安全模式。",
+            context=context,
+        )
+        return
+    runner.add(
+        finding_id="startup.process_topology",
+        severity=DoctorSeverity.Info,
+        status=DoctorFindingStatus.Ok,
+        title="进程拓扑受支持",
+        detail="API_WORKERS=1，插件和后台任务只会启动一份。",
+        recommendation="保持单 worker；扩容前需要先拆分 API 数据面和控制面。",
+        context=context,
+    )
 
 
 def _read_json(path: Path) -> Optional[dict[str, Any]]:
@@ -270,7 +316,7 @@ def _backend_health_payload(port: int, timeout: float = BACKEND_HEALTH_TIMEOUT) 
     读取本机后端健康接口响应，用于识别非 CLI 管理的 MoviePilot 进程。
     """
     query = urlencode({"token": BACKEND_HEALTH_TOKEN})
-    url = f"http://{_client_host(settings.HOST)}:{port}{BACKEND_HEALTH_PATH}?{query}"
+    url = f"http://{_client_host(get_runtime_setting('HOST'))}:{port}{BACKEND_HEALTH_PATH}?{query}"
     request = Request(url=url, headers={"Accept": "application/json"}, method="GET")
     try:
         with urlopen(request, timeout=timeout) as response:
@@ -416,13 +462,13 @@ def _partition_error_lines(
 
 
 def _frontend_dir() -> Path:
-    root_public = settings.ROOT_PATH / "public"
-    configured = Path(settings.FRONTEND_PATH)
+    root_public = get_runtime_setting('ROOT_PATH') / "public"
+    configured = Path(get_runtime_setting('FRONTEND_PATH'))
     if root_public.exists():
         return root_public
     if configured.is_absolute():
         return configured
-    return settings.ROOT_PATH / configured
+    return get_runtime_setting('ROOT_PATH') / configured
 
 
 def _unlink_if_requested(runner: DoctorRunnerProtocol, path: Path) -> bool:
@@ -442,26 +488,26 @@ def _check_runtime_paths(runner: DoctorRunnerProtocol) -> None:
         status=DoctorFindingStatus.Ok,
         title="运行路径已识别",
         detail=(
-            f"程序目录：{settings.ROOT_PATH}；配置目录：{settings.CONFIG_PATH}；"
-            f"日志目录：{settings.LOG_PATH}；Python：{sys.executable}"
+            f"程序目录：{get_runtime_setting('ROOT_PATH')}；配置目录：{get_runtime_setting('CONFIG_PATH')}；"
+            f"日志目录：{get_runtime_setting('LOG_PATH')}；Python：{sys.executable}"
         ),
         recommendation="如需切换配置目录，请使用 CONFIG_DIR 或本地 CLI 的 --config-dir 参数。",
         context={
-            "root_path": str(settings.ROOT_PATH),
-            "config_path": str(settings.CONFIG_PATH),
-            "log_path": str(settings.LOG_PATH),
+            "root_path": str(get_runtime_setting('ROOT_PATH')),
+            "config_path": str(get_runtime_setting('CONFIG_PATH')),
+            "log_path": str(get_runtime_setting('LOG_PATH')),
             "python": sys.executable,
         },
     )
 
 
 def _check_config(runner: DoctorRunnerProtocol) -> None:
-    token = (settings.API_TOKEN or "").strip()
+    token = (get_runtime_setting('API_TOKEN') or "").strip()
     if len(token) < 16:
         fixed = False
         detail = "API_TOKEN 未设置或长度小于 16 个字符，后端鉴权和本地工具调用可能不可用。"
         if runner.fix and "API_TOKEN" not in os.environ:
-            result, message = settings.update_setting("API_TOKEN", token)
+            result, message = update_runtime_setting("API_TOKEN", token)
             fixed = result is True
             if message:
                 detail = f"{detail} {message}"
@@ -488,13 +534,13 @@ def _check_config(runner: DoctorRunnerProtocol) -> None:
             recommendation="无需处理。",
         )
 
-    if settings.PORT == settings.NGINX_PORT:
+    if get_runtime_setting('PORT') == get_runtime_setting('NGINX_PORT'):
         runner.add(
             finding_id="config.port_same",
             severity=DoctorSeverity.Error,
             status=DoctorFindingStatus.Failed,
             title="前后端端口冲突",
-            detail=f"PORT 与 NGINX_PORT 都设置为 {settings.PORT}。",
+            detail=f"PORT 与 NGINX_PORT 都设置为 {get_runtime_setting('PORT')}。",
             recommendation="将 PORT 或 NGINX_PORT 调整为不同端口后重启服务。",
         )
     else:
@@ -503,11 +549,11 @@ def _check_config(runner: DoctorRunnerProtocol) -> None:
             severity=DoctorSeverity.Info,
             status=DoctorFindingStatus.Ok,
             title="前后端端口配置不同",
-            detail=f"后端端口 PORT={settings.PORT}；前端端口 NGINX_PORT={settings.NGINX_PORT}。",
+            detail=f"后端端口 PORT={get_runtime_setting('PORT')}；前端端口 NGINX_PORT={get_runtime_setting('NGINX_PORT')}。",
             recommendation="无需处理。",
         )
 
-    proxy_host = (settings.PROXY_HOST or "").strip()
+    proxy_host = (get_runtime_setting('PROXY_HOST') or "").strip()
     if proxy_host and not re.match(r"^(https?|socks5h?)://", proxy_host, re.IGNORECASE):
         runner.add(
             finding_id="config.proxy_format",
@@ -634,16 +680,16 @@ def _check_processes_and_ports(runner: DoctorRunnerProtocol) -> None:
         runner,
         name="backend",
         path=_backend_runtime_file(),
-        port=int(settings.PORT),
+        port=int(get_runtime_setting('PORT')),
     )
     frontend_process = _check_runtime_file(
         runner,
         name="frontend",
         path=_frontend_runtime_file(),
-        port=int(settings.NGINX_PORT),
+        port=int(get_runtime_setting('NGINX_PORT')),
     )
-    _check_port(runner, name="backend", port=int(settings.PORT), managed_process=backend_process)
-    _check_port(runner, name="frontend", port=int(settings.NGINX_PORT), managed_process=frontend_process)
+    _check_port(runner, name="backend", port=int(get_runtime_setting('PORT')), managed_process=backend_process)
+    _check_port(runner, name="frontend", port=int(get_runtime_setting('NGINX_PORT')), managed_process=frontend_process)
 
 
 def _check_dependencies(runner: DoctorRunnerProtocol) -> None:
@@ -670,7 +716,7 @@ def _check_dependencies(runner: DoctorRunnerProtocol) -> None:
 
 
 def _check_sqlite_database(runner: DoctorRunnerProtocol) -> None:
-    db_file = settings.CONFIG_PATH / "user.db"
+    db_file = get_runtime_setting('CONFIG_PATH') / "user.db"
     if not db_file.exists():
         runner.add(
             finding_id="database.sqlite_missing",
@@ -726,7 +772,7 @@ def _check_sqlite_database(runner: DoctorRunnerProtocol) -> None:
 def _check_postgresql_database(runner: DoctorRunnerProtocol) -> None:
     missing = []
     for key in ("DB_POSTGRESQL_HOST", "DB_POSTGRESQL_DATABASE", "DB_POSTGRESQL_USERNAME"):
-        if not str(getattr(settings, key, "") or "").strip():
+        if not str(get_runtime_setting(key, "") or "").strip():
             missing.append(key)
     if missing:
         runner.add(
@@ -751,9 +797,9 @@ def _check_postgresql_database(runner: DoctorRunnerProtocol) -> None:
         )
         return
 
-    host = settings.DB_POSTGRESQL_HOST
-    port = settings.DB_POSTGRESQL_PORT
-    if settings.DB_POSTGRESQL_SOCKET_MODE or not port:
+    host = get_runtime_setting('DB_POSTGRESQL_HOST')
+    port = get_runtime_setting('DB_POSTGRESQL_PORT')
+    if get_runtime_setting('DB_POSTGRESQL_SOCKET_MODE') or not port:
         runner.add(
             finding_id="database.postgresql_deep_skipped",
             severity=DoctorSeverity.Info,
@@ -769,16 +815,126 @@ def _check_postgresql_database(runner: DoctorRunnerProtocol) -> None:
         severity=DoctorSeverity.Info if ok else DoctorSeverity.Error,
         status=DoctorFindingStatus.Ok if ok else DoctorFindingStatus.Failed,
         title="PostgreSQL TCP 端口可连接" if ok else "PostgreSQL TCP 端口不可连接",
-        detail=f"{settings.DB_POSTGRESQL_TARGET} {detail}".strip(),
+        detail=f"{get_runtime_setting('DB_POSTGRESQL_TARGET')} {detail}".strip(),
         recommendation="不可连接时请检查数据库服务、容器网络、端口映射和防火墙。",
     )
 
 
 def _check_database(runner: DoctorRunnerProtocol) -> None:
-    if settings.DB_TYPE.lower() == "postgresql":
+    if get_runtime_setting('DB_TYPE').lower() == "postgresql":
         _check_postgresql_database(runner)
     else:
         _check_sqlite_database(runner)
+    _check_database_backups(runner)
+
+
+def _check_database_backups(runner: DoctorRunnerProtocol) -> None:
+    """列举并离线校验与当前数据库类型匹配的受管备份。"""
+    db_type = "postgresql" if get_runtime_setting('DB_TYPE').lower() == "postgresql" else "sqlite"
+    try:
+        paths = BackupFiles(get_runtime_setting('DATABASE_BACKUP_PATH')).list()
+    except OSError as error:
+        runner.add(
+            finding_id="database.backup_recovery",
+            severity=DoctorSeverity.Error,
+            status=DoctorFindingStatus.Failed,
+            title="数据库备份目录无法读取",
+            detail=str(error),
+            recommendation="检查数据库备份目录是否存在且当前用户具有读取权限。",
+            context={"db_type": db_type},
+        )
+        return
+
+    matching = [path for path in paths if BackupFiles.database_type(path.name) == db_type]
+    mismatched = [path.name for path in paths if path not in matching]
+    if not paths:
+        runner.add(
+            finding_id="database.backup_recovery",
+            severity=DoctorSeverity.Info,
+            status=DoctorFindingStatus.Skipped,
+            title="未找到受管数据库备份",
+            detail=f"当前数据库类型为 {db_type}，备份目录中没有正式备份文件。",
+            recommendation="可执行 `moviepilot database backup` 创建一次可校验备份。",
+            affects_report_status=False,
+            context={"db_type": db_type, "backups": []},
+        )
+        return
+
+    if not matching:
+        runner.add(
+            finding_id="database.backup_recovery",
+            severity=DoctorSeverity.Warn,
+            status=DoctorFindingStatus.Degraded,
+            title="没有匹配当前数据库类型的备份",
+            detail=f"当前数据库类型为 {db_type}，仅找到其他类型备份：{', '.join(mismatched)}。",
+            recommendation="确认数据库类型配置，或执行 `moviepilot database backup` 创建当前类型备份。",
+            affects_report_status=False,
+            context={"db_type": db_type, "backups": [], "mismatched": mismatched},
+        )
+        return
+
+    backups = []
+    for path in matching:
+        try:
+            size = path.stat().st_size
+            verification = verify_database_backup(path, db_type=db_type)
+            valid = verification.valid
+            method = verification.method
+            detail = verification.detail
+        except (OSError, RuntimeError, ValueError) as error:
+            size = None
+            valid = False
+            method = "unavailable"
+            detail = str(error)
+        backups.append(
+            {
+                "name": path.name,
+                "db_type": db_type,
+                "size": size,
+                "valid": valid,
+                "method": method,
+                "detail": detail,
+            }
+        )
+
+    valid_backups = [backup for backup in backups if backup["valid"]]
+    context = {
+        "db_type": db_type,
+        "backups": backups,
+        "mismatched": mismatched,
+    }
+    if valid_backups:
+        newest = valid_backups[0]
+        command = f"moviepilot database restore {newest['name']} --confirm"
+        runner.add(
+            finding_id="database.backup_recovery",
+            severity=DoctorSeverity.Info,
+            status=DoctorFindingStatus.Ok,
+            title="存在可还原的数据库备份",
+            detail=f"已校验 {len(backups)} 个 {db_type} 备份，其中 {len(valid_backups)} 个可用。",
+            recommendation=f"需要恢复时先停止 MoviePilot，再执行 `{command}`。",
+            context={**context, "restore_command": command},
+        )
+        return
+
+
+    failures = "; ".join(
+        f"{backup['name']}: {backup['detail'] or backup['method']}"
+        for backup in backups
+    )
+    runner.add(
+        finding_id="database.backup_recovery",
+        severity=DoctorSeverity.Error,
+        status=DoctorFindingStatus.Failed,
+        title="数据库备份均未通过校验",
+        detail=(
+            f"已检查 {len(backups)} 个 {db_type} 备份，没有可直接还原的文件。"
+            f"校验结果：{failures}"
+        ),
+        recommendation="根据校验详情处理备份文件或 PostgreSQL client，再重新运行 doctor。",
+        affects_report_status=False,
+        context=context,
+    )
 
 
 def _check_frontend_assets(runner: DoctorRunnerProtocol) -> None:
@@ -826,7 +982,7 @@ def _check_logs(runner: DoctorRunnerProtocol) -> None:
         _backend_stdio_log_file(),
         _frontend_stdio_log_file(),
     ]
-    plugin_log_dir = settings.LOG_PATH / "plugins"
+    plugin_log_dir = get_runtime_setting('LOG_PATH') / "plugins"
     plugin_logger_names: set[str] = set()
     if plugin_log_dir.exists():
         plugin_log_files = sorted(plugin_log_dir.rglob("*.log"))
@@ -862,7 +1018,7 @@ def _check_logs(runner: DoctorRunnerProtocol) -> None:
             severity=DoctorSeverity.Warn,
             status=DoctorFindingStatus.Degraded,
             title="未找到运行日志",
-            detail=f"{settings.LOG_PATH} 下没有可读取的 MoviePilot 日志。",
+            detail=f"{get_runtime_setting('LOG_PATH')} 下没有可读取的 MoviePilot 日志。",
             recommendation="如果服务尚未启动过可忽略；否则请确认 CONFIG_DIR 和日志目录权限。",
         )
         return
@@ -908,7 +1064,7 @@ def _check_logs(runner: DoctorRunnerProtocol) -> None:
             status=DoctorFindingStatus.Ok,
             title="最近日志未发现明显错误关键词",
             detail=(
-                f"已扫描 {settings.LOG_PATH} 下最近 {LOG_LOOKBACK_HOURS} 小时的主日志、"
+                f"已扫描 {get_runtime_setting('LOG_PATH')} 下最近 {LOG_LOOKBACK_HOURS} 小时的主日志、"
                 "启动日志和插件日志；插件扩展告警不参与核心健康状态。"
             ),
             recommendation="如果问题仍存在，请结合具体操作时间扩大日志范围排查。",
@@ -954,7 +1110,7 @@ def _check_docker(runner: DoctorRunnerProtocol) -> None:
         status=DoctorFindingStatus.Ok,
         title="Docker 诊断入口可用",
         detail=(
-            f"CONFIG_DIR={settings.CONFIG_PATH}；VENV_PATH={os.getenv('VENV_PATH', '/opt/venv')}；"
+            f"CONFIG_DIR={get_runtime_setting('CONFIG_PATH')}；VENV_PATH={os.getenv('VENV_PATH', '/opt/venv')}；"
             f"MOVIEPILOT_DOCKER_KEEPALIVE_ON_FAILURE={os.getenv('MOVIEPILOT_DOCKER_KEEPALIVE_ON_FAILURE', 'true')}"
         ),
         recommendation="主进程异常退出后容器会保活，仍可通过 `docker exec <container> moviepilot doctor` 诊断。",
@@ -962,7 +1118,7 @@ def _check_docker(runner: DoctorRunnerProtocol) -> None:
 
 
 def _check_safe_mode(runner: DoctorRunnerProtocol) -> None:
-    if settings.MOVIEPILOT_SAFE_MODE:
+    if get_runtime_setting('MOVIEPILOT_SAFE_MODE'):
         runner.add(
             finding_id="startup.safe_mode",
             severity=DoctorSeverity.Warn,

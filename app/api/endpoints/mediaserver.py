@@ -2,29 +2,32 @@ from typing import Any, List, Optional
 
 from fastapi import Depends, HTTPException, status
 
+from app.adapters.web.security.access import verify_token
+from app.api.dependencies.history import get_mediaserver_query_service
+from app.api.response import ResponseAPIRouter
+from app.application.configuration import get_configured_system_config
+from app.application.mediaserver import (
+    MediaServerQueryService,
+    get_mediaserver_configs,
+)
+from app.chain.download import DownloadChain
+from app.chain.mediaserver import MediaServerChain
+from app.domain.context import MediaInfo
+from app.domain.metainfo import MetaInfo
 from app.schemas.common import ServiceClientInfo as _SchemaServiceClientInfo
+from app.schemas.media import build_media_key, resolve_media_identity
 from app.schemas.mediaserver import ExistMediaInfo as _SchemaExistMediaInfo
 from app.schemas.mediaserver import MediaServerExistingEpisodes as _SchemaMediaServerExistingEpisodes
 from app.schemas.mediaserver import MediaServerExistsData as _SchemaMediaServerExistsData
 from app.schemas.mediaserver import MediaServerLibrary as _SchemaMediaServerLibrary
 from app.schemas.mediaserver import MediaServerPlayData as _SchemaMediaServerPlayData
 from app.schemas.mediaserver import MediaServerPlayItem as _SchemaMediaServerPlayItem
+from app.schemas.mediaserver import NotExistMediaInfo
 from app.schemas.mediaserver import NotExistMediaInfo as _SchemaNotExistMediaInfo
 from app.schemas.response import Response as _SchemaResponse
 from app.schemas.token import TokenPayload as _SchemaTokenPayload
-from app.schemas.workflow import MediaInfo as _SchemaMediaInfo
-from app.api.response import ResponseAPIRouter
-from app.chain.download import DownloadChain
-from app.chain.mediaserver import MediaServerChain
-from app.domain.context import MediaInfo
-from app.domain.metainfo import MetaInfo
-from app.adapters.web.security.access import verify_token
-from app.application.configuration import get_configured_system_config
-from app.application.mediaserver import MediaServerHelper, MediaServerQueryService
-from app.api.deps import get_mediaserver_query_service
-from app.schemas.mediaserver import NotExistMediaInfo
 from app.schemas.types import MediaSource, MediaType, SystemConfigKey
-from app.schemas.media import build_media_key, resolve_media_identity
+from app.schemas.workflow import MediaInfo as _SchemaMediaInfo
 
 router = ResponseAPIRouter()
 
@@ -54,11 +57,12 @@ def play_item(
     """
     if not itemid:
         return _SchemaResponse(success=False, message="参数错误")
-    configs = MediaServerHelper().get_configs()
+    configs = get_mediaserver_configs()
     if not configs:
         return _SchemaResponse(success=False, message="未配置媒体服务器")
     media_chain = MediaServerChain()
-    for name in configs.keys():
+    for config in configs:
+        name = config.name
         item = media_chain.iteminfo(server=name, item_id=itemid)
         if item:
             play_url = media_chain.get_play_url(server=name, item_id=itemid)

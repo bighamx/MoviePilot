@@ -19,8 +19,8 @@ from app.agent.tools.impl.query_media_detail import (
     QueryMediaDetailInput,
     QueryMediaDetailTool,
 )
-from app.agent.tools.impl.query_subscribe_shares import QuerySubscribeSharesTool
 from app.agent.tools.impl.query_subscribe_history import QuerySubscribeHistoryTool
+from app.agent.tools.impl.query_subscribe_shares import QuerySubscribeSharesTool
 from app.agent.tools.impl.recognize_media import RecognizeMediaTool
 from app.agent.tools.impl.scrape_metadata import ScrapeMetadataTool
 from app.agent.tools.impl.search_media import SearchMediaTool
@@ -309,6 +309,31 @@ def test_scrape_metadata_rejects_invalid_media_source_before_file_access(tmp_pat
     assert "media_source" in payload["message"]
 
 
+def test_scrape_metadata_checks_local_path_in_agent_worker(tmp_path, monkeypatch):
+    """Agent 刮削的本地路径检查应通过受控存储线程执行。"""
+    calls = []
+
+    async def fake_run_agent_blocking(bucket, func, *args, **kwargs):
+        calls.append((bucket, func, args, kwargs))
+        return False, False
+
+    monkeypatch.setattr("app.agent.tools.base.run_agent_blocking", fake_run_agent_blocking)
+    tool = ScrapeMetadataTool(session_id="session-1", user_id="10001")
+
+    result = asyncio.run(
+        tool.run(path=str(tmp_path / "missing"), storage="local")
+    )
+
+    payload = json.loads(result)
+    assert payload == {
+        "success": False,
+        "message": f"刮削路径不存在: {tmp_path / 'missing'}",
+    }
+    assert len(calls) == 1
+    assert calls[0][0] == "storage"
+    assert calls[0][2] == (tmp_path / "missing",)
+
+
 def test_query_artist_detail_marks_entity_as_non_subscribable():
     """艺术家详情应明确标记为不可订阅，避免 Agent 混入获取流程。"""
     artist = MusicArtistInfo(
@@ -397,14 +422,18 @@ def test_add_download_preserves_album_context_and_full_coverage_marker():
         submitted_contexts.append(context)
         return "download-1", None
 
-    tool = AddDownloadTasksTool(session_id="session-1", user_id="10001")
+    site_repository = SimpleNamespace(
+        async_get_by_name=AsyncMock(return_value=site)
+    )
+    tool = AddDownloadTasksTool(
+        session_id="session-1",
+        user_id="10001",
+        data=SimpleNamespace(sites=site_repository),
+    )
     with patch.object(
         AddDownloadTasksTool,
         "_async_resolve_cached_context",
         new=AsyncMock(return_value=cached_context),
-    ), patch(
-        "app.agent.tools.impl.add_download_tasks.SiteOper.async_get_by_name",
-        new=AsyncMock(return_value=site),
     ), patch.object(
         AddDownloadTasksTool,
         "_download_single_sync",
@@ -453,11 +482,11 @@ def test_query_subscribe_history_uses_database_media_values_and_music_fields(mon
             calls.append((mtype, page, count))
             return [record] if mtype == MediaType.MUSIC.value else []
 
-    monkeypatch.setattr(
-        "app.agent.tools.impl.query_subscribe_history.SubscribeHistoryOper",
-        FakeHistoryOper,
+    tool = QuerySubscribeHistoryTool(
+        session_id="session-1",
+        user_id="10001",
+        data=SimpleNamespace(subscription_history=FakeHistoryOper()),
     )
-    tool = QuerySubscribeHistoryTool(session_id="session-1", user_id="10001")
 
     result = asyncio.run(tool.run(media_type="all"))
 
@@ -487,11 +516,11 @@ def test_music_history_filter_excludes_video_records(monkeypatch):
             """仅为电影类型返回记录。"""
             return [movie_record] if mtype == MediaType.MOVIE.value else []
 
-    monkeypatch.setattr(
-        "app.agent.tools.impl.query_subscribe_history.SubscribeHistoryOper",
-        FakeHistoryOper,
+    tool = QuerySubscribeHistoryTool(
+        session_id="session-1",
+        user_id="10001",
+        data=SimpleNamespace(subscription_history=FakeHistoryOper()),
     )
-    tool = QuerySubscribeHistoryTool(session_id="session-1", user_id="10001")
 
     result = asyncio.run(
         tool.run(media_type="all", music_type="recording")

@@ -7,7 +7,11 @@ from unittest.mock import Mock
 
 import pytest
 
-from app.runtime.extensions.module.dispatcher import ModuleInvocationDispatcher
+from app.runtime.extensions.module.dispatcher import (
+    FrozenModuleProviderMissingError,
+    FrozenPluginProviderRef,
+    ModuleInvocationDispatcher,
+)
 
 
 class _PluginCatalog:
@@ -94,6 +98,303 @@ def test_plugin_scalar_short_circuits_system_modules() -> None:
     system_call.assert_not_called()
 
 
+def test_strict_dispatch_propagates_plugin_failure_before_host_fallback() -> None:
+    """严格查询不得把插件 provider 异常吞成空结果后继续宿主 fallback。"""
+    system_call = Mock(return_value=None)
+    module = _Module("系统", 10, system_call)
+    setattr(module, "get_file_item", module.execute)
+
+    def failed_provider(**_kwargs):
+        """模拟插件存储查询发生网络或 I/O 故障。"""
+        raise RuntimeError("provider lookup failed")
+
+    dispatcher, plugin_error, _, _ = _dispatcher(
+        plugins={("P1", "插件一"): {"get_file_item": failed_provider}},
+        modules=[module],
+    )
+
+    with pytest.raises(RuntimeError, match="provider lookup failed"):
+        dispatcher.dispatch_strict(
+            "get_file_item",
+            storage="plugin",
+            path="/library/old.mkv",
+        )
+
+    plugin_error.assert_called_once()
+    system_call.assert_not_called()
+
+
+def test_strict_dispatch_preserves_confirmed_absence() -> None:
+    """全部 provider 正常返回空值时，严格查询仍以 None 表示确认不存在。"""
+    module = _Module("系统", 10, lambda **_kwargs: None)
+    setattr(module, "get_file_item", module.execute)
+    dispatcher, _, _, _ = _dispatcher(
+        plugins={("P1", "插件一"): {"get_file_item": lambda **_kwargs: None}},
+        modules=[module],
+    )
+
+    assert (
+        dispatcher.dispatch_strict(
+            "get_file_item",
+            storage="plugin",
+            path="/library/missing.mkv",
+        )
+        is None
+    )
+
+
+def test_strict_dispatch_propagates_host_io_failure() -> None:
+    """严格查询也必须传播宿主存储适配器的 I/O 故障。"""
+    def failed_host(**_kwargs):
+        """模拟宿主存储 stat 或远端请求失败。"""
+        raise RuntimeError("host io failed")
+
+    module = _Module("系统", 10, failed_host)
+    setattr(module, "get_file_item", module.execute)
+    dispatcher, _, system_error, _ = _dispatcher(modules=[module])
+
+    with pytest.raises(RuntimeError, match="host io failed"):
+        dispatcher.dispatch_strict(
+            "get_file_item",
+            storage="local",
+            path="/library/old.mkv",
+        )
+
+    system_error.assert_called_once()
+
+
+def test_frozen_plugin_providers_preserve_original_order_after_catalog_reorder() -> None:
+    """冻结执行必须采用持久化顺序，不受当前插件目录重排影响。"""
+    calls = []
+    plugins = {
+        ("P1", "插件一"): {"transfer": lambda: calls.append("P1")},
+        ("P2", "插件二"): {"transfer": lambda: calls.append("P2")},
+    }
+    dispatcher, _, _, _ = _dispatcher(plugins=plugins)
+
+    providers = dispatcher.freeze_plugin_providers("transfer")
+    payloads = [provider.to_payload() for provider in providers]
+    restored = tuple(FrozenPluginProviderRef.from_payload(item) for item in payloads)
+    plugins.clear()
+    plugins.update(
+        {
+            ("P2", "插件二"): {"transfer": lambda: calls.append("new-P2")},
+            ("P1", "插件一"): {"transfer": lambda: calls.append("new-P1")},
+        }
+    )
+
+    assert dispatcher.execute_frozen_plugin_providers("transfer", restored) is None
+    assert payloads == [
+        {"plugin_id": "P1", "plugin_name": "插件一", "method": "transfer"},
+        {"plugin_id": "P2", "plugin_name": "插件二", "method": "transfer"},
+    ]
+    assert calls == ["new-P1", "new-P2"]
+
+
+def test_frozen_plugin_provider_propagates_failure_and_stops() -> None:
+    """冻结序列中的插件异常必须向上抛出，不能伪装成空结果。"""
+    calls = []
+
+    def fail() -> None:
+        """记录调用后模拟旧插件执行失败。"""
+        calls.append("P1")
+        raise RuntimeError("provider failed")
+
+    dispatcher, plugin_error, _, _ = _dispatcher(
+        plugins={
+            ("P1", "插件一"): {"transfer": fail},
+            ("P2", "插件二"): {
+                "transfer": lambda: calls.append("P2") or "success"
+            },
+        }
+    )
+    providers = dispatcher.freeze_plugin_providers("transfer")
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        dispatcher.execute_frozen_plugin_providers("transfer", providers)
+
+    assert calls == ["P1"]
+    plugin_error.assert_called_once()
+    assert plugin_error.call_args.args[1:4] == ("P1", "插件一", "transfer")
+
+
+def test_frozen_plugin_provider_first_non_empty_short_circuits() -> None:
+    """冻结 transfer 序列仍应在首个非空结果后停止。"""
+    second_provider = Mock(return_value="second")
+    dispatcher, _, _, _ = _dispatcher(
+        plugins={
+            ("P1", "插件一"): {"transfer": lambda: "first"},
+            ("P2", "插件二"): {"transfer": second_provider},
+        }
+    )
+    providers = dispatcher.freeze_plugin_providers("transfer")
+
+    assert (
+        dispatcher.execute_frozen_plugin_providers("transfer", providers) == "first"
+    )
+    second_provider.assert_not_called()
+
+
+def test_frozen_plugin_provider_missing_fails_before_any_execution() -> None:
+    """任一冻结 provider 缺失时必须显式失败且不得产生部分执行。"""
+    first_provider = Mock(return_value=None)
+    plugins = {
+        ("P1", "插件一"): {"transfer": first_provider},
+        ("P2", "插件二"): {"transfer": Mock(return_value=None)},
+    }
+    dispatcher, _, _, _ = _dispatcher(plugins=plugins)
+    providers = dispatcher.freeze_plugin_providers("transfer")
+    plugins.pop(("P2", "插件二"))
+
+    with pytest.raises(
+        FrozenModuleProviderMissingError,
+        match=r"P2/插件二\.transfer",
+    ):
+        dispatcher.execute_frozen_plugin_providers("transfer", providers)
+
+    first_provider.assert_not_called()
+
+
+def test_frozen_plugin_provider_missing_fails_before_pre_invoke_hook() -> None:
+    """全部冻结引用解析成功前不得触发 cleanup 等前置副作用。"""
+    first_provider = Mock(return_value=None)
+    before_invoke = Mock()
+    plugins = {
+        ("P1", "插件一"): {"transfer": first_provider},
+        ("P2", "插件二"): {"transfer": Mock(return_value=None)},
+    }
+    dispatcher, _, _, _ = _dispatcher(plugins=plugins)
+    providers = dispatcher.freeze_plugin_providers("transfer")
+    plugins.pop(("P2", "插件二"))
+
+    with pytest.raises(FrozenModuleProviderMissingError):
+        dispatcher.execute_frozen_plugin_providers(
+            "transfer",
+            providers,
+            before_invoke=before_invoke,
+        )
+
+    before_invoke.assert_not_called()
+    first_provider.assert_not_called()
+
+
+def test_empty_frozen_plugin_provider_sequence_skips_pre_invoke_hook() -> None:
+    """没有冻结 provider 时不得执行仅服务于 provider 的前置副作用。"""
+    before_invoke = Mock()
+    dispatcher, _, _, _ = _dispatcher()
+
+    assert (
+        dispatcher.execute_frozen_plugin_providers(
+            "transfer",
+            (),
+            before_invoke=before_invoke,
+        )
+        is None
+    )
+    before_invoke.assert_not_called()
+
+
+def test_ordinary_transfer_dispatch_remains_dynamic_and_compatible() -> None:
+    """普通 transfer 调度仍按当前目录动态发现并采用既有短路语义。"""
+    system_call = Mock(return_value="system")
+    module = _Module("系统", 10, system_call)
+    setattr(module, "transfer", module.execute)
+    dispatcher, _, _, _ = _dispatcher(
+        plugins={("P1", "插件一"): {"transfer": lambda: "plugin"}},
+        modules=[module],
+    )
+
+    assert dispatcher.dispatch("transfer") == "plugin"
+    system_call.assert_not_called()
+
+
+def test_host_internal_contract_skips_plugin_provider() -> None:
+    """宿主内部两阶段协议不得暴露给同名第三方 provider。"""
+    plugin_call = Mock(return_value="plugin")
+    system_call = Mock(return_value="system")
+    module = _Module("系统", 10, system_call)
+    setattr(module, "plan_transfer", module.execute)
+    dispatcher, _, _, _ = _dispatcher(
+        plugins={
+            ("P1", "插件一"): {"plan_transfer": plugin_call},
+        },
+        modules=[module],
+    )
+
+    assert dispatcher.dispatch("plan_transfer") == "system"
+    plugin_call.assert_not_called()
+    system_call.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_async_host_internal_contract_skips_plugin_provider() -> None:
+    """异步调度同样只允许宿主执行内部检查点协议。"""
+    plugin_call = Mock(return_value="plugin")
+    system_call = Mock(return_value="system")
+    module = _Module("系统", 10, system_call)
+    setattr(module, "execute_transfer_plan", module.execute)
+    dispatcher, _, _, _ = _dispatcher(
+        plugins={
+            ("P1", "插件一"): {"execute_transfer_plan": plugin_call},
+        },
+        modules=[module],
+    )
+
+    assert await dispatcher.async_dispatch("execute_transfer_plan") == "system"
+    plugin_call.assert_not_called()
+    system_call.assert_called_once()
+
+
+def test_fan_out_contract_runs_every_provider_and_ignores_results() -> None:
+    """副作用广播应执行全部插件和宿主 provider，并稳定返回 None。"""
+    calls = []
+
+    def record(name: str, result):
+        """生成记录调用顺序并返回测试哨兵的 provider。"""
+        return lambda: calls.append(name) or result
+
+    system_20 = _Module("系统二", 20, record("system-20", "ignored-system"))
+    system_10 = _Module("系统一", 10, record("system-10", None))
+    setattr(system_20, "clear_cache", system_20.execute)
+    setattr(system_10, "clear_cache", system_10.execute)
+    dispatcher, _, _, _ = _dispatcher(
+        plugins={
+            ("P1", "插件一"): {"clear_cache": record("plugin-1", "ignored-plugin")},
+            ("P2", "插件二"): {"clear_cache": record("plugin-2", None)},
+        },
+        modules=[system_20, system_10],
+    )
+
+    assert dispatcher.dispatch("clear_cache") is None
+    assert calls == ["plugin-1", "plugin-2", "system-10", "system-20"]
+
+
+@pytest.mark.asyncio
+async def test_async_fan_out_contract_matches_sync_execution() -> None:
+    """异步广播也应忽略返回值并执行全部同步或异步 provider。"""
+    calls = []
+
+    async def plugin_call():
+        """记录异步插件调用并返回应被忽略的哨兵。"""
+        calls.append("plugin")
+        return "ignored-plugin"
+
+    def system_call():
+        """记录同步宿主调用并返回应被忽略的哨兵。"""
+        calls.append("system")
+        return "ignored-system"
+
+    module = _Module("系统", 10, system_call)
+    setattr(module, "clear_cache", module.execute)
+    dispatcher, _, _, _ = _dispatcher(
+        plugins={("P1", "插件一"): {"clear_cache": plugin_call}},
+        modules=[module],
+    )
+
+    assert await dispatcher.async_dispatch("clear_cache") is None
+    assert calls == ["plugin", "system"]
+
+
 def test_list_results_merge_in_plugin_then_priority_order() -> None:
     """列表结果应先按插件顺序合并，再按宿主优先级继续合并。"""
     calls = []
@@ -120,6 +421,16 @@ def test_list_results_merge_in_plugin_then_priority_order() -> None:
         "system-20",
     ]
     assert calls == ["plugin-1", "plugin-2", "system-10", "system-20"]
+
+
+def test_result_shape_diagnosis_does_not_break_system_dispatch() -> None:
+    """provider 结果形状异常时只记录诊断，不得击穿宿主模块调度。"""
+    module = _Module("异常结果模块", 10, lambda: "unexpected")
+    setattr(module, "search_medias", module.execute)
+    dispatcher, _, system_error, _ = _dispatcher(modules=[module])
+
+    assert dispatcher.dispatch("search_medias") == "unexpected"
+    system_error.assert_not_called()
 
 
 def test_system_signature_relay_passes_previous_result() -> None:
@@ -167,6 +478,187 @@ def test_system_signature_relay_passes_previous_result() -> None:
     assert dispatcher.dispatch("execute") == {"value": 2}
 
 
+def test_explicit_pipeline_contract_relays_previous_result() -> None:
+    """图片补全契约应按优先级把上一 provider 结果交给下一 provider。"""
+    class ImageModule:
+        """在统一媒体对象上记录当前图片 provider。"""
+
+        def __init__(self, name: str, priority: int) -> None:
+            """保存 provider 名称和优先级。"""
+            self._name = name
+            self._priority = priority
+
+        def get_name(self) -> str:
+            """返回测试模块名。"""
+            return self._name
+
+        def get_priority(self) -> int:
+            """返回测试优先级。"""
+            return self._priority
+
+        def obtain_images(self, mediainfo: dict) -> dict:
+            """追加当前 provider 名称并返回同一媒体结果。"""
+            return {
+                **mediainfo,
+                "providers": [*mediainfo.get("providers", []), self._name],
+            }
+
+    dispatcher, _, _, _ = _dispatcher(
+        modules=[
+            ImageModule("fanart", 20),
+            ImageModule("tmdb", 10),
+        ]
+    )
+
+    assert dispatcher.dispatch("obtain_images", mediainfo={}) == {
+        "providers": ["tmdb", "fanart"]
+    }
+
+
+def test_first_non_empty_contract_stops_legacy_signature_relay() -> None:
+    """显式首个非空契约不得再把结果交给后续宿主 provider 改写。"""
+    class FirstModule:
+        """返回首个识别结果的宿主模块。"""
+
+        @staticmethod
+        def get_name() -> str:
+            """返回测试模块名。"""
+            return "第一识别源"
+
+        @staticmethod
+        def get_priority() -> int:
+            """返回第一优先级。"""
+            return 10
+
+        @staticmethod
+        def recognize_media() -> str:
+            """返回首个非空识别结果。"""
+            return "first"
+
+    class RelayCompatibleModule:
+        """模拟可接受上一结果的旧式宿主模块。"""
+
+        @staticmethod
+        def get_name() -> str:
+            """返回测试模块名。"""
+            return "旧式接力源"
+
+        @staticmethod
+        def get_priority() -> int:
+            """返回第二优先级。"""
+            return 20
+
+        @staticmethod
+        def recognize_media(previous: str) -> str:
+            """若被调用则改写上一结果。"""
+            return f"relayed:{previous}"
+
+    dispatcher, _, _, _ = _dispatcher(
+        modules=[RelayCompatibleModule(), FirstModule()]
+    )
+
+    assert dispatcher.dispatch("recognize_media") == "first"
+
+
+def test_ordered_list_contract_bypasses_legacy_signature_relay() -> None:
+    """显式列表聚合契约应按原参数调用并保留 provider 顺序。"""
+    class SearchModule:
+        """区分原参数调用与旧式结果接力的搜索模块。"""
+
+        @staticmethod
+        def get_name() -> str:
+            """返回测试模块名。"""
+            return "系统搜索源"
+
+        @staticmethod
+        def get_priority() -> int:
+            """返回稳定优先级。"""
+            return 10
+
+        @staticmethod
+        def search_medias(previous: list | None = None) -> list[str]:
+            """原参数调用返回系统结果，接力调用返回可检测哨兵。"""
+            return ["relayed"] if previous is not None else ["system"]
+
+    dispatcher, _, _, _ = _dispatcher(
+        plugins={
+            ("P1", "插件一"): {"search_medias": lambda: ["plugin"]},
+        },
+        modules=[SearchModule()],
+    )
+
+    assert dispatcher.dispatch("search_medias") == ["plugin", "system"]
+
+
+def test_ordered_mapping_contract_merges_system_downloader_results() -> None:
+    """未指定下载器时应按宿主优先级合并各 provider 的 Tracker 映射。"""
+    class TrackerModule:
+        """返回单个下载器 Tracker 映射的测试模块。"""
+
+        def __init__(self, name: str, priority: int) -> None:
+            """保存下载器名称和 provider 优先级。"""
+            self._name = name
+            self._priority = priority
+
+        def get_name(self) -> str:
+            """返回测试模块名。"""
+            return self._name
+
+        def get_priority(self) -> int:
+            """返回测试优先级。"""
+            return self._priority
+
+        def get_torrent_trackers(
+            self,
+            hash_string: str,
+            downloader: str | None = None,
+        ) -> dict[str, list[str]]:
+            """返回当前测试下载器的 Tracker 映射。"""
+            assert hash_string == "hash"
+            assert downloader is None
+            return {self._name: [f"https://{self._name}.test/announce"]}
+
+    dispatcher, _, _, _ = _dispatcher(
+        modules=[
+            TrackerModule("transmission", 20),
+            TrackerModule("qbittorrent", 10),
+        ]
+    )
+
+    assert dispatcher.dispatch(
+        "get_torrent_trackers",
+        hash_string="hash",
+        downloader=None,
+    ) == {
+        "qbittorrent": ["https://qbittorrent.test/announce"],
+        "transmission": ["https://transmission.test/announce"],
+    }
+
+
+def test_plugin_mapping_keeps_existing_host_short_circuit() -> None:
+    """插件返回 Tracker 映射后仍应保持插件优先，不再调用宿主 provider。"""
+    system_call = Mock(return_value={"system": ["https://system.test"]})
+    module = _Module("系统", 10, system_call)
+    setattr(module, "get_torrent_trackers", module.execute)
+    dispatcher, _, _, _ = _dispatcher(
+        plugins={
+            ("P1", "插件一"): {
+                "get_torrent_trackers": lambda **_kwargs: {
+                    "plugin": ["https://plugin.test"]
+                }
+            },
+        },
+        modules=[module],
+    )
+
+    assert dispatcher.dispatch(
+        "get_torrent_trackers",
+        hash_string="hash",
+        downloader=None,
+    ) == {"plugin": ["https://plugin.test"]}
+    system_call.assert_not_called()
+
+
 def test_module_exception_uses_error_policy_and_continues() -> None:
     """普通异常应交给错误策略，后续空结果模块仍可继续运行。"""
     def broken():
@@ -209,6 +701,44 @@ async def test_async_dispatch_awaits_coroutines_and_offloads_sync_functions() ->
     assert offloaded == [sync_module.execute]
 
 
+@pytest.mark.asyncio
+async def test_async_ordered_list_contract_uses_same_aggregation_policy() -> None:
+    """异步 dispatcher 应与同步路径共享显式列表聚合语义。"""
+    class SearchModule:
+        """提供异步路径下可识别调用方式的同步 provider。"""
+
+        @staticmethod
+        def get_name() -> str:
+            """返回测试模块名。"""
+            return "异步系统搜索源"
+
+        @staticmethod
+        def get_priority() -> int:
+            """返回稳定优先级。"""
+            return 10
+
+        @staticmethod
+        def search_medias(previous: list | None = None) -> list[str]:
+            """原参数调用返回系统结果，接力调用返回可检测哨兵。"""
+            return ["relayed"] if previous is not None else ["system"]
+
+    async def plugin_search() -> list[str]:
+        """返回插件搜索结果。"""
+        return ["plugin"]
+
+    dispatcher, _, _, _ = _dispatcher(
+        plugins={
+            ("P1", "插件一"): {"search_medias": plugin_search},
+        },
+        modules=[SearchModule()],
+    )
+
+    assert await dispatcher.async_dispatch("search_medias") == [
+        "plugin",
+        "system",
+    ]
+
+
 def test_plugin_non_mapping_module_decl_is_reported_and_skipped() -> None:
     """插件把方法表声明成 list 时走错误策略，且不影响后续健康插件。"""
     dispatcher, plugin_error, _, _ = _dispatcher(
@@ -220,6 +750,71 @@ def test_plugin_non_mapping_module_decl_is_reported_and_skipped() -> None:
 
     assert dispatcher.dispatch("execute") == "ok"
     plugin_error.assert_called_once()
+
+
+def test_unknown_plugin_method_records_legacy_abi_hit(monkeypatch) -> None:
+    """未知第三方方法继续执行，同时记录可迁移的 legacy ABI 来源。"""
+    hits = []
+    monkeypatch.setattr(
+        "app.runtime.extensions.module.dispatcher.record_metric",
+        lambda name, **labels: hits.append((name, labels)),
+    )
+    dispatcher, _, _, _ = _dispatcher(
+        plugins={("P1", "插件一"): {"third_party_custom": lambda: "ok"}},
+    )
+
+    assert dispatcher.dispatch("third_party_custom") == "ok"
+    assert hits == [
+        (
+            "module.contract.legacy_hit",
+            {
+                "method": "third_party_custom",
+                "caller_type": "plugin",
+                "abi_source": "third_party_plugin",
+            },
+        )
+    ]
+
+
+def test_unknown_host_method_records_legacy_abi_hit(monkeypatch) -> None:
+    """宿主临时新增而未登记的方法保持执行并留下迁移信号。"""
+    hits = []
+    monkeypatch.setattr(
+        "app.runtime.extensions.module.dispatcher.record_metric",
+        lambda name, **labels: hits.append((name, labels)),
+    )
+
+    class LegacyModule:
+        """提供未进入清单的宿主兼容方法。"""
+
+        @staticmethod
+        def get_name() -> str:
+            """返回测试模块名称。"""
+            return "旧模块"
+
+        @staticmethod
+        def get_priority() -> int:
+            """返回稳定测试优先级。"""
+            return 1
+
+        @staticmethod
+        def third_party_host() -> str:
+            """返回兼容方法结果。"""
+            return "ok"
+
+    dispatcher, _, _, _ = _dispatcher(modules=[LegacyModule()])
+
+    assert dispatcher.dispatch("third_party_host") == "ok"
+    assert hits == [
+        (
+            "module.contract.legacy_hit",
+            {
+                "method": "third_party_host",
+                "caller_type": "system",
+                "abi_source": "host_module",
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio

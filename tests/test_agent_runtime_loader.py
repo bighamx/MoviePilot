@@ -22,7 +22,7 @@ from app.runtime.capabilities.model import (
 @pytest.fixture
 def runtime_loader(monkeypatch):
     """为每个用例提供未构建、未关闭的 Agent Capability Runtime。"""
-    from app.agent import runtime_loader as module
+    from app.agent import loader as module
 
     monkeypatch.setattr(module, "_agent_runtime", None)
     for implementation_module in (
@@ -42,6 +42,7 @@ class _FakeManager:
         self.fail_initialize = False
         self.initialize_entered: asyncio.Event | None = None
         self.initialize_release: asyncio.Event | None = None
+        self.close_converged: bool | None = None
 
     async def initialize(self) -> None:
         self.initialize_calls += 1
@@ -52,8 +53,68 @@ class _FakeManager:
         if self.fail_initialize:
             raise RuntimeError("service initialization failed")
 
-    async def close(self) -> None:
+    async def close(self) -> bool | None:
         self.close_calls += 1
+        return self.close_converged
+
+
+@pytest.mark.anyio
+async def test_shutdown_retains_nonconverged_agent_service_for_retry(
+    runtime_loader,
+    monkeypatch,
+) -> None:
+    """Manager 返回未收敛时 Runtime 必须保留 owner，后续关闭可继续等待。"""
+    manager = _FakeManager()
+    manager.close_converged = False
+    modules = _fake_agent_modules(manager)
+    monkeypatch.setattr(
+        "app.agent.capabilities.adapter.settings.AI_AGENT_ENABLE",
+        True,
+    )
+    monkeypatch.setattr(
+        "app.agent.capabilities.adapter.importlib.import_module",
+        lambda name: (
+            monkeypatch.setitem(sys.modules, name, modules[name]) or modules[name]
+        ),
+    )
+    assert await runtime_loader.activate_agent_service() is manager
+
+    assert await runtime_loader.begin_agent_shutdown() is False
+    snapshot = runtime_loader._agent_runtime.snapshot("agent.service")
+    assert snapshot.lifecycle is CapabilityLifecycleState.FAILED
+    assert snapshot.visible is False
+
+    manager.close_converged = True
+    assert await runtime_loader.begin_agent_shutdown() is True
+    snapshot = runtime_loader._agent_runtime.snapshot("agent.service")
+    assert snapshot.lifecycle is CapabilityLifecycleState.STOPPED
+    assert manager.close_calls == 2
+
+
+@pytest.mark.anyio
+async def test_shutdown_propagates_runtime_wide_convergence(
+    runtime_loader,
+    monkeypatch,
+) -> None:
+    """Agent 关闭不得用单个 service 快照覆盖 Runtime 的整体结果。"""
+
+    class RuntimeWithIndependentShutdownResult:
+        """模拟其它 Agent 能力失败而 service 已停止的 Runtime。"""
+
+        async def shutdown_async(self, *, reason: str) -> bool:
+            """记录关闭原因并返回 Runtime 级未收敛。"""
+            assert reason == "application_shutdown"
+            return False
+
+        @staticmethod
+        def snapshot(_capability_id: str) -> types.SimpleNamespace:
+            """提供旧实现读取的已停止 service 快照。"""
+            return types.SimpleNamespace(lifecycle=CapabilityLifecycleState.STOPPED)
+
+    runtime = RuntimeWithIndependentShutdownResult()
+    monkeypatch.setattr(runtime_loader, "_ensure_runtime", lambda: runtime)
+
+    assert await runtime_loader.begin_agent_shutdown() is False
 
 
 def _fake_agent_modules(manager: object | None = None) -> dict[str, types.ModuleType]:

@@ -1,11 +1,17 @@
-import re
+import typing
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
-from typing import Callable, List, Dict, Any, Tuple, Optional, Set, Union, Self
+from typing import Any, Callable, Dict, List, Optional, Self, Set, Union
+
+import yaml  # type: ignore[import-untyped]
+from yaml.constructor import ConstructorError  # type: ignore[import-untyped]
+from yaml.events import AliasEvent  # type: ignore[import-untyped]
+from yaml.nodes import MappingNode  # type: ignore[import-untyped]
 
 from app.domain.meta.metabase import MetaBase
-from app.domain.meta.metamusic import MetaMusic
 from app.domain.meta.metamusic import (
+    MetaMusic,
     audio_quality_score,
     audio_quality_tier,
     format_audio_quality,
@@ -13,6 +19,8 @@ from app.domain.meta.metamusic import (
     normalize_audio_format,
 )
 from app.domain.metainfo import MetaInfo
+from app.foundation import temporal as time_tools
+from app.schemas.media import normalize_media_source, resolve_media_identity
 from app.schemas.types import (
     MUSIC_ENTITY_ALBUM,
     MUSIC_ENTITY_ARTIST,
@@ -20,22 +28,79 @@ from app.schemas.types import (
     MediaSource,
     MediaType,
 )
-from app.schemas.media import normalize_media_source, resolve_media_identity
-from app.foundation import temporal as time_tools
 
-BANGUMI_MOVIE_PLATFORMS = frozenset({"movie", "电影", "剧场版"})
-ANILIST_MOVIE_FORMATS = frozenset({"MOVIE"})
-ANILIST_CHINESE_TITLE_PATTERN = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
-ANILIST_JAPANESE_KANA_PATTERN = re.compile(r"[\u3040-\u30ff]")
-_tmdb_image_url_builder: Callable[[str], Optional[str]] = lambda path: path
+
+class _LyricsfileSafeLoader(yaml.SafeLoader):  # type: ignore[misc]
+    """在 SafeLoader 基础上拒绝 Lyricsfile 规范禁止的重复映射键。"""
+
+    def construct_mapping(
+        self, node: MappingNode, deep: bool = False
+    ) -> dict[Any, Any]:
+        """构造映射并在解析阶段拒绝重复键。"""
+        if not isinstance(node, MappingNode):
+            raise ConstructorError(None, None, "Lyricsfile 映射节点无效", node.start_mark)
+        keys = set()
+        for key_node, _value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            try:
+                duplicated = key in keys
+            except TypeError as err:
+                raise ConstructorError(None, None, "Lyricsfile 映射键必须可哈希", key_node.start_mark) from err
+            if duplicated:
+                raise ConstructorError(None, None, f"Lyricsfile 存在重复键：{key}", key_node.start_mark)
+            keys.add(key)
+        return typing.cast(
+            dict[Any, Any], super().construct_mapping(node, deep=deep)
+        )
 
 
 def configure_tmdb_image_url_builder(
     builder: Callable[[str], Optional[str]],
 ) -> None:
-    """注入 TMDB 图片地址构造器，领域模型不直接读取平台配置。"""
-    global _tmdb_image_url_builder
-    _tmdb_image_url_builder = builder
+    """兼容旧入口，将 TMDB 图片地址构造器交给来源投影 owner。"""
+    from app.domain.projection.tmdb import configure_image_url_builder
+
+    configure_image_url_builder(builder)
+
+
+def _project_tmdb(
+    state: Mapping[str, Any],
+    info: Mapping[str, Any],
+) -> dict[str, Any]:
+    """按需加载 TMDB 投影 owner，避免领域上下文冷导入全部来源实现。"""
+    from app.domain.projection.tmdb import project
+
+    return project(state, info)
+
+
+def _project_douban(
+    state: Mapping[str, Any],
+    info: Mapping[str, Any],
+) -> dict[str, Any]:
+    """按需加载豆瓣投影 owner，避免领域上下文冷导入全部来源实现。"""
+    from app.domain.projection.douban import project
+
+    return project(state, info)
+
+
+def _project_bangumi(
+    state: Mapping[str, Any],
+    info: Mapping[str, Any],
+) -> dict[str, Any]:
+    """按需加载 Bangumi 投影 owner，避免领域上下文冷导入全部来源实现。"""
+    from app.domain.projection.bangumi import project
+
+    return project(state, info)
+
+
+def _project_anilist(
+    state: Mapping[str, Any],
+    info: Mapping[str, Any],
+) -> dict[str, Any]:
+    """按需加载 AniList 投影 owner，避免领域上下文冷导入全部来源实现。"""
+    from app.domain.projection.anilist import project
+
+    return project(state, info)
 
 
 def _validate_music_type(value: object) -> None:
@@ -70,7 +135,7 @@ def _music_optional_int(value: object) -> int | None:
     if value in {None, ""}:
         return None
     try:
-        return int(value)
+        return int(str(value))
     except (TypeError, ValueError):
         return None
 
@@ -80,7 +145,7 @@ def _music_optional_float(value: object) -> float:
     if value in {None, ""}:
         return 0.0
     try:
-        return float(value)
+        return float(str(value))
     except (TypeError, ValueError):
         return 0.0
 
@@ -99,13 +164,44 @@ def _music_init_values(model: type, data: dict[str, Any]) -> dict[str, Any]:
 
 @dataclass
 class MusicLyrics:
-    """标准化单曲歌词，区分同步歌词、纯文本歌词和纯音乐结果。"""
+    """标准化单曲歌词候选，保留来源匹配度和 Lyricsfile 原始内容。"""
 
     provider: str
     provider_id: str | None = None
     instrumental: bool = False
     plain_lyrics: str | None = None
     synced_lyrics: str | None = None
+    lyricsfile: str | None = None
+    language: str | None = None
+    match_score: int = 0
+    provider_priority: int = 0
+
+    _lyricsfile_max_bytes = 1024 * 1024
+    _lyricsfile_max_lines = 10000
+    _lyricsfile_max_nodes = 50000
+    _lyricsfile_max_depth = 20
+
+    def __post_init__(self) -> None:
+        """补全 Lyricsfile 中可安全降级为 LRC 或纯文本的内容。"""
+        if not self.lyricsfile:
+            return
+        parsed = self._parse_lyricsfile(self.lyricsfile)
+        if not parsed:
+            return
+        metadata_value = parsed.get("metadata")
+        metadata: dict[str, Any] = (
+            metadata_value if isinstance(metadata_value, dict) else {}
+        )
+        self.instrumental = self.instrumental or bool(
+            metadata.get("instrumental", parsed.get("instrumental"))
+        )
+        self.language = self.language or self._optional_text(
+            metadata.get("language", parsed.get("language"))
+        )
+        if not self.synced_lyrics:
+            self.synced_lyrics = self._lyricsfile_to_lrc(parsed)
+        if not self.plain_lyrics:
+            self.plain_lyrics = self._lyricsfile_to_plain(parsed)
 
     @property
     def content(self) -> str | None:
@@ -120,6 +216,188 @@ class MusicLyrics:
         if self.plain_lyrics:
             return ".txt"
         return None
+
+    @property
+    def quality_rank(self) -> int:
+        """返回可比较的歌词质量等级，逐字同步高于逐行同步和纯文本。"""
+        if self.lyricsfile and self._lyricsfile_has_words(self.lyricsfile):
+            return 4
+        if self.synced_lyrics:
+            return 3
+        if self.plain_lyrics:
+            return 1
+        if self.instrumental:
+            return 1
+        return 0
+
+    @property
+    def identity_key(self) -> tuple[str, str, str]:
+        """构造候选去重键，兼容未提供来源 ID 的插件结果。"""
+        return (
+            self.provider.casefold(),
+            self.provider_id or "",
+            self.content or self.lyricsfile or "",
+        )
+
+    @classmethod
+    def _parse_lyricsfile(cls, content: str) -> dict[str, Any] | None:
+        """安全解析受大小和行数约束的 Lyricsfile YAML，并拒绝锚点别名。"""
+        if len(content.encode("utf-8")) > cls._lyricsfile_max_bytes:
+            return None
+        try:
+            if any(isinstance(event, AliasEvent) for event in yaml.parse(content)):
+                return None
+            payload = yaml.load(content, Loader=_LyricsfileSafeLoader)
+        except yaml.YAMLError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("version") != "1.0" or not isinstance(payload.get("metadata"), dict):
+            return None
+        if not cls._lyricsfile_value_is_safe(payload):
+            return None
+        lines = payload.get("lines")
+        if isinstance(lines, list) and len(lines) > cls._lyricsfile_max_lines:
+            return None
+        return payload if cls._lyricsfile_structure_is_valid(payload) else None
+
+    @classmethod
+    def _lyricsfile_structure_is_valid(cls, payload: dict[str, Any]) -> bool:
+        """校验 Lyricsfile 1.0 的必需元数据、歌词形状和毫秒时间范围。"""
+        metadata = payload.get("metadata")
+        if not isinstance(metadata, dict):
+            return False
+        if not cls._optional_text(metadata.get("title")) or not cls._optional_text(metadata.get("artist")):
+            return False
+        lines = payload.get("lines")
+        plain = payload.get("plain")
+        if lines is not None and not isinstance(lines, list):
+            return False
+        if plain is not None and not isinstance(plain, str):
+            return False
+        if metadata.get("instrumental") is True:
+            return not lines and not str(plain or "").strip()
+        if not lines and not str(plain or "").strip():
+            return False
+        return all(cls._lyricsfile_line_is_valid(line) for line in lines or [])
+
+    @classmethod
+    def _lyricsfile_line_is_valid(cls, line: Any) -> bool:
+        """校验单行与逐字时间戳，拒绝布尔值伪装整数和倒序区间。"""
+        if not isinstance(line, dict) or not isinstance(line.get("text"), str):
+            return False
+        start = line.get("start_ms")
+        end = line.get("end_ms")
+        if isinstance(start, bool) or not isinstance(start, int) or start < 0:
+            return False
+        if end is not None and (
+                isinstance(end, bool) or not isinstance(end, int) or end < start
+        ):
+            return False
+        words = line.get("words")
+        if words is None:
+            return True
+        if not isinstance(words, list):
+            return False
+        for word in words:
+            if not isinstance(word, dict) or not isinstance(word.get("text"), str):
+                return False
+            word_start = word.get("start_ms")
+            word_end = word.get("end_ms")
+            if isinstance(word_start, bool) or not isinstance(word_start, int) or word_start < 0:
+                return False
+            if word_end is not None and (
+                    isinstance(word_end, bool)
+                    or not isinstance(word_end, int)
+                    or word_end < word_start
+            ):
+                return False
+        return True
+
+    @classmethod
+    def _lyricsfile_value_is_safe(cls, value: Any, depth: int = 0, count: Optional[list[int]] = None) -> bool:
+        """限制 YAML 解析后的类型、深度和节点数，避免外部文档消耗过量资源。"""
+        if depth > cls._lyricsfile_max_depth:
+            return False
+        counter = count if count is not None else [0]
+        counter[0] += 1
+        if counter[0] > cls._lyricsfile_max_nodes:
+            return False
+        if value is None or isinstance(value, (str, int, bool)):
+            return True
+        if isinstance(value, list):
+            return all(cls._lyricsfile_value_is_safe(item, depth + 1, counter) for item in value)
+        if isinstance(value, dict):
+            return all(
+                isinstance(key, str)
+                and cls._lyricsfile_value_is_safe(item, depth + 1, counter)
+                for key, item in value.items()
+            )
+        return False
+
+    @classmethod
+    def _lyricsfile_has_words(cls, content: str) -> bool:
+        """判断 Lyricsfile 是否包含逐字时间轴。"""
+        payload = cls._parse_lyricsfile(content)
+        return bool(
+            payload
+            and any(
+                isinstance(line, dict) and isinstance(line.get("words"), list)
+                for line in payload.get("lines") or []
+            )
+        )
+
+    @staticmethod
+    def _optional_text(value: Any) -> str | None:
+        """把可选标量规范化为非空文本。"""
+        text = str(value or "").strip()
+        return text or None
+
+    @classmethod
+    def _lyricsfile_to_plain(cls, payload: dict[str, Any]) -> str | None:
+        """从 Lyricsfile plain 或时间行生成播放器可读纯文本。"""
+        plain = cls._optional_text(payload.get("plain"))
+        if plain:
+            return plain
+        texts = []
+        for line in payload.get("lines") or []:
+            if not isinstance(line, dict):
+                continue
+            text = cls._optional_text(line.get("text"))
+            if not text and isinstance(line.get("words"), list):
+                text = "".join(
+                    str(word.get("text") or "")
+                    for word in line["words"]
+                    if isinstance(word, dict)
+                ).strip() or None
+            if text:
+                texts.append(text)
+        return "\n".join(texts) or None
+
+    @classmethod
+    def _lyricsfile_to_lrc(cls, payload: dict[str, Any]) -> str | None:
+        """把 Lyricsfile 行级毫秒时间轴转换为通用 LRC。"""
+        output = []
+        for line in payload.get("lines") or []:
+            if not isinstance(line, dict):
+                continue
+            start_ms = _music_optional_int(line.get("start_ms"))
+            if start_ms is None:
+                continue
+            start_ms = max(start_ms, 0)
+            text = cls._optional_text(line.get("text"))
+            if not text and isinstance(line.get("words"), list):
+                text = "".join(
+                    str(word.get("text") or "")
+                    for word in line["words"]
+                    if isinstance(word, dict)
+                ).strip() or None
+            if not text:
+                continue
+            minutes, remainder = divmod(start_ms, 60000)
+            seconds = remainder / 1000
+            output.append(f"[{minutes:02d}:{seconds:05.2f}]{text}")
+        return "\n".join(output) or None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Self:
@@ -339,7 +617,7 @@ class MusicInfo:
             artists=list(meta.artists),
             album=meta.album,
             album_artist=meta.album_artist,
-            year=meta.year,
+            year=_music_optional_int(meta.year),
             disc_number=meta.disc_number,
             track_number=meta.track_number,
             total_tracks=meta.total_tracks,
@@ -812,7 +1090,7 @@ class TorrentInfo:
             print(f"种子发布时间获取失败: {e}")
             return 0
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         """
         返回字典
         """
@@ -903,7 +1181,7 @@ class SubtitleInfo:
         for key, value in data.items():
             setattr(self, key, value)
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         """
         返回字典。
         """
@@ -1098,594 +1376,54 @@ class MediaInfo:
         """
         self.category = cat or ""
 
+    def _apply_source_projection(self, values: dict[str, Any]) -> None:
+        """把来源 owner 返回的字段映射应用到当前领域对象。"""
+        for name, value in values.items():
+            setattr(self, name, value)
+
     def set_tmdb_info(self, info: dict):
-        """
-        初始化媒信息
-        """
-
-        def __directors_actors(tmdbinfo: dict) -> Tuple[List[dict], List[dict]]:
-            """
-            查询导演和演员
-            :param tmdbinfo: TMDB元数据
-            :return: 导演列表，演员列表
-            """
-            """
-            "cast": [
-              {
-                "adult": false,
-                "gender": 2,
-                "id": 3131,
-                "known_for_department": "Acting",
-                "name": "Antonio Banderas",
-                "original_name": "Antonio Banderas",
-                "popularity": 60.896,
-                "profile_path": "/iWIUEwgn2KW50MssR7tdPeFoRGW.jpg",
-                "cast_id": 2,
-                "character": "Puss in Boots (voice)",
-                "credit_id": "6052480e197de4006bb47b9a",
-                "order": 0
-              }
-            ],
-            "crew": [
-              {
-                "adult": false,
-                "gender": 2,
-                "id": 5524,
-                "known_for_department": "Production",
-                "name": "Andrew Adamson",
-                "original_name": "Andrew Adamson",
-                "popularity": 9.322,
-                "profile_path": "/qqIAVKAe5LHRbPyZUlptsqlo4Kb.jpg",
-                "credit_id": "63b86b2224b33300a0585bf1",
-                "department": "Production",
-                "job": "Executive Producer"
-              }
-            ]
-            """
-            if not tmdbinfo:
-                return [], []
-            _credits = tmdbinfo.get("credits")
-            if not _credits:
-                return [], []
-            directors = []
-            actors = []
-            for cast in _credits.get("cast") or []:
-                if cast.get("known_for_department") == "Acting":
-                    actors.append(cast)
-            for crew in _credits.get("crew") or []:
-                if crew.get("job") in ["Director", "Writer", "Editor", "Producer"]:
-                    directors.append(crew)
-            return directors, actors
-
-        if not info:
-            return
-        # 来源
-        self.media_source = MediaSource.TMDB
-        # 本体
-        self.tmdb_info = info
-        # 类型
-        if isinstance(info.get('media_type'), MediaType):
-            self.type = info.get('media_type')
-        elif info.get('media_type'):
-            self.type = MediaType.MOVIE if info.get("media_type") == "movie" else MediaType.TV
-        else:
-            self.type = MediaType.MOVIE if info.get("title") else MediaType.TV
-        # 当前来源原生 ID
-        self.media_id = str(info.get('id')) if info.get('id') is not None else None
-        self.tmdb_id = info.get('id')
-        if not self.media_id:
-            return
-        if info.get("external_ids"):
-            self.tvdb_id = info.get("external_ids", {}).get("tvdb_id")
-            self.imdb_id = info.get("external_ids", {}).get("imdb_id")
-        # 合集ID
-        self.collection_id = info.get('collection_id')
-        # 评分
-        self.vote_average = round(float(info.get('vote_average')), 1) if info.get('vote_average') else 0
-        # 描述
-        self.overview = info.get('overview')
-        # 风格
-        self.genre_ids = info.get('genre_ids') or []
-        # 原语种
-        self.original_language = info.get('original_language')
-        # 英文标题
-        self.en_title = info.get('en_title')
-        # 香港标题
-        self.hk_title = info.get('hk_title')
-        # 台湾标题
-        self.tw_title = info.get('tw_title')
-        # 新加坡标题
-        self.sg_title = info.get('sg_title')
-        if self.type == MediaType.MOVIE:
-            # 标题
-            self.title = info.get('title')
-            # 原标题
-            self.original_title = info.get('original_title')
-            # 发行日期
-            self.release_date = info.get('release_date')
-            if self.release_date:
-                # 年份
-                self.year = self.release_date[:4]
-            # 所有发行日期
-            self.release_dates = [
-                {
-                    "date": release_date.get("release_date"),
-                    "iso_code": result.get("iso_3166_1"),
-                    "note": release_date.get("note"),
-                    "type": release_date.get("type"),
-                }
-                for result in info.get("release_dates", {}).get("results", [])
-                for release_date in result.get("release_dates", [])
-                if release_date.get("release_date")
-            ]
-        else:
-            # 电视剧
-            self.title = info.get('name')
-            # 原标题
-            self.original_title = info.get('original_name')
-            # 发行日期
-            self.release_date = info.get('first_air_date')
-            if self.release_date:
-                # 年份
-                self.year = self.release_date[:4]
-            # 季集信息
-            if info.get('seasons'):
-                self.season_info = info.get('seasons')
-                for seainfo in info.get('seasons'):
-                    # 季
-                    season = seainfo.get("season_number")
-                    if season is None:
-                        continue
-                    # 集
-                    episode_count = seainfo.get("episode_count")
-                    self.seasons[season] = list(range(1, episode_count + 1))
-                    # 年份
-                    air_date = seainfo.get("air_date")
-                    if air_date:
-                        self.season_years[season] = air_date[:4]
-            # 剧集组
-            if info.get("episode_groups"):
-                self.episode_groups = info.pop("episode_groups").get("results") or []
-
-        # 海报
-        if path := info.get('poster_path'):
-            self.poster_path = _tmdb_image_url_builder(path)
-        # 背景
-        if path := info.get('backdrop_path'):
-            self.backdrop_path = _tmdb_image_url_builder(path)
-        # 导演和演员
-        self.directors, self.actors = __directors_actors(info)
-        # 别名和译名
-        self.names = info.get('names') or []
-        # 剩余属性赋值
-        for key, value in info.items():
-            if not value:
-                continue
-            if not hasattr(self, key):
-                continue
-            current_value = getattr(self, key)
-            if current_value:
-                continue
-            if current_value is None:
-                setattr(self, key, value)
-            elif type(current_value) is type(value):
-                setattr(self, key, value)
+        """通过 TMDB 来源 owner 初始化统一媒体字段。"""
+        self._apply_source_projection(_project_tmdb(vars(self), info))
 
     def set_douban_info(self, info: dict):
-        """
-        初始化豆瓣信息
-        """
-        if not info:
-            return
-        # 来源
-        self.media_source = MediaSource.Douban
-        # 本体
-        self.douban_info = info
-        # 豆瓣ID
-        self.media_id = str(info.get("id")) if info.get("id") is not None else None
-        self.douban_id = self.media_id
-        # 类型
-        if not self.type:
-            if isinstance(info.get('media_type'), MediaType):
-                self.type = info.get('media_type')
-            elif info.get("subtype"):
-                self.type = MediaType.MOVIE if info.get("subtype") == "movie" else MediaType.TV
-            elif info.get("target_type"):
-                self.type = MediaType.MOVIE if info.get("target_type") == "movie" else MediaType.TV
-            elif info.get("type_name"):
-                self.type = MediaType(info.get("type_name"))
-            elif info.get("uri"):
-                self.type = MediaType.MOVIE if "/movie/" in info.get("uri") else MediaType.TV
-            elif info.get("type") and info.get("type") in ["movie", "tv"]:
-                self.type = MediaType.MOVIE if info.get("type") == "movie" else MediaType.TV
-        # 标题
-        if not self.title:
-            self.title = info.get("title")
-        # 英文标题，暂时不支持
-        if not self.en_title:
-            self.en_title = info.get('original_title')
-        # 原语种标题
-        if not self.original_title:
-            self.original_title = info.get("original_title")
-        # 年份
-        if not self.year:
-            self.year = info.get("year")[:4] if info.get("year") else None
-            if not self.year and info.get("extra"):
-                self.year = info.get("extra").get("year")
-        # 识别标题中的季
-        meta = MetaInfo(info.get("title"))
-        # 季
-        if self.season is None:
-            self.season = meta.begin_season
-            if self.season is not None:
-                self.type = MediaType.TV
-            elif not self.type:
-                self.type = MediaType.MOVIE
-        # 评分
-        if not self.vote_average:
-            rating = info.get("rating")
-            if rating:
-                vote_average = float(rating.get("value"))
-            else:
-                vote_average = 0
-            self.vote_average = vote_average
-        # 发行日期
-        if not self.release_date:
-            if info.get("release_date"):
-                self.release_date = info.get("release_date")
-            elif info.get("pubdate") and isinstance(info.get("pubdate"), list):
-                release_date = info.get("pubdate")[0]
-                if release_date:
-                    match = re.search(r'\d{4}-\d{2}-\d{2}', release_date)
-                    if match:
-                        self.release_date = match.group()
-        # 海报
-        if not self.poster_path:
-            if info.get("pic"):
-                self.poster_path = info.get("pic", {}).get("large")
-            if not self.poster_path and info.get("cover_url"):
-                # imageView2/0/q/80/w/9999/h/120/format/webp ->  imageView2/1/w/500/h/750/format/webp
-                self.poster_path = re.sub(r'imageView2/\d/q/\d+/w/\d+/h/\d+/format/webp', 'imageView2/1/w/500/h/750/format/webp', info.get("cover_url"))
-            if not self.poster_path and info.get("cover"):
-                if info.get("cover").get("url"):
-                    self.poster_path = info.get("cover").get("url")
-                else:
-                    self.poster_path = info.get("cover").get("large", {}).get("url")
-        # 简介
-        if not self.overview:
-            self.overview = info.get("intro") or info.get("card_subtitle") or ""
-            if not self.overview:
-                if info.get("extra", {}).get("info"):
-                    extra_info = info.get("extra").get("info")
-                    if extra_info:
-                        self.overview = "，".join(["：".join(item) for item in extra_info])
-        # 从简介中提取年份
-        if self.overview and not self.year:
-            match = re.search(r'\d{4}', self.overview)
-            if match:
-                self.year = match.group()
-        # 导演和演员
-        if not self.directors:
-            self.directors = info.get("directors") or []
-        if not self.actors:
-            self.actors = info.get("actors") or []
-        # 别名
-        if not self.names:
-            akas = info.get("aka")
-            if akas:
-                self.names = [re.sub(r'\([港台豆友译名]+\)', "", aka) for aka in akas]
-        # 剧集
-        if self.type == MediaType.TV and not self.seasons:
-            meta = MetaInfo(info.get("title"))
-            season = meta.begin_season if meta.begin_season is not None else 1
-            episodes_count = info.get("episodes_count")
-            if episodes_count:
-                self.seasons[season] = list(range(1, episodes_count + 1))
-        # 季年份
-        if self.type == MediaType.TV and not self.season_years:
-            season = self.season if self.season is not None else 1
-            self.season_years = {
-                season: self.year
-            }
-        # 风格
-        if not self.genres:
-            self.genres = [{"id": genre, "name": genre} for genre in info.get("genres") or []]
-        # 时长
-        if not self.runtime and info.get("durations"):
-            # 查找数字
-            match = re.search(r'\d+', info.get("durations")[0])
-            if match:
-                self.runtime = int(match.group())
-        # 国家
-        if not self.production_countries:
-            self.production_countries = [{"id": country, "name": country} for country in info.get("countries") or []]
-        # 剩余属性赋值
-        for key, value in info.items():
-            if not value:
-                continue
-            if not hasattr(self, key):
-                continue
-            current_value = getattr(self, key)
-            if current_value:
-                continue
-            if current_value is None:
-                setattr(self, key, value)
-            elif type(current_value) is type(value):
-                setattr(self, key, value)
+        """通过豆瓣来源 owner 初始化统一媒体字段。"""
+        self._apply_source_projection(_project_douban(vars(self), info))
 
     @staticmethod
     def get_bangumi_media_type(info: dict) -> MediaType:
-        """
-        根据Bangumi媒介平台获取标准媒体类型，未知平台兼容回退为电视剧
+        """兼容旧方法，委托 Bangumi 来源 owner 解析媒体类型。"""
+        from app.domain.projection.bangumi import resolve_media_type
 
-        :param info: Bangumi条目信息
-        :return: 标准媒体类型
-        """
-        platform = str(info.get("platform") or "").strip().casefold()
-        if platform in BANGUMI_MOVIE_PLATFORMS:
-            return MediaType.MOVIE
-        return MediaType.TV
+        return resolve_media_type(info)
 
     def set_bangumi_info(self, info: dict) -> None:
-        """
-        初始化Bangumi信息
-        """
-        if not info:
-            return
-        # 来源
-        self.media_source = MediaSource.Bangumi
-        # 本体
-        self.bangumi_info = info
-        # Bangumi ID
-        self.media_id = str(info.get("id")) if info.get("id") is not None else None
-        self.bangumi_id = info.get("id")
-        # 类型
-        if not self.type:
-            self.type = self.get_bangumi_media_type(info)
-        # 标题
-        if not self.title:
-            self.title = info.get("name_cn") or info.get("name")
-        # 原语种标题
-        if not self.original_title:
-            self.original_title = info.get("name")
-        # 识别标题中的季
-        meta = MetaInfo(self.title)
-        # 季
-        if self.season is None:
-            self.season = meta.begin_season
-        # 评分
-        if not self.vote_average:
-            rating = info.get("rating")
-            if rating:
-                vote_average = float(rating.get("score"))
-            else:
-                vote_average = 0
-            self.vote_average = vote_average
-        # 发行日期
-        if not self.release_date:
-            self.release_date = info.get("date") or info.get("air_date")
-            # 年份
-            if not self.year:
-                self.year = self.release_date[:4] if self.release_date else None
-        # 海报
-        if not self.poster_path:
-            if info.get("images"):
-                self.poster_path = info.get("images", {}).get("large")
-            if not self.poster_path and info.get("image"):
-                self.poster_path = info.get("image")
-        # 简介
-        if not self.overview:
-            self.overview = info.get("summary")
-        # 别名
-        if not self.names:
-            infobox = info.get("infobox")
-            if infobox:
-                akas = [item.get("value") for item in infobox if item.get("key") == "别名"]
-                if akas:
-                    if isinstance(akas[0], list):
-                        self.names = [aka.get("v") if isinstance(aka, dict) else aka for aka in akas[0]]
-                    elif isinstance(akas[0], str):
-                        self.names = [akas[0]]
-
-        # 剧集
-        if self.type == MediaType.TV and not self.seasons:
-            meta = MetaInfo(self.title)
-            season = meta.begin_season if meta.begin_season is not None else 1
-            episodes_count = info.get("total_episodes") or info.get("eps")
-            # bangumi 返回的集数可能为字符串，统一转整型避免拼接/范围构造异常
-            try:
-                episodes_count = int(episodes_count) if episodes_count else 0
-            except (TypeError, ValueError):
-                episodes_count = 0
-            if episodes_count:
-                self.seasons[season] = list(range(1, episodes_count + 1))
-                self.number_of_episodes = episodes_count
-                self.number_of_seasons = 1
-        # 风格
-        if not self.genres:
-            self.genres = [
-                {"id": tag.get("name"), "name": tag.get("name")}
-                for tag in info.get("tags") or []
-                if tag.get("name")
-            ]
-        # 制作公司与导演
-        if info.get("infobox"):
-            companies = []
-            directors = []
-            for item in info.get("infobox"):
-                values = item.get("value")
-                if not isinstance(values, list):
-                    values = [values]
-                normalized_values = [
-                    value.get("v") if isinstance(value, dict) else value
-                    for value in values
-                    if value
-                ]
-                if item.get("key") in {"动画制作", "制作"}:
-                    companies.extend({"name": value} for value in normalized_values)
-                elif item.get("key") == "导演":
-                    directors.extend({"name": value} for value in normalized_values)
-            if companies and not self.production_companies:
-                self.production_companies = companies
-            if directors and not self.directors:
-                self.directors = directors
-        # 演员
-        if not self.actors:
-            self.actors = info.get("actors") or []
+        """通过 Bangumi 来源 owner 初始化统一媒体字段。"""
+        self._apply_source_projection(_project_bangumi(vars(self), info))
 
     @staticmethod
     def get_anilist_media_type(info: dict) -> MediaType:
-        """
-        根据 AniList 发布格式获取标准媒体类型。
+        """兼容旧方法，委托 AniList 来源 owner 解析媒体类型。"""
+        from app.domain.projection.anilist import resolve_media_type
 
-        :param info: AniList 媒体信息
-        :return: 标准媒体类型
-        """
-        return (
-            MediaType.MOVIE
-            if str(info.get("format") or "").upper() in ANILIST_MOVIE_FORMATS
-            else MediaType.TV
-        )
+        return resolve_media_type(info)
 
     @staticmethod
     def _anilist_date(date_info: dict) -> Optional[str]:
-        """
-        将 AniList 模糊日期转换为标准日期文本。
+        """兼容旧私有补丁点，委托 AniList owner 格式化模糊日期。"""
+        from app.domain.projection.anilist import format_date
 
-        :param date_info: AniList FuzzyDate 字段
-        :return: YYYY、YYYY-MM 或 YYYY-MM-DD 日期文本
-        """
-        if not date_info or not date_info.get("year"):
-            return None
-        values = [str(date_info.get("year"))]
-        if date_info.get("month"):
-            values.append(str(date_info.get("month")).zfill(2))
-        if date_info.get("day"):
-            values.append(str(date_info.get("day")).zfill(2))
-        return "-".join(values)
+        return format_date(date_info)
 
     @staticmethod
     def _anilist_chinese_title(info: dict) -> Optional[str]:
-        """
-        从 anilist-chinese 注入的标题和别名中选择中文标题。
+        """兼容旧私有补丁点，委托 AniList owner 选择中文标题。"""
+        from app.domain.projection.anilist import select_chinese_title
 
-        :param info: AniList 媒体信息
-        :return: 中文标题，未找到时返回 None
-        """
-        translated_title = (info.get("title") or {}).get("chinese")
-        if not translated_title:
-            return None
-        if (
-            ANILIST_CHINESE_TITLE_PATTERN.search(str(translated_title))
-            and not ANILIST_JAPANESE_KANA_PATTERN.search(str(translated_title))
-        ):
-            return str(translated_title)
-        for synonym in reversed(info.get("synonyms") or []):
-            if (
-                ANILIST_CHINESE_TITLE_PATTERN.search(str(synonym))
-                and not ANILIST_JAPANESE_KANA_PATTERN.search(str(synonym))
-            ):
-                return str(synonym)
-        return str(translated_title)
+        return select_chinese_title(info)
 
     def set_anilist_info(self, info: dict) -> None:
-        """
-        初始化 AniList 媒体信息。
-
-        :param info: AniList 媒体详情
-        """
-        if not info:
-            return
-        self.media_source = MediaSource.AniList
-        self.anilist_info = info
-        self.media_id = str(info.get("id")) if info.get("id") is not None else None
-        self.anilist_id = info.get("id")
-        self.type = self.type or self.get_anilist_media_type(info)
-
-        titles = info.get("title") or {}
-        self.title = (
-            self.title
-            or self._anilist_chinese_title(info)
-            or titles.get("native")
-            or titles.get("romaji")
-            or titles.get("english")
-        )
-        self.en_title = self.en_title or titles.get("english")
-        self.original_title = self.original_title or titles.get("native") or titles.get("romaji")
-        self.names = list(
-            dict.fromkeys(
-                value
-                for value in [
-                    titles.get("english"),
-                    titles.get("romaji"),
-                    titles.get("native"),
-                    *(info.get("synonyms") or []),
-                ]
-                if value and value != self.title
-            )
-        )
-
-        self.release_date = self.release_date or self._anilist_date(info.get("startDate") or {})
-        self.first_air_date = self.first_air_date or self.release_date
-        self.last_air_date = self.last_air_date or self._anilist_date(info.get("endDate") or {})
-        self.year = self.year or (
-            str(info.get("startDate", {}).get("year"))
-            if info.get("startDate", {}).get("year")
-            else str(info.get("seasonYear")) if info.get("seasonYear") else None
-        )
-
-        cover = info.get("coverImage") or {}
-        self.poster_path = self.poster_path or cover.get("extraLarge") or cover.get("large")
-        self.backdrop_path = self.backdrop_path or info.get("bannerImage")
-        self.overview = self.overview or re.sub(
-            r"<[^>]+>",
-            "",
-            str(info.get("description") or "").replace("<br>", "\n").replace("<br />", "\n"),
-        ).strip()
-        self.vote_average = self.vote_average or (
-            round(float(info.get("averageScore")) / 10, 1)
-            if info.get("averageScore") is not None
-            else 0
-        )
-        self.popularity = self.popularity or info.get("popularity")
-        self.runtime = self.runtime or info.get("duration")
-        self.adult = self.adult or bool(info.get("isAdult"))
-        self.status = self.status or info.get("status")
-        self.original_language = self.original_language or (
-            "ja" if info.get("countryOfOrigin") == "JP" else None
-        )
-        self.origin_country = self.origin_country or (
-            [info.get("countryOfOrigin")] if info.get("countryOfOrigin") else []
-        )
-        self.production_companies = self.production_companies or [
-            {"name": studio.get("name")}
-            for studio in info.get("studios", {}).get("nodes") or []
-            if studio.get("name")
-        ]
-        self.genres = self.genres or [
-            {"id": genre, "name": genre} for genre in info.get("genres") or []
-        ]
-        self.actors = self.actors or info.get("actors") or []
-        self.directors = self.directors or info.get("directors") or []
-
-        if self.season is None:
-            self.season = MetaInfo(self.title).begin_season if self.title else None
-        episodes_count = info.get("episodes")
-        if self.type == MediaType.TV and episodes_count:
-            season = self.season if self.season is not None else 1
-            self.seasons[season] = list(range(1, episodes_count + 1))
-            self.number_of_episodes = episodes_count
-            self.number_of_seasons = 1
-            if self.year:
-                self.season_years[season] = self.year
-
-        for external_link in info.get("externalLinks") or []:
-            if str(external_link.get("site") or "").casefold() != "anidb":
-                continue
-            match = re.search(r"\d+", external_link.get("url") or "")
-            if match:
-                self.anidb_id = int(match.group())
-                break
+        """通过 AniList 来源 owner 初始化统一媒体字段。"""
+        self._apply_source_projection(_project_anilist(vars(self), info))
 
     @property
     def title_year(self):
@@ -1834,10 +1572,12 @@ class Context:
     media_info_is_target: bool = False
     # 调用方对本候选允许下载的剧集集合，None 表示不限制，空集合表示拒绝交付任何集。
     allowed_episodes: Optional[Set[int]] = None
+    # 下载链实际提交的剧集集合；None 表示尚未执行下载选择。
+    selected_episodes: Optional[List[int]] = None
     # 下载层确认候选资源覆盖完整目标范围，供订阅事实写入判断整包资源。
     confirmed_full_coverage: bool = False
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         """
         转换为字典
         """
@@ -1852,5 +1592,6 @@ class Context:
             "media_info_is_target": self.media_info_is_target,
             # 保留 None / 空集 / 非空集 三态语义，避免下游误把"显式拒绝"当成"不限制"。
             "allowed_episodes": sorted(self.allowed_episodes) if self.allowed_episodes is not None else None,
+            "selected_episodes": self.selected_episodes,
             "confirmed_full_coverage": self.confirmed_full_coverage,
         }

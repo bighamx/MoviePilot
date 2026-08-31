@@ -7,15 +7,15 @@ import hashlib
 import io
 import pickle
 import threading
-from typing import Optional, List, Tuple
+from typing import List, Optional, Tuple
 
 from PIL import Image
 
-from app.runtime.cache import FileCache
-from app.runtime.config import settings
-from app.domain.context import MediaInfo, Context
+from app.adapters.network.http import RequestUtils
+from app.application.messaging.ingress import submit_message_to_host
+from app.domain.context import Context, MediaInfo
 from app.domain.metainfo import MetaInfo
-from app.runtime.log import logger
+from app.foundation import size as size_tools
 from app.modules.qqbot.api import (
     get_access_token,
     get_gateway_url,
@@ -23,8 +23,9 @@ from app.modules.qqbot.api import (
     send_proactive_group_message,
 )
 from app.modules.qqbot.gateway import run_gateway
-from app.adapters.network.http import RequestUtils
-from app.foundation import size as size_tools
+from app.runtime.cache import FileCache
+from app.runtime.log import logger
+from app.runtime.thread import ThreadHelper
 
 # QQ Markdown 图片展示尺寸限制，避免竖版海报被客户端拉伸变形
 _DEFAULT_IMAGE_SIZE: Tuple[int, int] = (208, 320)
@@ -33,6 +34,8 @@ _MAX_IMAGE_SIZE: Tuple[int, int] = (512, 512)
 
 class QQBot:
     """QQ Bot 通知客户端"""
+
+    _gateway_join_timeout_seconds = 20
 
     def __init__(
             self,
@@ -101,20 +104,13 @@ class QQBot:
         except Exception as e:
             logger.debug(f"QQ Bot 保存 known_targets 失败: {e}")
 
-    def _forward_to_message_chain(self, payload: dict) -> None:
-        """直接调用消息链处理，避免 HTTP 开销"""
-
-        def _run():
-            try:
-                # 回调
-                RequestUtils(timeout=15).post_res(
-                    f"http://127.0.0.1:{settings.PORT}/api/v1/message?token={settings.API_TOKEN}&source={self._config_name}",
-                    json=payload
-                )
-            except Exception as e:
-                logger.error(f"QQ Bot 转发消息失败: {e}")
-
-        threading.Thread(target=_run, daemon=True).start()
+    def _forward_to_message_chain(self, payload: dict) -> bool:
+        """通过受管线程池把 QQ Bot 入站 payload 转交统一消息入口。"""
+        return submit_message_to_host(
+            payload,
+            self._config_name,
+            submit=ThreadHelper().submit,
+        )
 
     def _on_gateway_message(self, payload: dict) -> None:
         """Gateway 收到消息时转发至 MP 消息链，并记录发送者用于广播"""
@@ -164,8 +160,8 @@ class QQBot:
         except Exception as e:
             logger.error(f"QQ Bot Gateway 启动失败: {e}")
 
-    def stop(self) -> None:
-        """停止 Gateway 连接"""
+    def stop(self) -> bool:
+        """停止 Gateway 连接，并返回后台线程是否已经终止。"""
         if self._gateway_stop is not None:
             self._gateway_stop.set()
         try:
@@ -173,12 +169,19 @@ class QQBot:
                 self._gateway_ws_holder[0].close()
         except Exception as e:
             logger.debug(f"QQ Bot Gateway WebSocket close: {e}")
-        if self._gateway_thread is not None and self._gateway_thread.is_alive():
-            self._gateway_thread.join(timeout=20)
-            if self._gateway_thread.is_alive():
-                logger.warning(
-                    "QQ Bot Gateway 线程在 stop 后仍未退出，可能存在重复收消息，请重启进程"
-                )
+        gateway_thread = self._gateway_thread
+        if (
+            gateway_thread is not None
+            and gateway_thread.is_alive()
+            and gateway_thread is not threading.current_thread()
+        ):
+            gateway_thread.join(timeout=self._gateway_join_timeout_seconds)
+        if gateway_thread is not None and gateway_thread.is_alive():
+            logger.warning(
+                "QQ Bot Gateway 线程在 stop 后仍未退出，可能存在重复收消息，请重启进程"
+            )
+            return False
+        return True
 
     def get_state(self) -> bool:
         """获取就绪状态"""

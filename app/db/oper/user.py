@@ -1,15 +1,18 @@
 """
 用户数据访问。
 
-认证依赖（get_current_user 等八个）已迁至 app/api/deps.py——那是 HTTP 层的关注点，
-产出 403/400 而非数据。本模块只保留 UserOper。
+认证依赖已迁至 app/api/dependencies/auth.py——那是 HTTP 层的关注点，
+产出认证与授权错误而非数据。本模块只保留 UserOper。
 
 这里不为那八个名字留惰性转发，否则会把
-app.db.oper.user -> app.api.deps -> app.application.security 这条边永久焊进依赖图，
+app.db.oper.user -> app.api.dependencies.auth -> app.application.security 这条边永久焊进依赖图，
 让数据访问模块在静态分析里牵着整个鉴权栈。仓外插件的旧 ``app.db.user_oper`` 路径由
 runtime 兼容映射指向 SDK 薄门面；canonical 数据访问模块仍只依赖模型，不承担兼容职责。
 """
 from typing import List, Optional
+
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
 from app.db.base import DbOper
 from app.db.models.user import User
@@ -24,70 +27,110 @@ class UserOper(DbOper):
         """
         获取用户列表
         """
-        return User.list(self._db)
+        return self._execute_sync_query(User.list)
 
     def add(self, **kwargs):
         """
         新增用户
         """
         user = User(**kwargs)
-        user.create(self._db)
+        self._stage_create(user)
 
     def get_by_name(self, name: str) -> Optional[User]:
         """
         根据用户名获取用户
         """
-        return User.get_by_name(self._db, name)
+        return self._execute_sync_query(
+            lambda session: User.get_by_name(session, name)
+        )
 
     def get_by_id(self, user_id: int) -> Optional[User]:
         """按 ID 获取用户。"""
-        return User.get_by_id(self._db, user_id)
+        return self._execute_sync_query(
+            lambda session: User.get_by_id(session, user_id)
+        )
 
     async def async_list(self) -> List[User]:
         """异步获取用户列表。"""
-        return await User.async_list(self._db)
+        return await self._execute_async_query(User.async_list)
 
     async def async_create(self, payload: dict) -> Optional[User]:
         """异步创建用户。"""
-        return await User(**payload).async_create(self._db)
+        user = User(**payload)
+
+        async def stage(session: AsyncSession) -> User:
+            """在当前异步事务中暂存用户并分配主键。"""
+            session.add(user)
+            await session.flush()
+            return user
+
+        return await self._execute_async_write(stage)
 
     async def async_update(self, user_id: int, payload: dict) -> Optional[User]:
         """异步更新用户。"""
         user = await self.async_get_by_id(user_id)
         if user:
-            await user.async_update(self._db, payload)
+            async def stage(session: AsyncSession) -> User:
+                """在当前事务中更新用户字段，必要时重新附加游离对象。"""
+                for key, value in payload.items():
+                    setattr(user, key, value)
+                return await session.merge(user)
+
+            await self._execute_async_write(stage)
         return user
 
-    async def async_delete(self, user_id: int) -> None:
+    async def async_delete(self, user_id: int) -> bool:
         """异步删除用户。"""
-        await User.async_delete_by_id(self._db, user_id)
+        return bool(await self._execute_async_write(
+            lambda session: User.async_delete_by_id(session, user_id)
+        ))
+
+    async def async_delete_by_name(self, name: str) -> bool:
+        """在独立异步事务中按用户名删除用户。"""
+        return bool(await self._execute_async_write(
+            lambda session: User().async_delete_by_name(session, name)
+        ))
 
     async def async_update_otp_by_name(
         self,
         name: str,
         otp: bool,
         secret: str,
-    ) -> None:
+    ) -> bool:
         """异步更新用户 OTP 状态。"""
-        await User.async_update_otp_by_name(self._db, name, otp, secret)
+        return bool(await self._execute_async_write(
+            lambda session: User.async_update_otp_by_name(
+                session, name, otp, secret
+            )
+        ))
 
     async def async_get_by_name(self, name: str) -> Optional[User]:
         """
         异步根据用户名获取用户。
         """
-        return await User.async_get_by_name(self._db, name)
+        async def query(session: AsyncSession) -> Optional[User]:
+            """在调用方异步会话中执行用户名查询。"""
+            result = await session.execute(select(User).where(User.name == name))
+            return result.scalars().first()
+
+        return await self._execute_async_query(query)
 
     async def async_get_by_id(self, user_id: int) -> Optional[User]:
         """
         异步根据用户 ID 获取用户。
         """
-        return await User.async_get_by_id(self._db, user_id)
+        async def query(session: AsyncSession) -> Optional[User]:
+            """在调用方异步会话中执行用户 ID 查询。"""
+            result = await session.execute(select(User).where(User.id == user_id))
+            return result.scalars().first()
+
+        return await self._execute_async_query(query)
 
     def get_permissions(self, name: str) -> dict:
         """
         获取用户权限
         """
-        user = User.get_by_name(self._db, name)
+        user = self.get_by_name(name)
         if user:
             return user.permissions or {}
         return {}
@@ -96,7 +139,7 @@ class UserOper(DbOper):
         """
         获取用户个性化设置，返回None表示用户不存在
         """
-        user = User.get_by_name(self._db, name)
+        user = self.get_by_name(name)
         if user:
             return user.settings or {}
         return None

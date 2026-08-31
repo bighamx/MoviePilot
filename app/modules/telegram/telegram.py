@@ -6,7 +6,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
-from urllib.parse import urljoin, quote
+from urllib.parse import urljoin
 
 from app.modules.telegram.compat import ensure_urllib3_header_param_compat
 
@@ -19,12 +19,14 @@ from telebot.types import (  # noqa: E402
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     InputMediaPhoto,
+    InputRichMessage as TelebotInputRichMessage,
+    ReplyParameters,
 )
 try:
     from telebot.types import ForceReply  # noqa: E402
 except ImportError:
     ForceReply = None
-from telegramify_markdown import standardize, telegramify  # noqa: E402
+from telegramify_markdown import richify, split_rich, standardize, telegramify  # noqa: E402
 try:
     from telegramify_markdown import entities_to_markdownv2  # noqa: E402
 except ImportError:
@@ -34,10 +36,12 @@ try:
 except ImportError:
     from telegramify_markdown.type import ContentTypes, File, Photo, Text  # noqa: E402
 
-from app.runtime.config import settings  # noqa: E402
+from app.runtime.settings import get_runtime_setting  # noqa: E402
+
 from app.domain.context import MediaInfo, Context  # noqa: E402
 from app.domain.metainfo import MetaInfo  # noqa: E402
 from app.application.image import ImageHelper  # noqa: E402
+from app.application.messaging.ingress import forward_message_to_host  # noqa: E402
 from app.runtime.thread import ThreadHelper  # noqa: E402
 from app.runtime.log import logger  # noqa: E402
 from app.runtime.execution import retry  # noqa: E402
@@ -70,23 +74,16 @@ class Telegram:
     Telegram 消息客户端，负责发送、编辑、接收和转发 Telegram 消息。
     """
 
-    _ds_url = (
-        f"http://127.0.0.1:{settings.PORT}/api/v1/message?token={settings.API_TOKEN}"
-    )
     _bot: TeleBot = None
     _callback_handlers: Dict[str, Callable] = {}  # 存储回调处理器
-    _user_chat_mapping: Dict[
-        str, str
-    ] = {}  # userid -> chat_id mapping for reply targeting
     _bot_username: Optional[str] = None  # Bot username for mention detection
-    _typing_tasks: Dict[str, threading.Thread] = {}  # chat_id -> typing任务
-    _typing_stop_flags: Dict[str, threading.Event] = {}  # chat_id -> 停止信号
-    _typing_lock = threading.RLock()
     _typing_interval_seconds = 5
     _typing_initial_delay_seconds = 1
     _typing_max_duration_seconds = 10 * 60
     _typing_command_max_duration_seconds = 30
     _typing_callback_max_duration_seconds = 60
+    _typing_join_timeout_seconds = 1
+    _shutdown_timeout_seconds = 10
 
     def __init__(
             self,
@@ -101,6 +98,13 @@ class Telegram:
         self._telegram_token = TELEGRAM_TOKEN
         self._telegram_chat_id = TELEGRAM_CHAT_ID
         self._polling_thread = None
+        # 一个 Telegram 配置对应一个 SDK client，运行状态不能被其他配置共享。
+        self._user_chat_mapping: Dict[str, str] = {}
+        self._typing_tasks: Dict[str, threading.Thread] = {}
+        self._typing_stop_flags: Dict[str, threading.Event] = {}
+        self._typing_lock = threading.RLock()
+        self._typing_lifecycle_lock = threading.RLock()
+        self._typing_accepting = True
         if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
             logger.error("Telegram配置不完整！")
             return
@@ -119,7 +123,7 @@ class Telegram:
                 apihelper.API_URL = "https://api.telegram.org/bot{0}/{1}"
                 apihelper.FILE_URL = "https://api.telegram.org/file/bot{0}/{1}"
                 # 设置代理
-                apihelper.proxy = settings.PROXY
+                apihelper.proxy = get_runtime_setting('PROXY')
             # bot
             _bot = TeleBot(self._telegram_token, parse_mode=TELEGRAM_PARSE_MODE_MARKDOWN)
             # 记录句柄
@@ -133,11 +137,7 @@ class Telegram:
                 logger.error(f"获取bot信息失败: {e}")
                 self._bot_username = None
 
-            # 标记渠道来源
-            if kwargs.get("name"):
-                # URL encode the source name to handle special characters
-                encoded_name = quote(kwargs.get("name"), safe="")
-                self._ds_url = f"{self._ds_url}&source={encoded_name}"
+            self._config_name = kwargs.get("name")
 
             @_bot.message_handler(commands=["start", "help"])
             def send_welcome(message):
@@ -160,10 +160,7 @@ class Telegram:
                     if not payload:
                         logger.warn("Telegram消息序列化失败，跳过转发")
                         return
-                    response = RequestUtils(timeout=15).post_res(
-                        self._ds_url, json=payload
-                    )
-                    if not response or response.status_code >= 400:
+                    if not self._forward_to_message_chain(payload):
                         logger.warn("Telegram消息转发失败")
 
             @_bot.callback_query_handler(func=lambda call: True)
@@ -204,10 +201,7 @@ class Telegram:
                     _bot.answer_callback_query(call.id)
 
                     # 发送给主程序处理
-                    response = RequestUtils(timeout=15).post_res(
-                        self._ds_url, json=callback_json
-                    )
-                    if not response or response.status_code >= 400:
+                    if not self._forward_to_message_chain(callback_json):
                         logger.warn("Telegram按钮回调转发失败")
 
                 except Exception as err:
@@ -227,6 +221,10 @@ class Telegram:
             self._polling_thread = threading.Thread(target=run_polling, daemon=True)
             self._polling_thread.start()
             logger.info("Telegram消息接收服务启动")
+
+    def _forward_to_message_chain(self, payload: dict) -> bool:
+        """把 Telegram SDK 回调同步转交统一消息入口。"""
+        return forward_message_to_host(payload, self._config_name)
 
     @property
     def bot(self):
@@ -486,70 +484,101 @@ class Telegram:
             chat_id: Union[str, int],
             max_duration_seconds: Optional[float] = None,
             initial_delay_seconds: Optional[float] = None,
-    ) -> None:
+    ) -> bool:
         """
-        启动持续发送正在输入状态的任务
+        启动持续发送正在输入状态的任务。
+
+        :return: 是否取得该会话的唯一 typing owner
         """
         chat_id_str = str(chat_id)
-        # 如果已有任务在运行，先停止
-        self._stop_typing_task(chat_id_str)
+        with self._typing_lifecycle_lock:
+            if not self._typing_accepting:
+                logger.debug("Telegram client已停止，拒绝启动typing任务")
+                return False
+            # 如果已有任务在运行，先停止；阻塞的旧 SDK 请求不能被新 owner 覆盖。
+            if not self._stop_typing_task(chat_id_str):
+                logger.warning(
+                    "Telegram typing旧任务尚未结束，拒绝并行启动: chat_id=%s",
+                    chat_id_str,
+                )
+                return False
 
-        # 使用独立 Event 避免同一 chat 新旧 typing 线程互相误改停止标记。
-        stop_event = threading.Event()
-        max_duration = max_duration_seconds or self._typing_max_duration_seconds
-        initial_delay = (
-            self._typing_initial_delay_seconds
-            if initial_delay_seconds is None
-            else max(initial_delay_seconds, 0)
-        )
+            # 使用独立 Event 避免同一 chat 新旧 typing 线程互相误改停止标记。
+            stop_event = threading.Event()
+            max_duration = max_duration_seconds or self._typing_max_duration_seconds
+            initial_delay = (
+                self._typing_initial_delay_seconds
+                if initial_delay_seconds is None
+                else max(initial_delay_seconds, 0)
+            )
 
-        def typing_worker():
-            """延迟首发并定期发送 typing 状态的后台线程。"""
-            started_at = time.monotonic()
-            try:
-                # Telegram 没有撤销 typing 的接口，短响应先等待一小段时间，
-                # 避免回复已经发出后客户端仍残留几秒“正在输入”。
-                if initial_delay and stop_event.wait(initial_delay):
-                    return
-                while not stop_event.is_set():
-                    if time.monotonic() - started_at >= max_duration:
-                        logger.warning(
-                            "Telegram typing状态超过最大续期，自动停止: chat_id=%s",
-                            chat_id_str,
-                        )
-                        break
-                    try:
-                        if self._bot:
-                            self._bot.send_chat_action(chat_id, "typing")
-                    except Exception as e:
-                        logger.debug(f"发送typing状态失败: {e}")
-                    # Telegram 客户端约 5-6 秒后会隐藏 typing，需要周期性续发。
-                    stop_event.wait(self._typing_interval_seconds)
-            finally:
+            def typing_worker():
+                """延迟首发并定期发送 typing 状态的后台线程。"""
+                started_at = time.monotonic()
+                try:
+                    # Telegram 没有撤销 typing 的接口，短响应先等待一小段时间，
+                    # 避免回复已经发出后客户端仍残留几秒“正在输入”。
+                    if initial_delay and stop_event.wait(initial_delay):
+                        return
+                    while not stop_event.is_set():
+                        if time.monotonic() - started_at >= max_duration:
+                            logger.warning(
+                                "Telegram typing状态超过最大续期，自动停止: chat_id=%s",
+                                chat_id_str,
+                            )
+                            break
+                        try:
+                            if self._bot:
+                                self._bot.send_chat_action(chat_id, "typing")
+                        except Exception as e:
+                            logger.debug(f"发送typing状态失败: {e}")
+                        # Telegram 客户端约 5-6 秒后会隐藏 typing，需要周期性续发。
+                        stop_event.wait(self._typing_interval_seconds)
+                finally:
+                    with self._typing_lock:
+                        current = self._typing_tasks.get(chat_id_str)
+                        if current is threading.current_thread():
+                            self._typing_tasks.pop(chat_id_str, None)
+                            self._typing_stop_flags.pop(chat_id_str, None)
+
+            thread = threading.Thread(
+                target=typing_worker,
+                name=f"MoviePilot-TelegramTyping-{chat_id_str}"[:120],
+                daemon=True,
+            )
+            with self._typing_lock:
+                self._typing_stop_flags[chat_id_str] = stop_event
+                self._typing_tasks[chat_id_str] = thread
+                try:
+                    thread.start()
+                except BaseException:
+                    self._typing_stop_flags.pop(chat_id_str, None)
+                    self._typing_tasks.pop(chat_id_str, None)
+                    raise
+            return True
+
+    def _stop_typing_task(self, chat_id: Union[str, int]) -> bool:
+        """
+        停止正在输入状态的任务，并保留尚未结束的 owner。
+
+        :return: 任务是否已经进入终态
+        """
+        chat_id_str = str(chat_id)
+        with self._typing_lifecycle_lock:
+            with self._typing_lock:
+                stop_event = self._typing_stop_flags.get(chat_id_str)
+                task = self._typing_tasks.get(chat_id_str)
+            if stop_event:
+                stop_event.set()
+            if task and task.is_alive() and task is not threading.current_thread():
+                task.join(timeout=self._typing_join_timeout_seconds)
+            task_finished = task is None or not task.is_alive()
+            if task_finished:
                 with self._typing_lock:
-                    current = self._typing_tasks.get(chat_id_str)
-                    if current is threading.current_thread():
+                    if self._typing_tasks.get(chat_id_str) is task:
                         self._typing_tasks.pop(chat_id_str, None)
                         self._typing_stop_flags.pop(chat_id_str, None)
-
-        thread = threading.Thread(target=typing_worker, daemon=True)
-        with self._typing_lock:
-            self._typing_stop_flags[chat_id_str] = stop_event
-            self._typing_tasks[chat_id_str] = thread
-        thread.start()
-
-    def _stop_typing_task(self, chat_id: Union[str, int]) -> None:
-        """
-        停止正在输入状态的任务
-        """
-        chat_id_str = str(chat_id)
-        with self._typing_lock:
-            stop_event = self._typing_stop_flags.pop(chat_id_str, None)
-            task = self._typing_tasks.pop(chat_id_str, None)
-        if stop_event:
-            stop_event.set()
-        if task and task.is_alive() and task is not threading.current_thread():
-            task.join(timeout=1)
+            return task_finished
 
     def _stop_typing_if_needed(
             self, chat_id: Union[str, int], stop_typing: bool
@@ -578,8 +607,7 @@ class Telegram:
         target_chat_id = target_chat_id or (str(userid) if userid else None)
         if not target_chat_id:
             return False
-        self._start_typing_task(target_chat_id)
-        return True
+        return self._start_typing_task(target_chat_id)
 
     def stop_typing(
             self,
@@ -615,6 +643,7 @@ class Telegram:
             disable_web_page_preview: Optional[bool] = None,
             stop_typing: bool = False,
             parse_mode: Optional[str] = None,
+            rich_message: Optional[str] = None,
             private_delivery: bool = False,
     ) -> Optional[dict]:
         """
@@ -631,6 +660,7 @@ class Telegram:
         :param disable_web_page_preview: 是否禁用链接预览
         :param stop_typing: 发送完成后是否立即停止 typing
         :param parse_mode: Telegram 消息格式类型，默认 MarkdownV2，可传 HTML
+        :param rich_message: 完整的 Telegram Rich Markdown 正文，设置后替代普通图文内容
         :param private_delivery: 是否绕过最近会话映射，直接以用户 ID 作为私聊目标
         :return: 包含 message_id, chat_id, success 的字典
         """
@@ -644,8 +674,8 @@ class Telegram:
             original_chat_id,
             private_delivery=private_delivery,
         )
-        if not title and not text:
-            logger.warn("标题和内容不能同时为空")
+        if not title and not text and not rich_message:
+            logger.warn("标题、内容和富文本内容不能同时为空")
             self._stop_typing_if_needed(chat_id, stop_typing)
             return {"success": False}
 
@@ -669,6 +699,45 @@ class Telegram:
                 reply_markup = self._create_inline_keyboard(buttons)
             elif force_reply and ForceReply:
                 reply_markup = self._create_force_reply_markup()
+
+            if rich_message:
+                if original_message_id and original_chat_id and not force_reply:
+                    result = self.__edit_rich_message(
+                        chat_id=original_chat_id,
+                        message_id=original_message_id,
+                        rich_message=rich_message,
+                        reply_markup=reply_markup,
+                    )
+                    self._stop_typing_if_needed(chat_id, stop_typing)
+                    return {
+                        "success": bool(result),
+                        "message_id": original_message_id,
+                        "chat_id": original_chat_id,
+                    }
+
+                target_chat_id = (
+                    original_chat_id
+                    if force_reply and original_chat_id
+                    else chat_id
+                )
+                sent = self.__send_rich_message(
+                    chat_id=target_chat_id,
+                    rich_message=rich_message,
+                    reply_markup=reply_markup,
+                    reply_to_message_id=(
+                        original_message_id if force_reply else None
+                    ),
+                )
+                self._stop_typing_if_needed(chat_id, stop_typing)
+                if sent and hasattr(sent, "message_id"):
+                    return {
+                        "success": True,
+                        "message_id": sent.message_id,
+                        "chat_id": sent.chat.id if hasattr(sent, "chat") else chat_id,
+                    }
+                if sent:
+                    return {"success": True}
+                return {"success": False}
 
             # 判断是编辑消息还是发送新消息
             if original_message_id and original_chat_id:
@@ -1165,6 +1234,7 @@ class Telegram:
             buttons: Optional[List[List[dict]]] = None,
             stop_typing: bool = False,
             parse_mode: Optional[str] = None,
+            rich_message: Optional[str] = None,
     ) -> Optional[bool]:
         """
         编辑Telegram消息（公开方法）
@@ -1175,6 +1245,7 @@ class Telegram:
         :param buttons: 新的按钮列表
         :param stop_typing: 编辑完成后是否立即停止 typing
         :param parse_mode: Telegram 消息格式类型，默认 MarkdownV2，可传 HTML
+        :param rich_message: 完整的 Telegram Rich Markdown 正文，设置后替代普通文本
         :return: 编辑是否成功
         """
         if not self._bot:
@@ -1182,6 +1253,17 @@ class Telegram:
 
         parse_mode = self._normalize_parse_mode(parse_mode)
         try:
+            if rich_message:
+                reply_markup = (
+                    self._create_inline_keyboard(buttons) if buttons else None
+                )
+                return self.__edit_rich_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    rich_message=rich_message,
+                    reply_markup=reply_markup,
+                )
+
             # 组合标题和文本
             if title:
                 bold_title = self._format_title(title, parse_mode)
@@ -1350,6 +1432,94 @@ class Telegram:
                     e = fallback_err
             logger.error(f"编辑消息失败：{str(e)}")
             return False
+
+    @staticmethod
+    def _build_rich_message_chunks(
+            rich_message: str,
+    ) -> List[TelebotInputRichMessage]:
+        """
+        将 GitHub 风格 Markdown 转换并拆分为 Telegram Rich Message。
+
+        :param rich_message: 完整的 Rich Markdown 正文
+        :return: 满足 Telegram 字节数和块数量限制的消息片段
+        """
+        converted = richify(rich_message, mode="html")
+        return [
+            TelebotInputRichMessage(**chunk.to_dict())
+            for chunk in split_rich(converted)
+        ]
+
+    def __edit_rich_message(
+            self,
+            chat_id: Union[str, int],
+            message_id: Union[str, int],
+            rich_message: str,
+            reply_markup: Optional[InlineKeyboardMarkup] = None,
+    ) -> bool:
+        """
+        编辑 Telegram Rich Message。
+
+        :param chat_id: 聊天 ID
+        :param message_id: 原消息 ID
+        :param rich_message: 完整的 Rich Markdown 正文
+        :param reply_markup: 内联键盘
+        :return: 编辑是否成功
+        """
+        chunks = self._build_rich_message_chunks(rich_message)
+        if len(chunks) != 1:
+            logger.warning("Telegram Rich Message 超出单条限制，无法编辑原消息")
+            return False
+        try:
+            self._bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                text=None,
+                rich_message=chunks[0],
+                reply_markup=reply_markup,
+            )
+            return True
+        except Exception as err:
+            if self.__is_message_not_modified_error(err):
+                logger.debug(f"Telegram消息内容未变化，跳过编辑：{str(err)}")
+                return True
+            logger.error(f"编辑 Telegram Rich Message 失败：{str(err)}")
+            return False
+
+    @retry(RetryException, logger=logger)
+    def __send_rich_message(
+            self,
+            chat_id: Union[str, int],
+            rich_message: str,
+            reply_markup: Optional[InlineKeyboardMarkup] = None,
+            reply_to_message_id: Optional[Union[str, int]] = None,
+    ) -> Any:
+        """
+        发送 Telegram Rich Message，超限内容自动拆分为多条。
+
+        :param chat_id: 目标聊天 ID
+        :param rich_message: 完整的 Rich Markdown 正文
+        :param reply_markup: 首条消息携带的键盘
+        :param reply_to_message_id: 首条消息回复的原消息 ID
+        :return: 最后一条已发送的 Telegram 消息
+        """
+        chunks = self._build_rich_message_chunks(rich_message)
+        reply_parameters = (
+            ReplyParameters(message_id=int(reply_to_message_id))
+            if reply_to_message_id is not None
+            else None
+        )
+        sent = None
+        try:
+            for index, chunk in enumerate(chunks):
+                sent = self._bot.send_rich_message(
+                    chat_id=chat_id,
+                    rich_message=chunk,
+                    reply_markup=reply_markup if index == 0 else None,
+                    reply_parameters=reply_parameters if index == 0 else None,
+                )
+            return sent
+        except Exception as err:
+            raise RetryException("发送 Telegram Rich Message 失败") from err
 
     def __send_request(
             self,
@@ -1572,19 +1742,56 @@ class Telegram:
         # 清理菜单命令
         self._bot.delete_my_commands()
 
-    def stop(self) -> None:
-        """
-        停止Telegram消息接收服务
-        """
-        # 停止所有typing任务
-        for chat_id in list(self._typing_tasks.keys()):
-            self._stop_typing_task(chat_id)
-        if not self._bot:
-            return
+    @staticmethod
+    def _stop_bot_with_deadline(bot: TeleBot, deadline: float) -> bool:
+        """停止 SDK polling，并在共享 deadline 内等待 worker 收敛。"""
+        bot.stop_polling()
+        if not bot.threaded or not bot.worker_pool:
+            return True
 
-        self._bot.stop_bot()
-        if self._polling_thread:
-            self._polling_thread.join()
+        workers = tuple(bot.worker_pool.workers)
+        for worker in workers:
+            worker.stop()
+        for worker in workers:
+            if worker is threading.current_thread():
+                continue
+            worker.join(timeout=max(0.0, deadline - time.monotonic()))
+        return all(not worker.is_alive() for worker in workers)
+
+    def stop(self) -> bool:
+        """
+        停止 Telegram 消息接收服务，并返回 SDK/polling/typing owner 是否收敛。
+        """
+        converged = True
+        with self._typing_lifecycle_lock:
+            self._typing_accepting = False
+            # 封口与 owner 快照处于同一临界区，停止后不会漏掉并发新增任务。
+            for chat_id in list(self._typing_tasks.keys()):
+                if not self._stop_typing_task(chat_id):
+                    converged = False
+
+        bot = self._bot
+        polling_thread = self._polling_thread
+        deadline = time.monotonic() + self._shutdown_timeout_seconds
+        transport_converged = True
+        if bot:
+            if not self._stop_bot_with_deadline(bot, deadline):
+                converged = False
+                transport_converged = False
+                logger.error("Telegram SDK worker 未在关闭预算内退出")
+        if (
+            polling_thread
+            and polling_thread.is_alive()
+            and polling_thread is not threading.current_thread()
+        ):
+            polling_thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if polling_thread and polling_thread.is_alive():
+            logger.error("Telegram polling 线程未在关闭预算内退出")
+            converged = False
+            transport_converged = False
+        if not transport_converged:
+            return False
         self._polling_thread = None
         self._bot = None
         logger.info("Telegram消息接收服务已停止")
+        return converged

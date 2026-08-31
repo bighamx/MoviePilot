@@ -1,18 +1,41 @@
 import re
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
-from typing import List, Optional, Tuple
+from typing import List, Optional, Protocol, Tuple
 
+from app.application.configuration import get_configured_system_config
+from app.domain.context import MediaInfo
+from app.runtime.log import logger
 from app.schemas.file import FileURI as _SchemaFileURI
 from app.schemas.system import TransferDirectoryConf as _SchemaTransferDirectoryConf
-from app.domain.context import MediaInfo
-from app.application.configuration import get_configured_system_config
-from app.runtime.log import logger
 from app.schemas.types import MediaType, StorageSchema, SystemConfigKey
-from app.adapters.system.host import SystemUtils
 
 JINJA2_VAR_PATTERN = re.compile(r"\{\{.*?}}", re.DOTALL)
 WINDOWS_DRIVE_PATTERN = re.compile(r"^[A-Za-z]:[\\/]")
 WINDOWS_DRIVE_PREFIX_PATTERN = re.compile(r"^[A-Za-z]:")
+
+
+class DiskTopology(Protocol):
+    """描述本地路径磁盘拓扑判断能力。"""
+
+    def is_same_disk(self, src: Path, dest: Path) -> bool:
+        """返回两个真实本地路径是否位于同一磁盘。"""
+        ...
+
+
+_disk_topology: Optional[DiskTopology] = None
+
+
+def configure_disk_topology(topology: Optional[DiskTopology]) -> None:
+    """由启动组合根注入或清除本地磁盘拓扑适配器。"""
+    global _disk_topology
+    _disk_topology = topology
+
+
+def _is_same_local_disk(src: Path, dest: Path) -> bool:
+    """通过已注入端口判断真实本地路径；未装配时稳定拒绝。"""
+    if _disk_topology is None:
+        raise RuntimeError("本地磁盘拓扑能力尚未由启动组合根配置")
+    return _disk_topology.is_same_disk(src, dest)
 
 
 class DirectoryHelper:
@@ -163,7 +186,7 @@ class DirectoryHelper:
         src_path, src_storage = src
         tar_path, tar_storage = tar
         if "local" == tar_storage == src_storage:
-            return SystemUtils.is_same_disk(src_path, tar_path)
+            return _is_same_local_disk(src_path, tar_path)
         # 网络存储，直接比较类型
         return src_storage == tar_storage
 
@@ -316,34 +339,32 @@ def _normalize_download_root(dir_info: _SchemaTransferDirectoryConf) -> Optional
         return None
 
 
-def validate_download_save_path(
-        save_path: str,
-        allow_unconfigured: bool = False,
-) -> str:
+def normalize_manual_download_save_path(save_path: str) -> str:
+    """规范化手动下载传给远程下载器的任意绝对保存路径。"""
+    value = str(save_path or "").strip()
+    if value.startswith(("\\\\", "//")):
+        path = PureWindowsPath(value)
+        if not path.is_absolute() or ".." in path.parts:
+            raise ValueError("保存路径必须是绝对路径且不能包含上级目录")
+        return path.as_posix()
+    if WINDOWS_DRIVE_PATTERN.match(value):
+        path = PureWindowsPath(value)
+        if ".." in path.parts:
+            raise ValueError("保存路径不能包含上级目录")
+        return path.as_posix()
+    if value.startswith("/") and not value.startswith("//"):
+        return _normalize_safe_posix_path(value).as_posix()
+    raise ValueError("保存路径必须是绝对路径")
+
+
+def validate_download_save_path(save_path: str) -> str:
     """
     校验用户传入的下载保存目录，/download/paths 暴露的下载目录配置是允许写入的公共合同。
 
     :param save_path: 下载保存目录，支持本地 /path、远端 <storage>:/path 和旧版订阅中的无前缀远程路径
-    :param allow_unconfigured: 是否允许手动下载使用未配置的绝对路径
     :return: 可直接传给下载接口的规范化保存目录
     """
     value = str(save_path or "").strip()
-    if allow_unconfigured:
-        if value.startswith(("\\\\", "//")):
-            path = PureWindowsPath(value)
-            if not path.is_absolute() or ".." in path.parts:
-                raise ValueError("保存路径必须是绝对路径且不能包含上级目录")
-            return path.as_posix()
-        if WINDOWS_DRIVE_PATTERN.match(value):
-            path = PureWindowsPath(value)
-            if ".." in path.parts:
-                raise ValueError("保存路径不能包含上级目录")
-            return path.as_posix()
-        if value.startswith("/") and not value.startswith("//"):
-            path = _normalize_safe_posix_path(value)
-            return path.as_posix()
-        raise ValueError("保存路径必须是绝对路径")
-
     has_storage_prefix = any(value.startswith(f"{item.value}:") for item in StorageSchema)
     storage, raw_path = _split_file_uri(value)
     target_style, target_path = _normalize_download_path(raw_path, storage)

@@ -1,6 +1,9 @@
+# pylint: disable=no-name-in-module
+
 import asyncio
 import json
 import threading
+from collections.abc import Generator
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,14 +15,11 @@ import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from langchain_core.messages import AIMessage
 
-from app.agent import (
-    AgentChain,
-    AgentManager,
-    MoviePilotAgent,
-    ReplyMode,
-    _MessageTask,
-)
-from app.agent.middleware.tool_selection import ToolSelectorMiddleware
+from app.agent.contracts import ReplyMode
+from app.agent.manager import AgentManager
+from app.agent.middleware.selection import ToolSelectorMiddleware
+from app.agent.orchestrator import MoviePilotAgent
+from app.agent.session import _MessageTask
 from app.agent.tools.factory import MoviePilotToolFactory
 from app.agent.tools.impl.create_agent_task import (
     CreateAgentTaskInput,
@@ -36,13 +36,17 @@ from app.agent.tools.impl.update_agent_task import (
     UpdateAgentTaskTool,
 )
 from app.agent.tools.tags import ToolTag
-from app.runtime.config import settings
+from app.chain.agent import AgentChain
 from app.db import SessionFactory
-from app.db.oper.agenttask import AgentTaskOper
+from app.db.adapters.agent import TransactionalAgentTaskRepository
 from app.db.models.agenttask import AgentTask
-from app.schemas import ScheduleInfo
-from app.scheduler import Scheduler
+from app.db.oper.agenttask import AgentTaskOper
+from app.runtime.config import settings
+from app.runtime.loop import main_loop_registry
 from app.runtime.scheduling import TimerUtils
+from app.scheduler.facade import Scheduler
+from app.scheduler.registry import ExecutionRegistry
+from app.schemas import ScheduleInfo
 
 
 class _FakeAgentTaskScheduler:
@@ -83,6 +87,17 @@ def anyio_backend() -> str:
 def enable_ai_agent(monkeypatch) -> None:
     """在当前测试模块中启用 Agent 调度能力并在用例后自动还原。"""
     monkeypatch.setattr(settings, "AI_AGENT_ENABLE", True)
+
+
+@pytest.fixture(autouse=True)
+def isolate_scheduler_main_loop() -> Generator[None, None, None]:
+    """隔离主循环登记，避免前序兼容层假循环改变 Scheduler 投递路径。"""
+    previous = main_loop_registry.current
+    main_loop_registry.replace_compat(None)
+    try:
+        yield
+    finally:
+        main_loop_registry.replace_compat(previous)
 
 
 def _future_time(minutes: int = 10) -> str:
@@ -127,10 +142,14 @@ def _add_agent_task(trigger_type: str, trigger_value: str, prefix: str):
 def _build_agent_task_scheduler(reconcile: bool = False) -> Scheduler:
     """构造不启动后台线程的 Agent 任务调度器。"""
     scheduler = object.__new__(Scheduler)
+    scheduler._event = threading.Event()
     scheduler._lock = threading.RLock()
     scheduler._jobs = {}
     scheduler._scheduler = BackgroundScheduler(timezone=settings.TZ)
+    scheduler._lifecycle_state = "running"
+    scheduler._registry = ExecutionRegistry(scheduler._lock)
     scheduler._agent_task_interruptions_reconciled = False
+    scheduler._agent_tasks = TransactionalAgentTaskRepository(SessionFactory)
     if reconcile:
         scheduler._reconcile_agent_task_interruptions()
     return scheduler
@@ -138,7 +157,14 @@ def _build_agent_task_scheduler(reconcile: bool = False) -> Scheduler:
 
 def _build_tool(tool_class, user_id: str):
     """构造带当前用户消息上下文的 Agent 工具。"""
-    tool = tool_class(session_id=f"session-{user_id}", user_id=user_id)
+    tool = tool_class(
+        session_id=f"session-{user_id}",
+        user_id=user_id,
+        data=SimpleNamespace(
+            tasks=TransactionalAgentTaskRepository(SessionFactory),
+            chat=SimpleNamespace(get_sync=lambda **_kwargs: None),
+        ),
+    )
     tool.set_message_attr(
         channel="Telegram",
         source="telegram-test",
@@ -316,6 +342,9 @@ def test_scheduler_registers_and_removes_agent_task_job() -> None:
     scheduler._lock = threading.RLock()
     scheduler._jobs = {}
     scheduler._scheduler = BackgroundScheduler(timezone=settings.TZ)
+    scheduler._lifecycle_state = "running"
+    scheduler._registry = ExecutionRegistry(scheduler._lock)
+    scheduler._agent_tasks = TransactionalAgentTaskRepository(SessionFactory)
 
     next_run_at = scheduler.update_agent_task_job(task.id)
     job_id = scheduler._get_agent_task_job_id(task.id)
@@ -337,6 +366,108 @@ def test_scheduler_registers_and_removes_agent_task_job() -> None:
         assert job_id not in scheduler._jobs
     finally:
         scheduler._scheduler.shutdown(wait=False)
+
+
+def test_stale_agent_task_generation_cannot_remove_replacement_job() -> None:
+    """旧执行收尾不得删除配置刷新后注册的新 generation。"""
+    task = _add_agent_task("date", _future_time(), "generation-replace")
+    scheduler = _build_agent_task_scheduler()
+    scheduler.update_agent_task_job(task.id)
+    job_id = scheduler._get_agent_task_job_id(task.id)
+    old_generation = scheduler._jobs[job_id]["_generation"]
+
+    scheduler.update_agent_task_job(task.id)
+    new_generation = scheduler._jobs[job_id]["_generation"]
+
+    assert new_generation > old_generation
+    assert scheduler._remove_agent_task_job_generation(
+        task.id,
+        old_generation,
+        "old-run",
+    ) is False
+    assert scheduler._jobs[job_id]["_generation"] == new_generation
+    assert scheduler._scheduler.get_job(job_id) is not None
+
+
+@pytest.mark.anyio
+async def test_date_task_reload_job_is_removed_after_run_finishes(
+        monkeypatch,
+) -> None:
+    """运行中重载生成的同一次任务副本必须随 date 终态一起移除。"""
+    task = _add_agent_task("date", _future_time(), "date-reload-active")
+    scheduler = _build_agent_task_scheduler()
+    scheduler.update_agent_task_job(task.id)
+    job_id = scheduler._get_agent_task_job_id(task.id)
+    original_generation = scheduler._jobs[job_id]["_generation"]
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def process_message(**_kwargs) -> str:
+        started.set()
+        await release.wait()
+        return "执行完成"
+
+    manager = SimpleNamespace(
+        execute_scheduled_task=AgentManager.execute_scheduled_task,
+        process_message=process_message,
+        _accepting_tasks=True,
+    )
+    manager.execute_scheduled_task = AgentManager.execute_scheduled_task.__get__(manager)
+    monkeypatch.setattr(
+        "app.application.agent.get_running_agent_manager",
+        lambda: manager,
+    )
+
+    assert scheduler.start(job_id) is True
+    await asyncio.wait_for(started.wait(), timeout=1)
+    scheduler.update_agent_task_job(task.id)
+    replacement_generation = scheduler._jobs[job_id]["_generation"]
+    assert replacement_generation > original_generation
+    assert scheduler._jobs[job_id]["_agent_task_status"] == "running"
+
+    release.set()
+
+    async def wait_until_released() -> None:
+        while scheduler._registry.handles():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_until_released(), timeout=1)
+    completed = AgentTaskOper().get(task.id)
+    assert completed.enabled is False
+    assert completed.last_status == "success"
+    assert job_id not in scheduler._jobs
+    assert scheduler._scheduler.get_job(job_id) is None
+
+
+def test_finished_date_task_cannot_remove_reenabled_job() -> None:
+    """date 收口后重新启用的任务不再属于旧执行的运行时清理范围。"""
+    task = _add_agent_task("date", _future_time(), "date-reenabled")
+    scheduler = _build_agent_task_scheduler()
+    scheduler.update_agent_task_job(task.id)
+    job_id = scheduler._get_agent_task_job_id(task.id)
+    original_generation = scheduler._jobs[job_id]["_generation"]
+    oper = AgentTaskOper()
+    run = oper.begin_run(task.id)
+    assert run is not None
+    outcome = oper.finish_run_outcome(run.run_id, success=True, result="完成")
+    assert outcome.date_task_disabled is True
+    assert oper.update(
+        task.id,
+        {"enabled": True, "last_status": "waiting"},
+    ) is True
+    scheduler.update_agent_task_job(task.id)
+    replacement_generation = scheduler._jobs[job_id]["_generation"]
+    assert replacement_generation > original_generation
+    assert scheduler._jobs[job_id]["_agent_task_run_id"] == run.run_id
+    assert scheduler._jobs[job_id]["_agent_task_status"] == "waiting"
+
+    assert scheduler._remove_agent_task_job_generation(
+        task.id,
+        original_generation,
+        run.run_id,
+    ) is False
+    assert scheduler._jobs[job_id]["_generation"] == replacement_generation
+    assert scheduler._scheduler.get_job(job_id) is not None
 
 
 @pytest.mark.parametrize(
@@ -388,10 +519,11 @@ async def test_interrupted_date_task_manual_run_disables_and_removes_job(
     manager = SimpleNamespace(
         execute_scheduled_task=AgentManager.execute_scheduled_task,
         process_message=process_message,
+        _accepting_tasks=True,
     )
     manager.execute_scheduled_task = AgentManager.execute_scheduled_task.__get__(manager)
     monkeypatch.setattr(
-        "app.agent.runtime_loader.get_running_agent_manager",
+        "app.application.agent.get_running_agent_manager",
         lambda: manager,
     )
 
@@ -419,7 +551,7 @@ async def test_scheduler_propagates_scheduled_trigger_source(monkeypatch) -> Non
     scheduler = _build_agent_task_scheduler()
     execute = AsyncMock(return_value=(True, "执行完成"))
     monkeypatch.setattr(
-        "app.agent.runtime_loader.get_running_agent_manager",
+        "app.application.agent.get_running_agent_manager",
         lambda: SimpleNamespace(execute_scheduled_task=execute),
     )
 
@@ -642,6 +774,64 @@ async def test_scheduler_config_reload_does_not_interrupt_running_agent_task() -
     manager.process_message.assert_not_awaited()
 
 
+@pytest.mark.anyio
+async def test_scheduler_config_reload_preserves_active_agent_task(
+        monkeypatch,
+) -> None:
+    """配置热重载只替换后续计划，已开始的 AgentTask 仍按真实结果收口。"""
+    task = _add_agent_task("cron", "0 * * * *", "reload-active")
+    scheduler = _build_agent_task_scheduler()
+    scheduler.init_agent_task_jobs()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def process_message(**_kwargs) -> str:
+        started.set()
+        await release.wait()
+        return "执行完成"
+
+    manager = SimpleNamespace(
+        execute_scheduled_task=AgentManager.execute_scheduled_task,
+        process_message=process_message,
+        _accepting_tasks=True,
+    )
+    manager.execute_scheduled_task = AgentManager.execute_scheduled_task.__get__(manager)
+    monkeypatch.setattr(
+        "app.application.agent.get_running_agent_manager",
+        lambda: manager,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "init",
+        Mock(side_effect=lambda **_kwargs: setattr(
+            scheduler,
+            "_lifecycle_state",
+            "running",
+        )),
+    )
+
+    job_id = scheduler._get_agent_task_job_id(task.id)
+    assert scheduler.start(job_id) is True
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert AgentTaskOper().get(task.id).last_status == "running"
+
+    await scheduler.on_config_changed()
+    assert AgentTaskOper().get(task.id).last_status == "running"
+    assert scheduler._registry.handles()
+
+    release.set()
+
+    async def wait_until_released() -> None:
+        while scheduler._registry.handles():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(wait_until_released(), timeout=1)
+
+    completed = AgentTaskOper().get(task.id)
+    assert completed.last_status == "success"
+    assert completed.last_result == "执行完成"
+
+
 def test_scheduler_restart_keeps_interrupted_cron_future_schedule() -> None:
     """周期任务中断后只保留下次正常调度，不抹掉本轮中断事实。"""
     task = _add_agent_task("cron", "0 * * * *", "restart-cron")
@@ -699,6 +889,8 @@ def test_scheduler_starts_registered_agent_task_without_waiting() -> None:
             "running": False,
         }
     }
+    scheduler._lifecycle_state = "running"
+    scheduler._registry = ExecutionRegistry(scheduler._lock)
     scheduler.start = Mock()
 
     assert scheduler.start_agent_task(7) is True
@@ -728,7 +920,7 @@ async def test_dashboard_schedule_keeps_agent_tasks(monkeypatch) -> None:
         )
     ]
     monkeypatch.setattr(
-        "app.api.endpoints.dashboard.Scheduler",
+        "app.api.endpoints.dashboard.get_scheduler",
         lambda: SimpleNamespace(list=lambda: scheduler_items),
     )
 
@@ -1063,8 +1255,17 @@ async def test_agent_manager_close_finishes_active_and_queued_scheduled_tasks() 
     started = asyncio.Event()
 
     async def block_current_task(_task):
+        """阻塞当前会话 worker，保留另一任务的排队状态。"""
         started.set()
         await asyncio.Event().wait()
+
+    async def wait_until_all_tasks_running() -> None:
+        """按真实时间等待异步数据库 worker 完成两个任务的认领。"""
+        while not all(
+            AgentTaskOper().get(task.id).last_status == "running"
+            for task in tasks
+        ):
+            await asyncio.sleep(0.01)
 
     manager._process_message_internal = block_current_task
     executions = [
@@ -1072,10 +1273,7 @@ async def test_agent_manager_close_finishes_active_and_queued_scheduled_tasks() 
         for task in tasks
     ]
     await asyncio.wait_for(started.wait(), timeout=1)
-    for _ in range(50):
-        if all(AgentTaskOper().get(task.id).last_status == "running" for task in tasks):
-            break
-        await asyncio.sleep(0)
+    await asyncio.wait_for(wait_until_all_tasks_running(), timeout=2)
     assert all(AgentTaskOper().get(task.id).last_status == "running" for task in tasks)
 
     await manager.close()

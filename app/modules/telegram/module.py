@@ -9,7 +9,7 @@ from app.application.messaging.agent import (
     resolve_config_principal_ids,
 )
 from app.runtime.log import logger
-from app.modules._base import _MessageChannelModuleBase
+from app.modules._base.notification import _MessageChannelModuleBase
 from app.modules.telegram.telegram import Telegram
 from app.schemas.notification import NotificationChannel
 from app.schemas.message import IncomingMessage
@@ -72,13 +72,9 @@ class TelegramModule(_MessageChannelModuleBase[Telegram]):
         """
         return 0
 
-    def stop(self) -> None:
-        """停止模块"""
-        for client in self.get_instances().values():
-            try:
-                client.stop()
-            except Exception as err:
-                logger.error(f"停止Telegram模块实例失败：{err}")
+    def stop(self) -> bool:
+        """停止全部 Telegram 实例，并返回资源是否全部收敛。"""
+        return self._stop_service_instances()
 
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
         """
@@ -515,6 +511,7 @@ class TelegramModule(_MessageChannelModuleBase[Telegram]):
                         original_chat_id=message.original_chat_id,
                         disable_web_page_preview=message.disable_web_page_preview,
                         parse_mode=message.parse_mode,
+                        rich_message=message.rich_message,
                     )
 
     def post_medias_message(
@@ -616,7 +613,7 @@ class TelegramModule(_MessageChannelModuleBase[Telegram]):
         :param text: 新的消息内容
         :param title: 消息标题
         :param buttons: 新的按钮列表
-        :param metadata: 其他元信息
+        :param metadata: 其他元信息；telegram_rich_message 用于流式富文本编辑
         :param parse_mode: Telegram 消息格式类型，默认 MarkdownV2，可传 HTML
         :return: 编辑是否成功
         """
@@ -634,6 +631,7 @@ class TelegramModule(_MessageChannelModuleBase[Telegram]):
                     title=title,
                     buttons=buttons,
                     parse_mode=parse_mode,
+                    rich_message=(metadata or {}).get("telegram_rich_message"),
                 )
                 if result:
                     return True
@@ -739,6 +737,7 @@ class TelegramModule(_MessageChannelModuleBase[Telegram]):
                         original_chat_id=original_chat_id,
                         disable_web_page_preview=message.disable_web_page_preview,
                         parse_mode=message.parse_mode,
+                        rich_message=message.rich_message,
                         private_delivery=message.private_delivery,
                     )
                 if result and result.get("success"):

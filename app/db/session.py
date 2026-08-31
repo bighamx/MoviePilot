@@ -21,9 +21,12 @@ from sqlalchemy.orm import Session, scoped_session, sessionmaker
 
 import app.db.engine as engine_module
 from app.db.engine import (_async_pool_enabled, _get_database_engine,
-                           get_engine, get_global_async_engine)
-from app.runtime.config import global_vars, settings
+                           _database_backend_label, get_engine,
+                           get_global_async_engine)
+from app.runtime.loop import main_loop_registry
+from app.runtime.settings import get_runtime_setting
 from app.runtime.log import logger
+from app.runtime.observability import record_metric
 
 # 会话工厂同样惰性：sessionmaker 在构造时就要绑定引擎，模块级构造等于把引擎的
 # 创建时机重新拉回 import 期，惰性化就白做了。
@@ -83,7 +86,7 @@ def get_scoped_session() -> scoped_session:
 #
 # 做成 __dict__ 里真实存在的函数就两头都成立：导入它不碰引擎，调用它才创建。全仓库对这三个
 # 名字的用法都是 `X()` 取一个会话，这一形式的语义与原先的 sessionmaker / scoped_session 实例
-# 完全一致；patch("app.scheduler.SessionFactory", ...) 这类既有测试替身也照旧生效。
+# 完全一致；测试应在实际数据库 owner 边界替换 SessionFactory。
 #
 # 但仅限 `X()` 这一形式：它们不再是 sessionmaker / scoped_session 实例，因此实例上的其余接口
 # （ScopedSession.remove()、SessionFactory.configure()、AsyncSessionFactory.begin()、
@@ -132,7 +135,7 @@ _pooled_async_engines: Dict[int, Any] = {}
 _pooled_async_lock = threading.Lock()
 # 回退路径（未池化的临时循环）共享的全局连接配额。用 threading 信号量而非
 # asyncio.Semaphore：后者绑定单个事件循环，无法跨循环生效
-_fallback_slots = threading.BoundedSemaphore(max(1, settings.DB_ASYNC_FALLBACK_LIMIT))
+_fallback_slots = threading.BoundedSemaphore(max(1, get_runtime_setting('DB_ASYNC_FALLBACK_LIMIT')))
 
 
 def _pooled_loop() -> Optional[Any]:
@@ -141,8 +144,8 @@ def _pooled_loop() -> Optional[Any]:
 
     只认常驻主循环：它承载了绝大多数异步 DB 流量，且生命周期与进程一致，
     池中连接不会因循环销毁而失效。
-    直接读 CURRENT_EVENT_LOOP 而不用 global_vars.loop——后者在未设置时会
-    新建一个事件循环，仅为判断就产生副作用是不可接受的。
+    直接读可空 current 而不用 require()，避免主循环尚未就绪时
+    把正常的回退引擎选择转换成生命周期异常。
     """
     if not _async_pool_enabled():
         return None
@@ -151,7 +154,7 @@ def _pooled_loop() -> Optional[Any]:
     except RuntimeError:
         # 没有运行中的循环，行为与池化前一致
         return None
-    if loop is not getattr(global_vars, "CURRENT_EVENT_LOOP", None):
+    if loop is not main_loop_registry.current:
         return None
     return loop
 
@@ -177,8 +180,8 @@ def _resolve_async_engine() -> Tuple[SaAsyncEngine, bool]:
         if engine is None:
             engine = cast(SaAsyncEngine, _get_database_engine(is_async=True, pooled=True))
             _pooled_async_engines[key] = engine
-            logger.info(f"异步数据库连接池已启用: pool_size={settings.DB_ASYNC_POOL_SIZE}, "
-                        f"max_overflow={settings.DB_ASYNC_MAX_OVERFLOW}")
+            logger.info(f"异步数据库连接池已启用: pool_size={get_runtime_setting('DB_ASYNC_POOL_SIZE')}, "
+                        f"max_overflow={get_runtime_setting('DB_ASYNC_MAX_OVERFLOW')}")
     return engine, True
 
 
@@ -198,14 +201,29 @@ async def _acquire_fallback_slot():
     变得无界。信号量是线程安全且与事件循环无关的，但不能在协程里阻塞获取，
     因此用非阻塞获取 + 异步让出。
     """
-    deadline = time.monotonic() + settings.DB_POOL_TIMEOUT
-    while not _fallback_slots.acquire(blocking=False):
-        if time.monotonic() >= deadline:
-            raise TimeoutError(
-                f"异步数据库连接配额已耗尽（上限 {settings.DB_ASYNC_FALLBACK_LIMIT}），"
-                f"等待超过 {settings.DB_POOL_TIMEOUT} 秒"
-            )
-        await asyncio.sleep(0.01)
+    started_at = time.monotonic()
+    deadline = started_at + get_runtime_setting('DB_POOL_TIMEOUT')
+    outcome = "success"
+    try:
+        while not _fallback_slots.acquire(blocking=False):
+            if time.monotonic() >= deadline:
+                outcome = "timeout"
+                record_metric(
+                    "db.pool.timeout",
+                    backend=_database_backend_label(),
+                )
+                raise TimeoutError(
+                    f"异步数据库连接配额已耗尽（上限 {get_runtime_setting('DB_ASYNC_FALLBACK_LIMIT')}），"
+                    f"等待超过 {get_runtime_setting('DB_POOL_TIMEOUT')} 秒"
+                )
+            await asyncio.sleep(0.01)
+    finally:
+        record_metric(
+            "db.pool.wait",
+            time.monotonic() - started_at,
+            backend=_database_backend_label(),
+            outcome=outcome,
+        )
 
 
 @asynccontextmanager

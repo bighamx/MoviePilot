@@ -1,37 +1,189 @@
 from pathlib import Path
-from typing import Any, List, Annotated, Optional
+from typing import Annotated, Any, List, Literal, Optional, cast
 
-from fastapi import Depends
+from fastapi import Depends, HTTPException, Query, status
 
+from app.adapters.web.security.access import verify_apitoken, verify_token
+from app.api.dependencies.auth import get_current_active_manage_user
+from app.api.dependencies.history import get_transfer_execution_repository, get_transfer_history_lookup_service
+from app.api.response import ResponseAPIRouter
+from app.application.configuration import get_api_runtime_config_snapshot
+from app.application.directory import DirectoryHelper
+from app.application.history import TransferHistoryLookupService
+from app.application.transfer.execution import (
+    TransferExecutionCommand,
+    TransferExecutionConflictError,
+    TransferExecutionRepository,
+    TransferExecutionState,
+    TransferManualReviewDecision,
+    TransferManualReviewQuery,
+    TransferManualReviewTaskView,
+    TransferStepResult,
+)
+from app.chain.media import MediaChain
+from app.chain.transfer.facade import TransferChain
+from app.runtime.log import logger
+from app.runtime.stop import runtime_stop_state
 from app.schemas.common import NameData as _SchemaNameData
 from app.schemas.response import Response as _SchemaResponse
+from app.schemas.system import TransferDirectoryConf as _SchemaTransferDirectoryConf
 from app.schemas.token import TokenPayload as _SchemaTokenPayload
 from app.schemas.transfer import EpisodeFormat as _SchemaEpisodeFormat
 from app.schemas.transfer import EpisodeFormatRecommendData as _SchemaEpisodeFormatRecommendData
+from app.schemas.transfer import EpisodeFormatRecommendItem, ManualTransferItem
 from app.schemas.transfer import ManualTransferHistoryInfo as _SchemaManualTransferHistoryInfo
 from app.schemas.transfer import ManualTransferResultData as _SchemaManualTransferResultData
 from app.schemas.transfer import ManualTransferTargetPath as _SchemaManualTransferTargetPath
-from app.schemas.system import TransferDirectoryConf as _SchemaTransferDirectoryConf
 from app.schemas.transfer import TransferJob as _SchemaTransferJob
-from app.schemas.workflow import FileItem as _SchemaFileItem
-from app.api.response import ResponseAPIRouter
-from app.chain.media import MediaChain
-from app.chain.transfer import TransferChain
-from app.runtime.config import settings, global_vars
-from app.adapters.web.security.access import verify_token, verify_apitoken
-from app.api.deps import (
-    get_current_active_manage_user,
-    get_transfer_history_lookup_service,
-)
-from app.application.directory import DirectoryHelper
-from app.application.history import TransferHistoryLookupService
-from app.runtime.log import logger
-from app.schemas.types import MediaType
+from app.schemas.transfer import TransferManualReviewData as _SchemaTransferManualReviewData
+from app.schemas.transfer import TransferManualReviewPageData as _SchemaTransferManualReviewPageData
+from app.schemas.transfer import TransferManualReviewRequest as _SchemaTransferManualReviewRequest
+from app.schemas.transfer import TransferManualReviewTaskData as _SchemaTransferManualReviewTaskData
+from app.schemas.types import MUSIC_ENTITY_ALBUM, MUSIC_ENTITY_RECORDING, MediaType
 from app.schemas.workflow import FileItem
-from app.schemas.transfer import ManualTransferItem
-from app.schemas.transfer import EpisodeFormatRecommendItem
+from app.schemas.workflow import FileItem as _SchemaFileItem
 
 router = ResponseAPIRouter()
+
+
+def _manual_review_actor(current_user: object) -> str:
+    """按名称、用户名和用户 ID 的稳定顺序提取人工复核操作者。"""
+    for attribute in ("name", "username", "id"):
+        value = getattr(current_user, attribute, None)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="当前管理用户缺少可审计身份",
+    )
+
+
+def _manual_review_task_data(
+    task: TransferManualReviewTaskView,
+) -> _SchemaTransferManualReviewTaskData:
+    """把 Application 人工复核投影映射为严格公开响应。"""
+    return cast(
+        _SchemaTransferManualReviewTaskData,
+        _SchemaTransferManualReviewTaskData.model_validate({
+            "task_id": task.task_id,
+            "source": {
+                "storage": task.source.storage,
+                "path": task.source.path,
+            },
+            "state": task.state.value,
+            "step": {
+                "operation_id": task.step.operation_id,
+                "kind": task.step.kind,
+                "intent": task.step.intent,
+                "evidence": task.step.evidence,
+                "error": task.step.error,
+            },
+            "review_revision": task.review_revision,
+        }),
+    )
+
+
+@router.get(  # type: ignore[misc]
+    "/tasks/manual-reviews",
+    summary="分页查询 durable 整理人工复核任务",
+    response_model=_SchemaResponse[_SchemaTransferManualReviewPageData],
+)
+def list_transfer_manual_reviews(
+    state_filter: Literal["manual_review", "retry_wait"] = Query(
+        default="manual_review",
+        alias="state",
+    ),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=30, ge=1, le=100),
+    current_user: object = Depends(get_current_active_manage_user),
+    repository: TransferExecutionRepository = Depends(
+        get_transfer_execution_repository
+    ),
+) -> Any:
+    """分页返回待复核或已判定等待 durable 恢复的任务。"""
+    del current_user
+    result = TransferManualReviewQuery(repository).list(
+        state=TransferExecutionState(state_filter),
+        page=page,
+        page_size=page_size,
+    )
+    return _SchemaResponse(
+        success=True,
+        data=_SchemaTransferManualReviewPageData(
+            items=[_manual_review_task_data(item) for item in result.items],
+            total=result.total,
+            page=result.page,
+            page_size=result.page_size,
+        ),
+    )
+
+
+@router.get(  # type: ignore[misc]
+    "/tasks/{task_id}/manual-review",
+    summary="查询 durable 整理人工复核详情",
+    response_model=_SchemaResponse[_SchemaTransferManualReviewTaskData],
+)
+def get_transfer_manual_review(
+    task_id: str,
+    current_user: object = Depends(get_current_active_manage_user),
+    repository: TransferExecutionRepository = Depends(
+        get_transfer_execution_repository
+    ),
+) -> Any:
+    """按任务标识返回严格裁剪的人工复核详情。"""
+    del current_user
+    task = TransferManualReviewQuery(repository).get(task_id=task_id)
+    if task is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="人工复核任务不存在",
+        )
+    return _SchemaResponse(success=True, data=_manual_review_task_data(task))
+
+
+@router.post(  # type: ignore[misc]
+    "/tasks/{task_id}/manual-review",
+    summary="人工判定整理步骤的外部执行结果",
+    response_model=_SchemaResponse[_SchemaTransferManualReviewData],
+)
+def resolve_transfer_manual_review(
+    task_id: str,
+    review: _SchemaTransferManualReviewRequest,
+    current_user: object = Depends(get_current_active_manage_user),
+    repository: TransferExecutionRepository = Depends(
+        get_transfer_execution_repository
+    ),
+) -> Any:
+    """提交无租约人工判定，并返回不含 attempt 与 lease 的公开状态。"""
+    result = (
+        TransferStepResult(payload=dict(review.result_payload))
+        if review.result_payload is not None
+        else None
+    )
+    try:
+        resolved = TransferExecutionCommand(repository).resolve_manual_review(
+            task_id=task_id,
+            operation_id=review.operation_id,
+            decision=TransferManualReviewDecision(review.decision),
+            actor=_manual_review_actor(current_user),
+            reason=review.reason,
+            result=result,
+        )
+    except TransferExecutionConflictError as error:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(error),
+        ) from error
+    return _SchemaResponse(
+        success=True,
+        data=_SchemaTransferManualReviewData(
+            task_id=resolved.task_id,
+            operation_id=resolved.operation_id,
+            decision=resolved.decision.value,
+            state=resolved.state.value,
+            review_revision=resolved.review_revision,
+        ),
+    )
 
 
 @router.get(
@@ -61,7 +213,9 @@ def query_name(
         return _SchemaResponse(success=False, message="未识别到新名称")
     if filetype == "dir":
         media_path = DirectoryHelper.get_media_root_path(
-            rename_format=settings.RENAME_FORMAT(context.media_info.type),
+            rename_format=get_api_runtime_config_snapshot().rename_format(
+                context.media_info.type
+            ),
             rename_path=Path(new_path),
             media_type=context.media_info.type,
         )
@@ -101,7 +255,7 @@ async def remove_queue(
     """
     TransferChain().remove_from_queue(fileitem)
     # 取消整理
-    global_vars.stop_transfer(fileitem.path)
+    runtime_stop_state.stop_transfer(fileitem.path)
     return _SchemaResponse(success=True)
 
 
@@ -304,12 +458,26 @@ def manual_transfer(
     _: object = Depends(get_current_active_manage_user),
 ) -> Any:
     """
-    手动转移，文件或历史记录，支持自定义剧集识别格式
+    解析手动整理 HTTP 请求并委托兼容用例处理器。
+
     :param transer_item: 手工整理项
     :param background: 后台运行
     :param history_query: 整理历史投影服务
     :param _: Token校验
     """
+    return _execute_manual_transfer(
+        transer_item=transer_item,
+        background=background,
+        history_query=history_query,
+    )
+
+
+def _execute_manual_transfer(
+    transer_item: ManualTransferItem,
+    background: Optional[bool],
+    history_query: TransferHistoryLookupService,
+) -> Any:
+    """执行历史恢复、批量预览与 TransferChain 兼容编排。"""
     force = False
     downloader = None
     download_hash = None
@@ -383,7 +551,7 @@ def manual_transfer(
     elif transer_item.fileitem:
         src_fileitems = [transer_item.fileitem]
     else:
-        return _SchemaResponse(success=False, message=f"缺少参数")
+        return _SchemaResponse(success=False, message="缺少参数")
 
     dedup_fileitems: List[FileItem] = []
     seen_paths = set()
@@ -411,6 +579,16 @@ def manual_transfer(
             return _SchemaResponse(
                 success=False, message=f"不支持的媒体类型：{type_name}"
             )
+
+    def _resolve_music_type(file_item: FileItem) -> Optional[str]:
+        """为未显式指定实体的旧客户端按源项类型补全音乐命名空间。"""
+        if mtype != MediaType.MUSIC or transer_item.music_type:
+            return transer_item.music_type
+        return (
+            MUSIC_ENTITY_ALBUM
+            if file_item.type == "dir"
+            else MUSIC_ENTITY_RECORDING
+        )
     # 自定义格式
     epformat = None
     if (
@@ -472,7 +650,7 @@ def manual_transfer(
                 target_path=target_path,
                 media_source=transer_item.media_source,
                 media_id=transer_item.media_id,
-                music_type=transer_item.music_type,
+                music_type=_resolve_music_type(src_fileitem),
                 mtype=mtype,
                 season=transer_item.season,
                 episode_group=transer_item.episode_group,
@@ -556,7 +734,7 @@ def manual_transfer(
         target_path=target_path,
         media_source=transer_item.media_source,
         media_id=transer_item.media_id,
-        music_type=transer_item.music_type,
+        music_type=_resolve_music_type(src_fileitem),
         mtype=mtype,
         season=transer_item.season,
         episode_group=transer_item.episode_group,

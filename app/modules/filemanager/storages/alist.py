@@ -3,20 +3,20 @@ import json
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import List, Optional
 
-from app.schemas.file import StorageUsage as _SchemaStorageUsage
-from app.schemas.workflow import FileItem as _SchemaFileItem
-from app.runtime.cache import cached
-from app.runtime.config import settings, global_vars
-from app.runtime.log import logger
-from app.modules.filemanager.storages import StorageBase, transfer_process
-from app.schemas.exception import OperationInterrupted, StorageQueryError
-from app.schemas.types import StorageSchema
 from app.adapters.network.http import RequestUtils
 from app.foundation.singleton import WeakSingleton
 from app.foundation.url import UrlUtils
-
+from app.modules.filemanager.storages import StorageBase, transfer_process
+from app.runtime.cache import cached
+from app.runtime.log import logger
+from app.runtime.settings import get_runtime_setting
+from app.runtime.stop import runtime_stop_state
+from app.schemas.exception import OperationInterrupted, StorageQueryError
+from app.schemas.file import StorageUsage as _SchemaStorageUsage
+from app.schemas.types import StorageSchema
+from app.schemas.workflow import FileItem as _SchemaFileItem
 
 # OpenList/AList 在 per_page<=0 时会退回后端默认 200，显式指定最大页大小避免大目录被截断。
 OPENLIST_MAX_LIST_PAGE_SIZE = 500
@@ -39,7 +39,7 @@ class Alist(StorageBase, metaclass=WeakSingleton):
     }
 
     # 快照检查目录修改时间
-    snapshot_check_folder_modtime = settings.OPENLIST_SNAPSHOT_CHECK_FOLDER_MODTIME
+    snapshot_check_folder_modtime = get_runtime_setting('OPENLIST_SNAPSHOT_CHECK_FOLDER_MODTIME')
 
     def __init__(self):
         super().__init__()
@@ -690,7 +690,7 @@ class Alist(StorageBase, metaclass=WeakSingleton):
                 download_url = download_url + "?sign=" + result["data"]["sign"]
 
         if not path:
-            local_path = settings.TEMP_PATH / fileitem.name
+            local_path = get_runtime_setting('TEMP_PATH') / fileitem.name
         else:
             local_path = path / fileitem.name
 
@@ -700,7 +700,7 @@ class Alist(StorageBase, metaclass=WeakSingleton):
                 r.raise_for_status()
                 with open(local_path, "wb") as f:
                     for chunk in r.iter_content(chunk_size=8192):
-                        if global_vars.is_transfer_stopped(fileitem.path):
+                        if runtime_stop_state.consume_transfer_stop(fileitem.path):
                             logger.info(f"【OpenList】{fileitem.path} 下载已取消！")
                             return None
                         f.write(chunk)
@@ -757,7 +757,7 @@ class Alist(StorageBase, metaclass=WeakSingleton):
                     return self.file_size
 
                 def read(self, size=-1):
-                    if global_vars.is_transfer_stopped(path.as_posix()):
+                    if runtime_stop_state.consume_transfer_stop(path.as_posix()):
                         logger.info(f"【OpenList】{path} 上传已取消！")
                         raise OperationInterrupted(f"Upload cancelled: {path}")
                     chunk = self.file.read(size)

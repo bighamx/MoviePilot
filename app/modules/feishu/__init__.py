@@ -3,7 +3,7 @@ from typing import Any, List, Optional, Tuple, Union
 from app.domain.context import Context, MediaInfo
 from app.application.messaging.agent import register_channel_admin_resolver, resolve_config_principal_ids
 from app.runtime.log import logger
-from app.modules._base import _MessageChannelModuleBase
+from app.modules._base.notification import _MessageChannelModuleBase
 from app.modules.feishu.feishu import Feishu
 from app.schemas.message import IncomingMessage
 from app.schemas.notification import NotificationChannel
@@ -48,13 +48,9 @@ class FeishuModule(_MessageChannelModuleBase[Feishu]):
         """
         return False
 
-    def stop(self) -> None:
-        """停止模块"""
-        for client in self.get_instances().values():
-            try:
-                client.stop()
-            except Exception as err:
-                logger.error(f"停止飞书模块实例失败：{err}")
+    def stop(self) -> bool:
+        """停止全部飞书实例，并返回资源是否全部收敛。"""
+        return self._stop_service_instances()
 
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
         """通知模块通过系统通知配置控制实例化，这里不额外设置环境开关。"""

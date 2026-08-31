@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 import docker
 import psutil
 
-from app.runtime.config import settings
+from app.runtime.settings import get_runtime_setting
 from app.runtime.log import logger
 from app.runtime.reload import ConfigReloadMixin
 from app.foundation.environment import is_docker
@@ -21,7 +21,6 @@ class SystemHelper(ConfigReloadMixin):
     """
     系统工具类，提供系统相关的操作和判断
     """
-    AUTO_UPDATE_ENABLED_VALUES = {"release", "dev"}
     CONFIG_WATCH = {
         "DEBUG",
         "LOG_LEVEL",
@@ -32,10 +31,20 @@ class SystemHelper(ConfigReloadMixin):
     }
 
     __system_flag_file = "/var/log/nginx/__moviepilot__"
-    __local_backend_runtime_file = settings.TEMP_PATH / "moviepilot.runtime.json"
-    __local_restart_log_file = settings.LOG_PATH / "moviepilot.restart.stdout.log"
-    __one_shot_update_flag_file = settings.TEMP_PATH / "moviepilot.pending_update"
-    __docker_restart_intent_file = settings.TEMP_PATH / "moviepilot.intentional_restart"
+    __local_backend_runtime_file = (
+        get_runtime_setting('TEMP_PATH') / "moviepilot.runtime.json"
+    )
+    __local_restart_log_file = (
+        get_runtime_setting('LOG_PATH') / "moviepilot.restart.stdout.log"
+    )
+    __one_shot_dev_update_flag_file = (
+        get_runtime_setting('TEMP_PATH') / "moviepilot.pending_dev_update"
+    )
+    __docker_restart_intent_file = (
+        get_runtime_setting('TEMP_PATH') / "moviepilot.intentional_restart"
+    )
+    __graceful_shutdown_monitor_lock = threading.Lock()
+    __graceful_shutdown_monitor: Optional[threading.Thread] = None
 
     def on_config_changed(self):
         """配置变化后重新应用日志设置。"""
@@ -93,94 +102,41 @@ class SystemHelper(ConfigReloadMixin):
             return False
 
     @staticmethod
-    def normalize_auto_update_mode(mode: Optional[str]) -> str:
-        """
-        统一自动升级模式值，兼容历史 true 表示 release。
-        """
-        normalized = str(mode or "").strip().lower()
-        return "release" if normalized == "true" else normalized
-
-    @staticmethod
-    def get_auto_update_mode() -> str:
-        """
-        获取当前配置中的自动升级模式。
-        """
-        return SystemHelper.normalize_auto_update_mode(
-            settings.MOVIEPILOT_AUTO_UPDATE
-        )
-
-    @staticmethod
-    def is_auto_update_enabled(mode: Optional[str] = None) -> bool:
-        """
-        判断给定模式或当前配置是否启用了启动时自动升级。
-        """
-        effective_mode = (
-            SystemHelper.get_auto_update_mode()
-            if mode is None
-            else SystemHelper.normalize_auto_update_mode(mode)
-        )
-        return effective_mode in SystemHelper.AUTO_UPDATE_ENABLED_VALUES
-
-    @staticmethod
-    def queue_one_shot_update(mode: str = "release") -> Tuple[bool, str]:
-        """
-        写入一次性升级标记，供重启后的启动流程消费。
-        """
-        effective_mode = SystemHelper.normalize_auto_update_mode(mode)
-        if effective_mode not in SystemHelper.AUTO_UPDATE_ENABLED_VALUES:
-            return False, "升级模式仅支持 release 或 dev"
-
+    def queue_one_shot_dev_update() -> Tuple[bool, str]:
+        """写入一次性 Dev 更新标记，供本次重启的启动流程消费。"""
         try:
-            SystemHelper.__one_shot_update_flag_file.parent.mkdir(
+            SystemHelper.__one_shot_dev_update_flag_file.parent.mkdir(
                 parents=True, exist_ok=True
             )
-            SystemHelper.__one_shot_update_flag_file.write_text(
-                effective_mode, encoding="utf-8"
+            SystemHelper.__one_shot_dev_update_flag_file.write_text(
+                "dev", encoding="utf-8"
             )
-            logger.info(f"已写入一次性升级标记，模式: {effective_mode}")
             return True, ""
         except OSError as err:
-            logger.error(f"写入一次性升级标记失败: {err}")
-            return False, f"写入一次性升级标记失败：{err}"
+            logger.error(f"写入一次性 Dev 更新标记失败: {err}")
+            return False, f"写入一次性 Dev 更新标记失败：{err}"
 
     @staticmethod
-    def consume_one_shot_update_mode() -> Optional[str]:
-        """
-        读取并清除一次性升级标记，避免后续启动重复执行。
-        """
-        path = SystemHelper.__one_shot_update_flag_file
+    def consume_one_shot_dev_update() -> bool:
+        """读取并删除一次性 Dev 更新标记，确保普通重启不会重复更新。"""
+        path = SystemHelper.__one_shot_dev_update_flag_file
         if not path.exists():
-            return None
-
+            return False
         try:
-            raw_mode = path.read_text(encoding="utf-8", errors="replace")
-        except OSError as err:
-            logger.warning(f"读取一次性升级标记失败: {err}")
-            raw_mode = ""
-
-        try:
+            mode = path.read_text(encoding="utf-8", errors="replace").strip().lower()
             path.unlink(missing_ok=True)
         except OSError as err:
-            logger.warning(f"删除一次性升级标记失败: {err}")
-
-        effective_mode = SystemHelper.normalize_auto_update_mode(raw_mode)
-        if effective_mode not in SystemHelper.AUTO_UPDATE_ENABLED_VALUES:
-            if raw_mode:
-                logger.warning(f"忽略无效的一次性升级模式: {raw_mode}")
-            return None
-
-        logger.info(f"检测到一次性升级标记，模式: {effective_mode}")
-        return effective_mode
+            logger.warning(f"消费一次性 Dev 更新标记失败: {err}")
+            return False
+        return mode == "dev"
 
     @staticmethod
-    def clear_one_shot_update_flag() -> None:
-        """
-        删除一次性升级标记。
-        """
+    def clear_one_shot_dev_update() -> None:
+        """重启失败时撤销尚未消费的一次性 Dev 更新。"""
         try:
-            SystemHelper.__one_shot_update_flag_file.unlink(missing_ok=True)
+            SystemHelper.__one_shot_dev_update_flag_file.unlink(missing_ok=True)
         except OSError as err:
-            logger.warning(f"删除一次性升级标记失败: {err}")
+            logger.warning(f"清理一次性 Dev 更新标记失败: {err}")
 
     @staticmethod
     def _spawn_local_restart_helper() -> None:
@@ -192,13 +148,14 @@ class SystemHelper(ConfigReloadMixin):
             "subprocess.run(cmd, cwd=os.environ.get('MOVIEPILOT_ROOT'), env=os.environ.copy(), check=False)"
         )
         env = os.environ.copy()
-        env["MOVIEPILOT_ROOT"] = str(settings.ROOT_PATH)
+        root_path = get_runtime_setting('ROOT_PATH')
+        env["MOVIEPILOT_ROOT"] = str(root_path)
         env["PYTHONUNBUFFERED"] = "1"
 
         SystemHelper.__local_restart_log_file.parent.mkdir(parents=True, exist_ok=True)
         with SystemHelper.__local_restart_log_file.open("a", encoding="utf-8") as log_handle:
             kwargs = {
-                "cwd": str(settings.ROOT_PATH),
+                "cwd": str(root_path),
                 "stdout": log_handle,
                 "stderr": subprocess.STDOUT,
                 "stdin": subprocess.DEVNULL,
@@ -250,7 +207,9 @@ class SystemHelper(ConfigReloadMixin):
                 return False
 
             # 创建 Docker 客户端
-            client = docker.DockerClient(base_url=settings.DOCKER_CLIENT_API)
+            client = docker.DockerClient(
+                base_url=get_runtime_setting('DOCKER_CLIENT_API')
+            )
             # 获取容器信息
             container = client.containers.get(container_id)
             restart_policy = container.attrs.get('HostConfig', {}).get('RestartPolicy', {})
@@ -328,51 +287,62 @@ class SystemHelper(ConfigReloadMixin):
             return SystemHelper._docker_api_restart()
 
     @staticmethod
-    def upgrade(mode: str = "release") -> Tuple[bool, str]:
-        """
-        触发升级并重启。
-
-        - 已开启自动升级时，直接重启，沿用当前配置。
-        - 未开启自动升级时，写入一次性升级标记，供下次启动时执行升级。
-        """
-        current_mode = SystemHelper.get_auto_update_mode()
-        if SystemHelper.is_auto_update_enabled(current_mode):
-            ret, msg = SystemHelper.restart()
-            if not ret:
-                return ret, msg
-            if current_mode == "dev":
-                return True, "已检测到自动升级模式 dev，正在重启并执行升级"
-            return True, "已检测到自动升级已开启，正在重启并执行升级"
-
-        queued, message = SystemHelper.queue_one_shot_update(mode)
-        if not queued:
-            return False, message
-
-        ret, msg = SystemHelper.restart()
+    def upgrade_dev() -> Tuple[bool, str]:
+        """保留原 Dev 模式：重启后跟踪当前 v3 开发分支。"""
+        configured_mode = str(
+            get_runtime_setting('MOVIEPILOT_AUTO_UPDATE') or ""
+        ).strip().lower()
+        if configured_mode != "dev":
+            queued, message = SystemHelper.queue_one_shot_dev_update()
+            if not queued:
+                return False, message
+        ret, message = SystemHelper.restart()
         if not ret:
-            SystemHelper.clear_one_shot_update_flag()
-            return ret, msg
-        effective_mode = SystemHelper.normalize_auto_update_mode(mode)
-        return True, f"已安排一次性 {effective_mode} 升级并重启"
+            SystemHelper.clear_one_shot_dev_update()
+            return False, message
+        return True, "已安排 Dev 更新并重启"
 
     @staticmethod
     def _start_graceful_shutdown_monitor():
         """
-        启动优雅退出超时监控
-        如果30秒内进程没有退出，则使用Docker API强制重启
+        启动唯一的优雅退出超时监控。
+
+        如果 180 秒内进程没有退出，则使用 Docker API 强制重启；重复重启请求
+        复用当前 monitor，避免并行触发多次容器重启。
         """
 
         def monitor_thread():
-            time.sleep(180)  # 等待180秒
-            logger.warning("优雅退出超时180秒，使用Docker API强制重启...")
             try:
-                SystemHelper._docker_api_restart()
-            except Exception as e:
-                logger.error(f"强制重启失败: {str(e)}")
+                time.sleep(180)
+                logger.warning("优雅退出超时180秒，使用Docker API强制重启...")
+                try:
+                    SystemHelper._docker_api_restart()
+                except Exception as e:
+                    logger.error(f"强制重启失败: {str(e)}")
+            finally:
+                with SystemHelper.__graceful_shutdown_monitor_lock:
+                    if (
+                        SystemHelper.__graceful_shutdown_monitor
+                        is threading.current_thread()
+                    ):
+                        SystemHelper.__graceful_shutdown_monitor = None
 
-        # 在后台线程中启动监控
-        thread = threading.Thread(target=monitor_thread, daemon=True)
-        thread.start()
+        with SystemHelper.__graceful_shutdown_monitor_lock:
+            running = SystemHelper.__graceful_shutdown_monitor
+            if running is not None and running.is_alive():
+                logger.debug("优雅退出超时监控已在运行，跳过重复启动")
+                return
+            thread = threading.Thread(
+                target=monitor_thread,
+                name="MoviePilot-GracefulRestartFallback",
+                daemon=True,
+            )
+            SystemHelper.__graceful_shutdown_monitor = thread
+            try:
+                thread.start()
+            except BaseException:
+                SystemHelper.__graceful_shutdown_monitor = None
+                raise
 
     @staticmethod
     def _docker_api_restart() -> Tuple[bool, str]:
@@ -381,7 +351,9 @@ class SystemHelper(ConfigReloadMixin):
         """
         try:
             # 创建 Docker 客户端
-            client = docker.DockerClient(base_url=settings.DOCKER_CLIENT_API)
+            client = docker.DockerClient(
+                base_url=get_runtime_setting('DOCKER_CLIENT_API')
+            )
             container_id = SystemHelper._get_container_id()
             if not container_id:
                 return False, "获取容器ID失败！"

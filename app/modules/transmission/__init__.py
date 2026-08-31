@@ -1,15 +1,13 @@
 from pathlib import Path
 from typing import Set, Tuple, Optional, Union, List, Dict
 
-from transmission_rpc import File
-
 from app.schemas.dashboard import DownloaderInfo as _SchemaDownloaderInfo
-from app.runtime.config import settings
 from app.domain.metainfo import MetaInfo
 from app.runtime.log import logger
-from app.modules._base import _DownloaderModuleBase
+from app.runtime.settings import get_runtime_setting
+from app.modules._base.downloader import _DownloaderModuleBase
 from app.modules.transmission.transmission import Transmission
-from app.schemas.transfer import DownloaderTorrent
+from app.schemas.transfer import DownloaderFile, DownloaderTorrent
 from app.schemas.types import (
     DownloadTaskState,
     DownloaderType,
@@ -19,6 +17,7 @@ from app.schemas.types import (
 )
 from app.foundation import size as size_tools
 from app.foundation import temporal as time_tools
+
 
 _TRANSMISSION_DOWNLOADING_STATES = {
     "download_pending",
@@ -30,6 +29,7 @@ _TRANSMISSION_PAUSED_STATES = {
 
 
 class TransmissionModule(_DownloaderModuleBase[Transmission]):
+    """Transmission 下载器模块，负责任务添加、标签和文件选择。"""
 
     def init_module(self) -> None:
         """
@@ -40,6 +40,7 @@ class TransmissionModule(_DownloaderModuleBase[Transmission]):
 
     @staticmethod
     def get_name() -> str:
+        """返回模块展示名称。"""
         return "Transmission"
 
     @staticmethod
@@ -64,9 +65,11 @@ class TransmissionModule(_DownloaderModuleBase[Transmission]):
         return 2
 
     def stop(self):
+        """下载器客户端由服务基类管理，本模块无额外停止动作。"""
         pass
 
     def init_setting(self) -> Tuple[str, Union[str, bool]]:
+        """下载器实例由系统配置管理，不声明独立模块开关。"""
         pass
 
     def download(self, content: Union[Path, str, bytes], download_dir: Path, cookie: str,
@@ -107,8 +110,8 @@ class TransmissionModule(_DownloaderModuleBase[Transmission]):
         # 标签
         if label:
             labels = label.split(',')
-        elif settings.TORRENT_TAG:
-            labels = settings.TORRENT_TAG.split(',')
+        elif get_runtime_setting('TORRENT_TAG'):
+            labels = get_runtime_setting('TORRENT_TAG').split(',')
         else:
             labels = None
         # 添加任务
@@ -135,16 +138,16 @@ class TransmissionModule(_DownloaderModuleBase[Transmission]):
                             torrent_hash = torrent.hashString
                             logger.warn(f"下载器中已存在该种子任务：{torrent_hash} - {torrent.name}")
                             # 给种子打上标签
-                            if settings.TORRENT_TAG:
-                                logger.info(f"给种子 {torrent_hash} 打上标签：{settings.TORRENT_TAG}")
+                            if get_runtime_setting('TORRENT_TAG'):
+                                logger.info(f"给种子 {torrent_hash} 打上标签：{get_runtime_setting('TORRENT_TAG')}")
                                 # 种子标签
                                 labels = [str(tag).strip()
                                           for tag in torrent.labels] if hasattr(torrent, "labels") else []
                                 if "已整理" in labels:
                                     labels.remove("已整理")
                                     server.set_torrent_tag(ids=torrent_hash, tags=labels)
-                                if settings.TORRENT_TAG and settings.TORRENT_TAG not in labels:
-                                    labels.append(settings.TORRENT_TAG)
+                                if get_runtime_setting('TORRENT_TAG') and get_runtime_setting('TORRENT_TAG') not in labels:
+                                    labels.append(get_runtime_setting('TORRENT_TAG'))
                                     server.set_torrent_tag(ids=torrent_hash, tags=labels)
                             return downloader or self.get_default_config_name(), torrent_hash, torrent_layout, f"下载任务已存在"
                 finally:
@@ -209,7 +212,7 @@ class TransmissionModule(_DownloaderModuleBase[Transmission]):
             servers: Dict[str, Transmission] = self.get_instances()
         ret_torrents = []
         query_status = self._normalize_query_status(status)
-        query_tags = None if include_all_tags else settings.TORRENT_TAG
+        query_tags = None if include_all_tags else get_runtime_setting('TORRENT_TAG')
 
         def __get_torrent_attr(torrent_data, *attr_names):
             """
@@ -524,15 +527,19 @@ class TransmissionModule(_DownloaderModuleBase[Transmission]):
             return None
         return server.stop_torrents(ids=hashs)
 
-    def torrent_files(self, tid: str, downloader: Optional[str] = None) -> Optional[List[File]]:
+    def torrent_files(
+        self, tid: str, downloader: Optional[str] = None
+    ) -> Optional[List[DownloaderFile]]:
         """
-        获取种子文件列表
+        获取种子文件列表，并在模块边界隔离 Transmission SDK 对象。
         """
         # 获取下载器
         server: Transmission = self.get_instance(downloader)
         if not server:
             return None
-        return server.get_files(tid=tid)
+        return self._normalize_torrent_files(
+            server.get_files(tid=tid), DownloaderFile.model_validate
+        )
 
     def downloader_info(self, downloader: Optional[str] = None) -> Optional[List[_SchemaDownloaderInfo]]:
         """

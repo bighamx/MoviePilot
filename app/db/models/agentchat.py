@@ -5,7 +5,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base, get_id_column
-from app.db.decorators import async_db_query, db_query
 
 
 class AgentChat(Base):
@@ -47,10 +46,10 @@ class AgentChat(Base):
         Index("ix_agentchat_session_user", "session_id", "user_id"),
         Index("ix_agentchat_user_updated", "user_id", "updated_at", "id"),
         Index("ix_agentchat_channel_updated", "channel", "updated_at", "id"),
+        Index("ix_agentchat_updated_id", "updated_at", "id"),
     )
 
     @classmethod
-    @db_query
     def get_by_session(
         cls, db: Session, session_id: str, user_id: Optional[str] = None
     ) -> Optional["AgentChat"]:
@@ -63,7 +62,6 @@ class AgentChat(Base):
         return db.execute(statement.order_by(cls.id.desc())).scalars().first()
 
     @classmethod
-    @async_db_query
     async def async_get_by_session(
         cls, db: AsyncSession, session_id: str, user_id: Optional[str] = None
     ) -> Optional["AgentChat"]:
@@ -77,7 +75,6 @@ class AgentChat(Base):
         return result.scalars().first()
 
     @classmethod
-    @db_query
     def list_by_page(
         cls,
         db: Session,
@@ -103,7 +100,6 @@ class AgentChat(Base):
         ).scalars().all())
 
     @classmethod
-    @async_db_query
     async def async_list_by_page(
         cls,
         db: AsyncSession,

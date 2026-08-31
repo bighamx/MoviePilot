@@ -9,12 +9,13 @@ import importlib.util
 import json
 import os
 import platform
-import secrets
 import re
+import secrets
 import shlex
 import shutil
 import subprocess
 import sys
+import sysconfig
 import tarfile
 import textwrap
 import urllib.parse
@@ -33,10 +34,10 @@ PUBLIC_DIR = ROOT / "public"
 RUNTIME_DIR = ROOT / ".runtime"
 NODE_DIR = RUNTIME_DIR / "node"
 INSTALL_ENV_FILE = ROOT / ".moviepilot.env"
-MIN_PYTHON_VERSION = (3, 11)
-SUPPORTED_PYTHON_TEXT = (
-    f"Python {MIN_PYTHON_VERSION[0]}.{MIN_PYTHON_VERSION[1]} 或更高版本"
-)
+MIN_PYTHON_VERSION = (3, 14)
+SUPPORTED_PYTHON_TEXT = "Python 3.14+"
+MIN_UV_VERSION = (0, 12, 5)
+MIN_UV_VERSION_TEXT = ".".join(str(part) for part in MIN_UV_VERSION)
 
 CONFIG_DIR = LEGACY_CONFIG_DIR
 LOG_DIR = CONFIG_DIR / "logs"
@@ -159,7 +160,7 @@ LOCAL_FRONTEND_SERVICE_SCRIPT = textwrap.dedent(
     const backendHost = process.env.MOVIEPILOT_BACKEND_HOST || '127.0.0.1'
     const backendPort = Number(process.env.PORT || 3001)
     const frontendPort = Number(process.env.NGINX_PORT || 3000)
-    const backendHealthPath = '/api/v1/system/global?token=moviepilot'
+    const backendHealthPath = '/health/ready'
     const backendHealthTimeoutMs = Number(process.env.MOVIEPILOT_FRONTEND_HEALTH_TIMEOUT_MS || 3000)
     const backendHealthIntervalMs = Number(process.env.MOVIEPILOT_FRONTEND_HEALTH_INTERVAL_MS || 15000)
     const backendMaxFailures = Math.max(
@@ -525,12 +526,10 @@ def build_package_install_env() -> dict[str, str]:
     env = os.environ.copy()
     package_cache_root = env.get("PACKAGE_CACHE_ROOT", "").strip() or str(CONFIG_DIR / ".cache")
     env.setdefault("PACKAGE_CACHE_ROOT", package_cache_root)
-    env.setdefault("PIP_CACHE_DIR", os.path.join(package_cache_root, "pip"))
     env.setdefault("UV_CACHE_DIR", os.path.join(package_cache_root, "uv"))
 
     index_url = env.get("PIP_PROXY", "").strip()
     if index_url:
-        env["PIP_INDEX_URL"] = index_url
         env["UV_DEFAULT_INDEX"] = index_url
 
     proxy = env.get("PROXY_HOST", "").strip()
@@ -620,67 +619,45 @@ def get_venv_bin_dir(venv_dir: Path) -> Path:
     return venv_dir / "bin"
 
 
-def get_venv_pip(venv_dir: Path) -> Path:
-    if os.name == "nt":
-        return get_venv_bin_dir(venv_dir) / "pip.exe"
-    return get_venv_bin_dir(venv_dir) / "pip"
-
-
-def _ensure_uv_available_for_venv(venv_dir: Path, venv_python: Path) -> Optional[Path]:
-    if os.name == "nt":
+def parse_uv_version(output: str) -> tuple[int, int, int] | None:
+    """从 uv 版本输出中提取稳定版三段版本号。"""
+    match = re.match(r"^uv\s+(\d+)\.(\d+)\.(\d+)(?:\s|$)", output.strip())
+    if not match:
         return None
+    return tuple(int(part) for part in match.groups())
 
+
+def require_uv() -> Path:
+    """返回满足仓库最低版本要求的 uv。"""
+    uv_command = shutil.which("uv")
+    if not uv_command:
+        raise RuntimeError(
+            f"未找到 uv {MIN_UV_VERSION_TEXT}+，请先安装后重新执行。"
+        )
+    uv_bin = Path(uv_command).expanduser().resolve()
+    version = capture([str(uv_bin), "--version"])
+    parsed_version = parse_uv_version(version)
+    if parsed_version is None or parsed_version < MIN_UV_VERSION:
+        raise RuntimeError(
+            f"MoviePilot 需要 uv {MIN_UV_VERSION_TEXT}+，当前为 {version or '未知版本'}。"
+        )
+    return uv_bin
+
+
+def expose_uv_to_venv(uv_bin: Path, venv_dir: Path) -> Path:
+    """让运行时能从虚拟环境旁定位同一 uv 二进制。"""
     venv_bin = get_venv_bin_dir(venv_dir)
-    uv_bin = venv_bin / "uv"
-    if uv_bin.exists():
-        return uv_bin
-
-    system_uv = shutil.which("uv")
-    if system_uv:
-        uv_target = Path(system_uv).expanduser().resolve()
-        print_step(f"复用系统 uv：{uv_target}")
-        if uv_bin.exists() or uv_bin.is_symlink():
-            uv_bin.unlink()
-        uv_bin.symlink_to(uv_target)
-        return uv_bin
-
-    print_step("当前未检测到 uv，先在虚拟环境内安装 uv")
-    command = [str(venv_python), "-m", "pip", "install", "--upgrade", "pip", "uv"]
-    run(command, env=build_package_install_env(), safe_command=redact_command(command))
-    if uv_bin.exists():
-        return uv_bin
-    raise RuntimeError("uv 安装完成，但虚拟环境中未找到 uv 可执行文件")
-
-
-def configure_venv_pip_compat(venv_dir: Path, venv_python: Path) -> Path:
-    """
-    在虚拟环境中安装 uv 并保持 pip 命令兼容，供现有安装流程复用。
-    """
+    runtime_uv = venv_bin / ("uv.exe" if os.name == "nt" else "uv")
+    venv_bin.mkdir(parents=True, exist_ok=True)
+    if runtime_uv.resolve() == uv_bin.resolve():
+        return runtime_uv
+    if runtime_uv.exists() or runtime_uv.is_symlink():
+        runtime_uv.unlink()
     if os.name == "nt":
-        return get_venv_pip(venv_dir)
-
-    _ensure_uv_available_for_venv(venv_dir, venv_python)
-    venv_bin = get_venv_bin_dir(venv_dir)
-    wrapper_src = ROOT / "scripts" / "uv-pip-compat.sh"
-    wrapper_dst = venv_bin / "uv-pip-compat"
-    shutil.copy2(wrapper_src, wrapper_dst)
-    wrapper_dst.chmod(0o755)
-
-    python_version = get_python_version(str(venv_python))
-    compat_links = {
-        "pip",
-        "pip3",
-        f"pip{python_version[0]}",
-        f"pip{python_version[0]}.{python_version[1]}",
-        "pip-compile",
-        "pip-sync",
-    }
-    for link_name in compat_links:
-        link_path = venv_bin / link_name
-        if link_path.exists() or link_path.is_symlink():
-            link_path.unlink()
-        link_path.symlink_to(wrapper_dst.name)
-    return get_venv_pip(venv_dir)
+        shutil.copy2(uv_bin, runtime_uv)
+    else:
+        runtime_uv.symlink_to(uv_bin)
+    return runtime_uv
 
 
 def ensure_supported_python(python_bin: str) -> None:
@@ -690,6 +667,12 @@ def ensure_supported_python(python_bin: str) -> None:
             f"MoviePilot 本地安装需要 {SUPPORTED_PYTHON_TEXT}，当前解释器为 {python_bin} "
             f"({version[0]}.{version[1]}.{version[2]})"
         )
+
+
+def resolve_python_path(python_bin: str) -> Path:
+    """解析解释器命令，优先按 PATH 找到实际执行文件。"""
+    resolved = shutil.which(python_bin)
+    return Path(resolved or python_bin).expanduser().resolve()
 
 
 def ensure_local_dirs() -> None:
@@ -949,8 +932,20 @@ def install_node_runtime(node_version: str) -> Path:
     return node_bin
 
 
-def install_frontend(frontend_version: str, node_version: str) -> dict[str, str]:
-    version_tag, download_url = _resolve_frontend_release(frontend_version)
+def install_frontend(
+    frontend_version: str,
+    node_version: str,
+    archive: Optional[Path] = None,
+) -> dict[str, str]:
+    if archive:
+        version_tag = (frontend_version or "").strip()
+        if not version_tag:
+            raise RuntimeError("使用本地前端更新包时必须指定版本")
+        if not archive.is_file():
+            raise RuntimeError(f"前端更新包不存在：{archive}")
+        download_url = ""
+    else:
+        version_tag, download_url = _resolve_frontend_release(frontend_version)
     node_bin = install_node_runtime(node_version)
 
     if _frontend_runtime_ready(version_tag):
@@ -958,16 +953,29 @@ def install_frontend(frontend_version: str, node_version: str) -> dict[str, str]
         print_step(f"前端发布包已是最新版本：{version_tag}")
         return {"version": version_tag, "node": str(node_bin)}
 
-    print_step(f"下载前端发布包：{version_tag}")
+    print_step(
+        f"使用已下载的前端发布包：{version_tag}"
+        if archive
+        else f"下载前端发布包：{version_tag}"
+    )
     with TemporaryDirectory() as temp_dir:
         temp_path = Path(temp_dir)
         archive_path = temp_path / "dist.zip"
         extract_dir = temp_path / "extract"
-        download_file(download_url, archive_path)
+        if archive:
+            shutil.copy2(archive, archive_path)
+        else:
+            download_file(download_url, archive_path)
         extract_archive(archive_path, extract_dir)
         dist_dir = extract_dir / "dist"
         if not dist_dir.exists():
             raise RuntimeError("前端发布包中未找到 dist 目录")
+        packaged_version = (dist_dir / "version.txt")
+        if (
+            not packaged_version.is_file()
+            or packaged_version.read_text(encoding="utf-8").strip() != version_tag
+        ):
+            raise RuntimeError("前端更新包版本与目标版本不一致")
         _remove_path(PUBLIC_DIR)
         shutil.move(str(dist_dir), str(PUBLIC_DIR))
 
@@ -999,32 +1007,76 @@ def install_frontend(frontend_version: str, node_version: str) -> dict[str, str]
 
 
 def local_resource_status() -> bool:
-    return (
-        SITE_RESOURCE_DIR / f"user.sites.{RESOURCE_VERSION_FLAG}.bin"
-    ).exists() and bool(
-        list(SITE_RESOURCE_DIR.glob("sites*"))
+    platform_tag, machine = _get_platform_tag()
+    required_files = _get_runtime_resource_filenames(
+        platform_tag,
+        machine,
+        _get_python_version_tag(),
     )
+    return all((SITE_RESOURCE_DIR / filename).is_file() for filename in required_files)
 
 
 def copy_resource_files(source_dir: Path) -> list[str]:
     if not source_dir.is_dir():
         raise FileNotFoundError(f"资源目录不存在：{source_dir}")
 
-    copied: list[str] = []
-    for source in sorted(source_dir.iterdir()):
-        if source.is_dir():
-            continue
-        target = SITE_RESOURCE_DIR / source.name
-        shutil.copy2(source, target)
-        copied.append(source.name)
+    platform_tag, machine = _get_platform_tag()
+    python_version = _get_python_version_tag()
+    selected = _require_runtime_resource_files(
+        source_dir,
+        platform_tag,
+        machine,
+        python_version,
+    )
+    SITE_RESOURCE_DIR.mkdir(parents=True, exist_ok=True)
+    _replace_resource_files(selected)
 
-    if not copied:
-        raise RuntimeError(f"资源目录中未找到可复制文件：{source_dir}")
+    active_native_name = selected[-1].name
+    for target in SITE_RESOURCE_DIR.iterdir():
+        if (
+            target.is_file()
+            and target.name.startswith("sites.")
+            and target.suffix.lower() in {".so", ".pyd", ".dylib"}
+            and target.name != active_native_name
+        ):
+            target.unlink()
     print_step(f"已同步资源文件到 {SITE_RESOURCE_DIR}")
-    return copied
+    return [source.name for source in selected]
 
 
-def _get_platform_tag() -> str:
+def _replace_resource_files(selected: list[Path]) -> None:
+    """完整暂存运行资源，并在替换失败时恢复原目标文件。"""
+    with TemporaryDirectory(prefix=".sites-sync-", dir=SITE_RESOURCE_DIR) as temp_dir:
+        transaction_dir = Path(temp_dir)
+        staging_dir = transaction_dir / "staging"
+        backup_dir = transaction_dir / "backup"
+        staging_dir.mkdir()
+        backup_dir.mkdir()
+        for source in selected:
+            shutil.copy2(source, staging_dir / source.name)
+
+        installed: list[Path] = []
+        backups: dict[Path, Path] = {}
+        try:
+            for source in selected:
+                target = SITE_RESOURCE_DIR / source.name
+                backup = backup_dir / source.name
+                if target.exists():
+                    os.replace(target, backup)
+                    backups[target] = backup
+                os.replace(staging_dir / source.name, target)
+                installed.append(target)
+        except OSError:
+            for target in reversed(installed):
+                if target.exists():
+                    target.unlink()
+            for target, backup in backups.items():
+                if backup.exists():
+                    os.replace(backup, target)
+            raise
+
+
+def _get_platform_tag() -> tuple[str, str]:
     system = platform.system().lower()
     machine = platform.machine().lower()
     if system == "darwin":
@@ -1044,40 +1096,71 @@ def _get_platform_tag() -> str:
 
 def _get_python_version_tag() -> str:
     version = sys.version_info
-    return f"cp{version.major}{version.minor}"
+    free_threaded = "t" if sysconfig.get_config_var("Py_GIL_DISABLED") else ""
+    return f"cp{version.major}{version.minor}{free_threaded}"
+
+
+def _get_runtime_resource_filenames(
+    platform_tag: str,
+    machine: str,
+    python_version: str,
+) -> tuple[str, str]:
+    """返回当前解释器、系统和架构唯一对应的 V3 资源文件名。"""
+    python_tag = python_version.removeprefix("cp")
+    data_filename = f"user.sites.{RESOURCE_VERSION_FLAG}.bin"
+    if platform_tag == "windows":
+        native_filename = f"sites.cp{python_tag}-win_amd64.pyd"
+    elif platform_tag == "darwin":
+        native_filename = f"sites.cpython-{python_tag}-darwin.so"
+    elif platform_tag == "linux":
+        native_filename = f"sites.cpython-{python_tag}-{machine}-linux-gnu.so"
+    else:
+        raise RuntimeError(f"不支持的平台标签：{platform_tag}")
+    return data_filename, native_filename
 
 
 def _filter_resources_files(
     source_dir: Path,
     platform_tag: str,
+    machine: str,
     python_version: str,
 ) -> list[Path]:
     """筛选 V3 资源中与当前 Python 平台匹配的运行文件。"""
-    matched_files: list[Path] = []
-    for file in source_dir.iterdir():
-        if not file.is_file():
-            continue
-        filename = file.name
-        if filename == f"user.sites.{RESOURCE_VERSION_FLAG}.bin":
-            matched_files.append(file)
-            continue
-        if not filename.startswith("sites."):
-            continue
-        if platform_tag == "windows":
-            if filename == f"sites.cp{python_version.replace('cp', '')}-win_amd64.pyd":
-                matched_files.append(file)
-        elif platform_tag == "darwin":
-            if (
-                filename
-                == f"sites.cpython-{python_version.replace('cp', '')}-darwin.so"
-            ):
-                matched_files.append(file)
-        elif platform_tag == "linux":
-            if (
-                f"cpython-{python_version.replace('cp', '')}" in filename
-                and "linux-gnu" in filename
-            ):
-                matched_files.append(file)
+    filenames = _get_runtime_resource_filenames(
+        platform_tag,
+        machine,
+        python_version,
+    )
+    return [
+        source_dir / filename
+        for filename in filenames
+        if (source_dir / filename).is_file()
+    ]
+
+
+def _require_runtime_resource_files(
+    source_dir: Path,
+    platform_tag: str,
+    machine: str,
+    python_version: str,
+) -> list[Path]:
+    """返回完整运行资源；缺少数据包或原生扩展时拒绝部分同步。"""
+    required_names = _get_runtime_resource_filenames(
+        platform_tag,
+        machine,
+        python_version,
+    )
+    matched_files = _filter_resources_files(
+        source_dir,
+        platform_tag,
+        machine,
+        python_version,
+    )
+    matched_names = {path.name for path in matched_files}
+    missing_names = [name for name in required_names if name not in matched_names]
+    if missing_names:
+        missing = "、".join(missing_names)
+        raise RuntimeError(f"资源目录缺少当前运行时文件：{missing}")
     return matched_files
 
 
@@ -1103,15 +1186,12 @@ def _download_resources_dir() -> Path:
             f"当前平台：{platform_name}-{machine}，Python 版本：{python_version}"
         )
 
-        matched_files = _filter_resources_files(
+        matched_files = _require_runtime_resource_files(
             source_dir,
             platform_name,
+            machine,
             python_version,
         )
-        if not matched_files:
-            raise RuntimeError(
-                f"未找到匹配的 sites 资源文件：{platform_name} / {python_version}"
-            )
 
         staging_dir = temp_path / "staging"
         staging_dir.mkdir(parents=True, exist_ok=True)
@@ -2127,7 +2207,7 @@ def _load_auth_site_definitions_inner() -> dict[str, Any]:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 
-    from app.application.site.sites import SitesHelper  # noqa
+    from app.application.site.sites import SitesHelper  # pylint: disable=import-error,no-name-in-module
 
     auth_sites = SitesHelper().get_authsites() or {}
     definitions: dict[str, Any] = {}
@@ -2408,22 +2488,39 @@ def _apply_local_system_config_inner(config_payload: dict[str, Any]) -> None:
         sys.path.insert(0, str(ROOT))
 
     try:
-        from app.startup.database_initializer import init_db, update_db
+        from app.startup.initializers.database import prepare_database
         from app.db.oper.systemconfig import SystemConfigOper
         from app.schemas.types import SystemConfigKey
+        from app.db.session import SessionFactory, async_session_scope
+        from app.db.uow import configure_transaction_runners
+        from app.db.adapters.transaction import TransactionalWriteRunner
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "当前环境尚未安装 MoviePilot 运行依赖，请先执行 moviepilot install deps 或 moviepilot setup"
         ) from exc
 
-    init_db()
-    generated_password = _prepare_superuser_password_for_bootstrap()
-    update_db()
+    transaction_runner = TransactionalWriteRunner(
+        sync_session=SessionFactory,
+        async_session=async_session_scope,
+    )
+    configure_transaction_runners(
+        sync=transaction_runner.sync,
+        async_=transaction_runner.async_,
+    )
+
+    generated_password = None
+
+    def prepare_superuser_password() -> None:
+        nonlocal generated_password
+        generated_password = _prepare_superuser_password_for_bootstrap()
+
+    prepare_database(before_alembic=prepare_superuser_password)
     _ensure_superuser_account_inner()
     if generated_password:
         print_step(f"超级管理员初始密码：{generated_password}")
 
     system_config = SystemConfigOper()
+    system_config.load_snapshot()
     directory_items = config_payload.get("directories") or []
     if directory_items:
         current_directories = system_config.get(SystemConfigKey.Directories) or []
@@ -2464,7 +2561,7 @@ def _apply_local_system_config_inner(config_payload: dict[str, Any]) -> None:
     ):
         system_config.set(SystemConfigKey.UserSiteAuthParams, site_auth_item)
         try:
-            from app.application.site.sites import SitesHelper  # noqa
+            from app.application.site.sites import SitesHelper  # pylint: disable=import-error,no-name-in-module
 
             status, msg = SitesHelper().check_user(
                 site_auth_item.get("site"), site_auth_item.get("params")
@@ -2476,7 +2573,6 @@ def _apply_local_system_config_inner(config_payload: dict[str, Any]) -> None:
         except Exception as exc:
             print_step(f"已保存站点认证配置，当前未完成校验：{exc}")
 
-    system_config.set(SystemConfigKey.SetupWizardState, True)
     print_step("已写入本地系统配置")
 
 
@@ -2496,9 +2592,9 @@ def _ensure_superuser_account_inner() -> None:
     if str(ROOT) not in sys.path:
         sys.path.insert(0, str(ROOT))
 
-    from app.runtime.config import settings
-    from app.application.security.access import get_password_hash
+    from app.application.security.token import get_password_hash
     from app.db.oper.user import UserOper
+    from app.runtime.config import settings
 
     username = str(settings.SUPERUSER or "").strip()
     username_error = _validate_superuser_name(username)
@@ -2571,15 +2667,19 @@ def _sync_superuser_account_inner() -> None:
         sys.path.insert(0, str(ROOT))
 
     try:
-        from app.startup.database_initializer import init_db, update_db
+        from app.startup.initializers.database import prepare_database
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "当前环境尚未安装 MoviePilot 运行依赖，请先执行 moviepilot install deps 或 moviepilot setup"
         ) from exc
 
-    init_db()
-    generated_password = _prepare_superuser_password_for_bootstrap()
-    update_db()
+    generated_password = None
+
+    def prepare_superuser_password() -> None:
+        nonlocal generated_password
+        generated_password = _prepare_superuser_password_for_bootstrap()
+
+    prepare_database(before_alembic=prepare_superuser_password)
     _ensure_superuser_account_inner()
     if generated_password:
         print_step(f"超级管理员初始密码：{generated_password}")
@@ -2735,33 +2835,62 @@ def install_deps(*, python_bin: str, venv_dir: Path, recreate: bool) -> Path:
     """
     ensure_supported_python(python_bin)
     venv_dir = venv_dir.expanduser().resolve()
+    if recreate:
+        requested_python = resolve_python_path(python_bin)
+        executing_python = Path(sys.executable).expanduser().resolve()
+        if requested_python.is_relative_to(venv_dir) or executing_python.is_relative_to(
+            venv_dir
+        ):
+            raise RuntimeError(
+                "重建虚拟环境需要使用 venv 外部的 Python 3.14+ 解释器。"
+            )
+    uv_bin = require_uv()
+    temporary_uv_dir: Optional[TemporaryDirectory[str]] = None
+    if recreate and venv_dir.exists() and uv_bin.is_relative_to(venv_dir):
+        temporary_uv_dir = TemporaryDirectory(prefix="moviepilot-uv-")
+        temporary_uv = Path(temporary_uv_dir.name) / uv_bin.name
+        shutil.copy2(uv_bin, temporary_uv)
+        uv_bin = temporary_uv
     venv_python = get_venv_python(venv_dir)
-    venv_pip = get_venv_pip(venv_dir)
     print_step(f"使用 Python 解释器：{python_bin}")
+    try:
+        if recreate and venv_dir.exists():
+            print_step(f"删除已有虚拟环境：{venv_dir}")
+            shutil.rmtree(venv_dir)
 
-    if recreate and venv_dir.exists():
-        print_step(f"删除已有虚拟环境：{venv_dir}")
-        shutil.rmtree(venv_dir)
+        if venv_python.exists():
+            print_step(f"复用已有虚拟环境：{venv_dir}")
+        else:
+            print_step(f"创建虚拟环境：{venv_dir}")
 
-    if not venv_python.exists():
-        print_step(f"创建虚拟环境：{venv_dir}")
-        run([python_bin, "-m", "venv", str(venv_dir)])
-    else:
-        print_step(f"复用已有虚拟环境：{venv_dir}")
-
-    if os.name == "nt":
-        print_step("升级 pip")
-        command = [str(venv_python), "-m", "pip", "install", "--upgrade", "pip"]
-        run(command, env=build_package_install_env(), safe_command=redact_command(command))
-    else:
-        print_step("为虚拟环境配置 uv 兼容 pip 命令")
-        venv_pip = configure_venv_pip_compat(venv_dir, venv_python)
-
-    print_step("安装项目依赖")
-    command = [str(venv_pip), "install", "-r", str(ROOT / "requirements.txt")]
-    run(command, env=build_package_install_env(), safe_command=redact_command(command))
-    install_browser_runtime(venv_python)
-    return venv_python
+        print_step("同步项目锁定依赖")
+        command = [
+            str(uv_bin),
+            "sync",
+            "--project",
+            str(ROOT),
+            "--locked",
+            "--no-dev",
+            "--no-install-project",
+            "--python",
+            python_bin,
+        ]
+        env = build_package_install_env()
+        env["UV_PROJECT_ENVIRONMENT"] = str(venv_dir)
+        run(command, env=env, safe_command=redact_command(command))
+        if temporary_uv_dir is not None:
+            runtime_uv = get_venv_bin_dir(venv_dir) / (
+                "uv.exe" if os.name == "nt" else "uv"
+            )
+            runtime_uv.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(uv_bin, runtime_uv)
+        else:
+            expose_uv_to_venv(uv_bin, venv_dir)
+        install_browser_runtime(venv_python)
+        return venv_python
+    finally:
+        if temporary_uv_dir is not None:
+            temporary_uv_dir.cleanup()
 
 
 def install_browser_runtime(venv_python: Path) -> None:
@@ -3591,13 +3720,20 @@ def _ensure_git_clean() -> None:
     )
 
 
-def _update_backend_ref(ref: str) -> str:
+def _update_backend_ref(ref: str, *, fetch: bool = True) -> str:
     if not (ROOT / ".git").exists():
         raise RuntimeError("当前目录不是 Git 仓库，无法更新后端代码。")
 
     _ensure_git_clean()
-    print_step("获取远端更新")
-    run(["git", "fetch", "--tags", "origin"], cwd=ROOT)
+    if fetch:
+        print_step("获取远端更新")
+        run(["git", "fetch", "--tags", "origin"], cwd=ROOT)
+    else:
+        # Release 下载阶段已获取并验证标签，重启安装不得再次依赖网络。
+        run(
+            ["git", "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+            cwd=ROOT,
+        )
 
     current_branch = _git_output("rev-parse", "--abbrev-ref", "HEAD")
     if ref == "latest":
@@ -3615,10 +3751,15 @@ def _update_backend_ref(ref: str) -> str:
 
 
 def update_backend(
-    *, ref: str, python_bin: str, venv_dir: Path, recreate: bool
+    *,
+    ref: str,
+    python_bin: str,
+    venv_dir: Path,
+    recreate: bool,
+    fetch: bool = True,
 ) -> Path:
     ensure_services_stopped()
-    resolved_ref = _update_backend_ref(ref=ref)
+    resolved_ref = _update_backend_ref(ref=ref, fetch=fetch)
     venv_python = install_deps(
         python_bin=python_bin, venv_dir=venv_dir, recreate=recreate
     )
@@ -3671,8 +3812,8 @@ def run_agent_request(
         sys.path.insert(0, str(ROOT))
 
     try:
-        from app.startup.database_initializer import init_db, update_db
-        from app.agent import MoviePilotAgent
+        from app.startup.initializers.database import prepare_database
+        from app.agent.orchestrator import MoviePilotAgent
         from app.runtime.config import settings
     except ModuleNotFoundError as exc:
         raise RuntimeError(
@@ -3682,8 +3823,7 @@ def run_agent_request(
     if not settings.AI_AGENT_ENABLE:
         raise RuntimeError("MoviePilot 智能体未启用，请先在配置中打开 AI_AGENT_ENABLE")
 
-    init_db()
-    update_db()
+    prepare_database()
 
     session = (session_id or "").strip()
     if new_session or not session:
@@ -3711,7 +3851,7 @@ def build_parser() -> argparse.ArgumentParser:
     install_parser.add_argument(
         "--python",
         default=DEFAULT_BOOTSTRAP_PYTHON,
-        help="用于创建虚拟环境的 Python 解释器，默认自动选择本地 3.11+ 版本",
+        help="用于创建虚拟环境的 Python 解释器，默认自动选择本地 3.14+ 版本",
     )
     install_parser.add_argument(
         "--venv", default=str(ROOT / "venv"), help="虚拟环境目录"
@@ -3773,7 +3913,7 @@ def build_parser() -> argparse.ArgumentParser:
     setup_parser.add_argument(
         "--python",
         default=DEFAULT_BOOTSTRAP_PYTHON,
-        help="用于创建虚拟环境的 Python 解释器，默认自动选择本地 3.11+ 版本",
+        help="用于创建虚拟环境的 Python 解释器，默认自动选择本地 3.14+ 版本",
     )
     setup_parser.add_argument("--venv", default=str(ROOT / "venv"), help="虚拟环境目录")
     setup_parser.add_argument(
@@ -3840,12 +3980,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--frontend-version", help="前端版本，默认使用 version.py 中的 FRONTEND_VERSION"
     )
     update_parser.add_argument(
+        "--frontend-archive",
+        help="使用已经下载的前端 dist.zip，避免重启安装阶段再次联网",
+    )
+    update_parser.add_argument(
+        "--offline-backend",
+        action="store_true",
+        help="不拉取远端，直接使用下载阶段准备好的本地 Git 标签",
+    )
+    update_parser.add_argument(
         "--node-version", default=DEFAULT_NODE_VERSION, help="本地 Node 运行时版本"
     )
     update_parser.add_argument(
         "--python",
         default=DEFAULT_BOOTSTRAP_PYTHON,
-        help="用于安装后端依赖的 Python 解释器，默认自动选择本地 3.11+ 版本",
+        help="用于安装后端依赖的 Python 解释器，默认自动选择本地 3.14+ 版本",
     )
     update_parser.add_argument(
         "--venv", default=str(ROOT / "venv"), help="虚拟环境目录"
@@ -4045,11 +4194,13 @@ def main() -> int:
                     python_bin=args.python,
                     venv_dir=Path(args.venv),
                     recreate=args.recreate,
+                    fetch=not args.offline_backend,
                 )
             if args.target in {"frontend", "all"}:
                 frontend_result = install_frontend(
                     frontend_version=args.frontend_version,
                     node_version=args.node_version,
+                    archive=Path(args.frontend_archive) if args.frontend_archive else None,
                 )
                 print_step(f"前端更新完成，版本：{frontend_result['version']}")
             if args.target == "all" and not args.skip_resources:

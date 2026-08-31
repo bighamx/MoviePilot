@@ -5,33 +5,36 @@ from uuid import UUID
 from fastapi import Depends, Query
 from pydantic import BeforeValidator
 
+from app.adapters.web.security.access import verify_apitoken, verify_token
+from app.api.dependencies.auth import (
+    get_current_active_superuser,
+    get_current_active_user,
+)
+from app.api.response import ResponseAPIRouter
+from app.application.configuration import get_api_runtime_config_snapshot
+from app.chain.media import MediaChain
+from app.chain.scraping import ScrapingChain
+from app.chain.tmdb import TmdbChain
+from app.domain.context import Context, MusicInfo
+from app.domain.media import is_music_media_source, normalize_music_type, parse_media_source_selection
+from app.domain.meta.metabase import MetaBase
+from app.domain.meta.metamusic import MetaMusic
+from app.domain.metainfo import MetaInfo, MetaInfoPath
+from app.schemas.category import CategoryConfig
 from app.schemas.category import CategoryConfig as _SchemaCategoryConfig
 from app.schemas.category import MediaCategoryMap as _SchemaMediaCategoryMap
 from app.schemas.context import MediaEpisodeGroup as _SchemaMediaEpisodeGroup
 from app.schemas.context import MediaPerson as _SchemaMediaPerson
 from app.schemas.context import MediaSearchResults as _SchemaMediaSearchResults
 from app.schemas.context import MediaSeason as _SchemaMediaSeason
+from app.schemas.event import MediaSourceInfo as _SchemaMediaSourceInfo
+from app.schemas.media import normalize_media_source, resolve_media_identity
 from app.schemas.response import Response as _SchemaResponse
 from app.schemas.token import TokenPayload as _SchemaTokenPayload
+from app.schemas.types import MUSIC_ENTITY_RECORDING, MediaSource, MediaType
 from app.schemas.workflow import Context as _SchemaContext
 from app.schemas.workflow import FileItem as _SchemaFileItem
 from app.schemas.workflow import MediaInfo as _SchemaMediaInfo
-from app.api.response import ResponseAPIRouter
-from app.chain.media import MediaChain
-from app.chain.scraping import ScrapingChain
-from app.chain.tmdb import TmdbChain
-from app.runtime.config import settings
-from app.domain.context import Context, MusicInfo
-from app.domain.meta.metabase import MetaBase
-from app.domain.meta.metamusic import MetaMusic
-from app.domain.metainfo import MetaInfo, MetaInfoPath
-from app.adapters.web.security.access import verify_token, verify_apitoken
-from app.api.deps import get_current_active_user, get_current_active_superuser
-from app.schemas.category import CategoryConfig
-from app.schemas.event import MediaSourceInfo as _SchemaMediaSourceInfo
-from app.schemas.types import MUSIC_ENTITY_RECORDING, MediaSource, MediaType
-from app.domain.media import is_music_media_source, normalize_music_type, parse_media_source_selection
-from app.schemas.media import normalize_media_source, resolve_media_identity
 
 router = ResponseAPIRouter()
 
@@ -147,7 +150,8 @@ def _build_recognize_metainfo(
     if (
         ("/" in title or "\\" in title)
         and "://" not in title
-        and title_path.suffix.lower() in settings.RMT_MEDIAEXT
+        and title_path.suffix.lower()
+        in get_api_runtime_config_snapshot().media_extensions
     ):
         metainfo = MetaInfoPath(
             title_path,
@@ -366,7 +370,8 @@ async def search(
         return []
 
     # 排序和分页
-    setting_order = settings.SEARCH_SOURCE.split(",") if settings.SEARCH_SOURCE else []
+    search_source = get_api_runtime_config_snapshot().search_source
+    setting_order = search_source.split(",") if search_source else []
     sort_order = {source: index for index, source in enumerate(setting_order)}
 
     sorted_result = sorted(result, key=lambda x: sort_order.get(__get_source(x), 4))
@@ -383,10 +388,7 @@ def source(_: _SchemaTokenPayload = Depends(verify_token)) -> list[_SchemaMediaS
     return _registered_media_sources()
 
 
-@router.post(
-    "/scrape/{storage}", summary="刮削媒体信息", response_model=_SchemaResponse[None]
-)
-def scrape(
+def _scrape_impl(
     fileitem: _SchemaFileItem,
     storage: Optional[str] = "local",
     media_source: Optional[MediaSource] = None,
@@ -491,6 +493,22 @@ def scrape(
         overwrite=True,
     )
     return _SchemaResponse(success=True, message=f"{fileitem.path} 刮削完成")
+
+
+@router.post(
+    "/scrape/{storage}", summary="刮削媒体信息", response_model=_SchemaResponse[None]
+)
+def scrape(
+    fileitem: _SchemaFileItem,
+    storage: Optional[str] = "local",
+    media_source: Optional[MediaSource] = None,
+    media_id: Optional[str] = None,
+    type_name: Optional[MediaType] = None,
+    music_type: Optional[str] = None,
+    _: _SchemaTokenPayload = Depends(verify_token),
+) -> Any:
+    """刮削媒体信息的兼容公开入口。"""
+    return _scrape_impl(fileitem, storage, media_source, media_id, type_name, music_type, _)
 
 
 @router.get(

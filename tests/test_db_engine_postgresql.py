@@ -103,6 +103,17 @@ def test_budget_uses_sqlite_pool_for_sqlite(monkeypatch):
     assert engine_module.connection_budget()["sync"] == 7
 
 
+def test_budget_counts_database_worker_with_sync_nullpool(monkeypatch):
+    """同步 NullPool 需要同时计入通用线程池和专属数据库 worker。"""
+    monkeypatch.setattr(settings, "DB_TYPE", "postgresql", raising=False)
+    monkeypatch.setattr(settings, "DB_POOL_TYPE", "NullPool", raising=False)
+    threadpool_size = settings.CONF.threadpool
+
+    budget = engine_module.connection_budget()
+
+    assert budget["sync"] == threadpool_size + 4
+
+
 # --------------------------------------------------------------------------- #
 # 额度校验（PostgreSQL 路径）
 # --------------------------------------------------------------------------- #
@@ -210,6 +221,19 @@ def test_pg_sync_engine_applies_pool_settings(monkeypatch):
     assert captured["pool_size"] == 7
     assert captured["max_overflow"] == 9
     assert captured["url"].startswith("postgresql")
+
+
+def test_pg_sync_engine_uses_psycopg_on_free_threaded_python(monkeypatch):
+    """free-threaded 运行时不能加载会重新启用 GIL 的 psycopg2 扩展。"""
+    monkeypatch.setattr(engine_module, "is_free_threaded_runtime", lambda: True)
+    captured = {}
+    monkeypatch.setattr(engine_module, "create_engine",
+                        lambda **kw: captured.update(kw) or MagicMock())
+    monkeypatch.setattr(engine_module, "_register_database_error_logging", lambda *_a: None)
+
+    engine_module._get_postgresql_engine(is_async=False)
+
+    assert captured["url"].startswith("postgresql+psycopg://")
 
 
 def test_pg_async_engine_pooled_omits_poolclass(monkeypatch):

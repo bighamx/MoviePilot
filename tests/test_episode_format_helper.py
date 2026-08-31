@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,8 +23,12 @@ def _make_file(name: str, size: int = 150 * 1024 * 1024) -> FileItem:
 @pytest.fixture(autouse=True)
 def _patch_media_exts(monkeypatch):
     monkeypatch.setattr(
-        "app.application.formatting.settings.RMT_MEDIAEXT",
-        [".mkv", ".mp4"],
+        "app.application.formatting.get_chain_runtime_config_snapshot",
+        lambda: SimpleNamespace(
+            video_extensions=(".mkv", ".mp4"),
+            subtitle_extensions=(".srt", ".ass"),
+            audio_extensions=(".flac", ".mp3", ".mka"),
+        ),
     )
 
 
@@ -722,7 +727,7 @@ def test_transfer_chain_recommend_episode_format_passes_helper_data(monkeypatch)
         lambda item: [sample],
     )
     monkeypatch.setattr(
-        "app.chain._transfer.EpisodeFormatRuleHelper.recommend",
+        "app.chain.transfer.format.EpisodeFormatRuleHelper.recommend",
         lambda self, rules, sample_files: (True, "", helper_data),
     )
 
@@ -777,7 +782,7 @@ def test_transfer_chain_recommend_episode_format_uses_selected_fileitems(monkeyp
         lambda: [],
     )
     monkeypatch.setattr(
-        "app.chain._transfer.EpisodeFormatRuleHelper.recommend",
+        "app.chain.transfer.format.EpisodeFormatRuleHelper.recommend",
         lambda self, rules, sample_files: (True, "", {
             **helper_data,
             "received_samples": [item.name for item in sample_files],
@@ -842,7 +847,7 @@ def test_transfer_chain_episode_format_samples_include_extra_files(monkeypatch):
     other_item = _make_file("Show - 01.txt")
 
     monkeypatch.setattr(
-        "app.chain.transfer.StorageChain.list_files",
+        "app.chain.transfer.request.StorageChain.list_files",
         lambda self, item, recursion=False: [
             media_item,
             subtitle_item,

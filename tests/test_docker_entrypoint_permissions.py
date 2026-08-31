@@ -32,6 +32,18 @@ def _write_fake_chown(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     chown.chmod(0o755)
+    gosu = fake_bin / "gosu"
+    gosu.write_text(
+        textwrap.dedent(
+            """\
+            #!/usr/bin/env bash
+            shift
+            exec "$@"
+            """
+        ),
+        encoding="utf-8",
+    )
+    gosu.chmod(0o755)
     return fake_bin
 
 
@@ -78,6 +90,7 @@ def _run_permission_case(tmp_path: Path, body: str, env: dict[str, str] | None =
         "PUID": str(os.getuid()),
         "PGID": str(os.getgid()),
     }
+    case_env.pop("UV_CACHE_DIR", None)
     if env:
         case_env.update(env)
 
@@ -302,11 +315,15 @@ def test_browser_install_is_centralized_in_startup() -> None:
     browser = (ROOT / "docker" / "browser.sh").read_text(encoding="utf-8")
     updater = (ROOT / "docker" / "update.sh").read_text(encoding="utf-8")
     startup = entrypoint.split("# 使用env配置", 1)[1]
+    updater_source = 'source "${MP_CONTROL_DIR:-/usr/local/lib/moviepilot/control}/update.sh"'
 
     assert "-m cloakbrowser install" not in entrypoint
     assert browser.count("-m cloakbrowser install") == 2
     assert "-m cloakbrowser install" not in updater
-    assert startup.index('source "${MP_CONTROL_DIR:-/usr/local/lib/moviepilot/control}/update.sh"') < startup.index(
+    assert startup.count(updater_source) == 1
+    assert startup.index(updater_source) < startup.index(
+        'if [ "${MOVIEPILOT_BOOTSTRAP_UPDATE_DONE:-0}" != "1" ]'
+    ) < startup.index(
         'source "${MP_CONTROL_DIR:-/usr/local/lib/moviepilot/control}/browser.sh"'
     ) < startup.index("resolve_browser_cache_dir") < startup.index("ensure_browser_kernel")
 
@@ -428,6 +445,52 @@ def test_runtime_writable_paths_are_still_corrected(tmp_path: Path) -> None:
     assert not any(f"{tmp_path}/public" in line for line in lines)
 
 
+def test_external_package_cache_is_repaired_without_chowning_parent(
+    tmp_path: Path,
+) -> None:
+    external_cache = tmp_path / "package-cache" / "uv"
+    log = _run_permission_case(
+        tmp_path,
+        """
+        gosu() { shift; "$@"; }
+        UV_CACHE_DIR="${EXTERNAL_CACHE}" HOME="${HOME_DIR}" correct_file_permissions
+        """,
+        env={"EXTERNAL_CACHE": str(external_cache)},
+    )
+
+    assert f"-R moviepilot:moviepilot {external_cache}" in log.splitlines()
+    assert not any(
+        line.endswith(str(external_cache.parent)) for line in log.splitlines()
+    )
+
+
+def test_external_package_cache_write_probe_failure_is_fatal(tmp_path: Path) -> None:
+    output = _run_entrypoint_case(
+        tmp_path,
+        """
+        ERROR() { printf '%s\n' "$1"; }
+        chown() { :; }
+        gosu() { return 1; }
+        CONFIG_DIR="${CASE_CONFIG_DIR}"
+        VENV_PATH="${CASE_VENV_PATH}"
+        UV_CACHE_DIR="${CASE_CACHE_DIR}"
+        if correct_package_cache_permissions; then
+          printf 'unexpected-success\n'
+        else
+          printf 'rejected\n'
+        fi
+        """,
+        env={
+            "CASE_CONFIG_DIR": str(tmp_path / "config"),
+            "CASE_VENV_PATH": str(tmp_path / "venv"),
+            "CASE_CACHE_DIR": str(tmp_path / "external-cache"),
+        },
+    )
+
+    assert "uv 缓存目录不可写" in output
+    assert output.endswith("rejected\n")
+
+
 def test_explicit_browser_cache_subtree_is_not_scanned_by_permission_repair(
     tmp_path: Path,
 ) -> None:
@@ -493,7 +556,7 @@ def test_backend_ready_log_uses_configured_ports(tmp_path: Path) -> None:
     )
 
     assert curl_log.read_text(encoding="utf-8") == (
-        "-fsS --max-time 2 http://127.0.0.1:4321/api/v1/system/global?token=moviepilot\n"
+        "-fsS --max-time 2 http://127.0.0.1:4321/health/ready\n"
     )
     assert "MoviePilot Web 已可访问" in output
     assert "后端就绪耗时" in output
@@ -528,6 +591,46 @@ def test_backend_ready_timeout_accepts_leading_zero_decimal(tmp_path: Path) -> N
 
     assert "MOVIEPILOT_BACKEND_READY_TIMEOUT=08 无效" not in output
     assert "MoviePilot Web 已可访问" in output
+
+
+def test_backend_dependency_recovery_uses_runtime_profile_sync(tmp_path: Path) -> None:
+    """启动自愈必须复用按当前解释器选择依赖组的同步入口。"""
+    venv_bin = tmp_path / "venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    python_bin = venv_bin / "python3"
+    python_bin.write_text(
+        "#!/bin/bash\n[ -f \"${RECOVERY_MARKER}\" ]\n",
+        encoding="utf-8",
+    )
+    python_bin.chmod(0o755)
+    marker = tmp_path / "recovered"
+
+    output = _run_entrypoint_case(
+        tmp_path,
+        """
+        INFO() { printf '[INFO] %s\\n' "$1"; }
+        WARN() { printf '[WARN] %s\\n' "$1"; }
+        configure_package_route() {
+          PACKAGE_LOG="test-route"
+          printf 'configured\\n'
+        }
+        sync_project_dependencies_for() {
+          printf 'sync:%s\\n' "$1"
+          touch "${RECOVERY_MARKER}"
+        }
+        ensure_backend_runtime_dependencies
+        printf 'route-ready:%s\\n' "${PACKAGE_ROUTE_READY}"
+        """,
+        env={
+            "VENV_PATH": str(tmp_path / "venv"),
+            "RECOVERY_MARKER": str(marker),
+        },
+    )
+
+    assert "configured" in output
+    assert "sync:/app" in output
+    assert "route-ready:true" in output
+    assert marker.exists()
 
 
 def test_backend_failure_keepalive_contract_is_explicit() -> None:

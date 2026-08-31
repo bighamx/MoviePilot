@@ -1,20 +1,21 @@
 from typing import Any, Optional
-from sqlalchemy import Boolean, JSON, String, select
+
+from sqlalchemy import JSON, Boolean, Index, String, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base, get_id_column
-from app.db.decorators import db_query, db_update, async_db_query, async_db_update
 
 
 class User(Base):
     """
     用户表
     """
+
     # ID
     id = get_id_column()
     # 用户名，唯一值
-    name: Mapped[str] = mapped_column(String, index=True, nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
     # 邮箱
     email: Mapped[Optional[str]] = mapped_column(String)
     # 加密后密码
@@ -34,78 +35,86 @@ class User(Base):
     # 用户个性化设置 json
     settings: Mapped[Optional[Any]] = mapped_column(JSON, default=dict)
 
+    __table_args__ = (Index("ux_user_name", "name", unique=True),)
+
     @classmethod
-    @db_query
-    def get_by_name(cls, db: Session, name: str):
+    def get_by_name(
+        cls,
+        db: Session,
+        name: str,
+    ):
+        """在调用方同步会话中按用户名查询用户。"""
         return db.execute(select(cls).where(cls.name == name)).scalars().first()
 
     @classmethod
-    @async_db_query
-    async def async_get_by_name(cls, db: AsyncSession, name: str):
-        result = await db.execute(
-            select(cls).filter(cls.name == name)
-        )
+    async def async_get_by_name(
+        cls,
+        db: AsyncSession,
+        name: str,
+    ):
+        """在调用方异步会话中按用户名查询用户。"""
+        result = await db.execute(select(cls).filter(cls.name == name))
         return result.scalars().first()
 
     @classmethod
-    @db_query
     def get_by_id(cls, db: Session, user_id: int):
+        """在调用方同步会话中按用户 ID 查询用户。"""
         return db.execute(select(cls).where(cls.id == user_id)).scalars().first()
 
     @classmethod
-    @async_db_query
-    async def async_get_by_id(cls, db: AsyncSession, user_id: int):
-        result = await db.execute(
-            select(cls).filter(cls.id == user_id)
-        )
+    async def async_get_by_id(
+        cls,
+        db: AsyncSession,
+        user_id: int,
+    ):
+        """在调用方异步会话中按用户 ID 查询用户。"""
+        result = await db.execute(select(cls).filter(cls.id == user_id))
         return result.scalars().first()
 
-    @db_update
     def delete_by_name(self, db: Session, name: str):
+        """在调用方同步会话中按用户名暂存删除。"""
         user = self.get_by_name(db, name)
         if user:
-            user.delete(db, user.id)
+            db.delete(user)
         return True
 
-    @async_db_update
     async def async_delete_by_name(self, db: AsyncSession, name: str):
+        """在调用方异步会话中按用户名暂存删除。"""
         user = await self.async_get_by_name(db, name)
         if user:
-            await user.async_delete(db, user.id)
+            await db.delete(user)
         return True
 
-    @db_update
     def delete_by_id(self, db: Session, user_id: int):
+        """在调用方同步会话中按用户 ID 暂存删除。"""
         user = self.get_by_id(db, user_id)
         if user:
-            user.delete(db, user.id)
+            db.delete(user)
         return True
 
-    @async_db_update
-    async def async_delete_by_id(self, db: AsyncSession, user_id: int):
-        user = await self.async_get_by_id(db, user_id)
+    @classmethod
+    async def async_delete_by_id(cls, db: AsyncSession, user_id: int):
+        """异步按用户 ID 删除用户，供 UserOper 通过类方法调用。"""
+        user = await cls.async_get_by_id(db, user_id)
         if user:
-            await user.async_delete(db, user.id)
+            await db.delete(user)
         return True
 
-    @db_update
     def update_otp_by_name(self, db: Session, name: str, otp: bool, secret: str):
+        """在调用方同步会话中更新指定用户的 OTP 状态。"""
         user = self.get_by_name(db, name)
         if user:
-            user.update(db, {
-                'is_otp': otp,
-                'otp_secret': secret
-            })
+            user.is_otp = otp
+            user.otp_secret = secret
             return True
         return False
 
-    @async_db_update
-    async def async_update_otp_by_name(self, db: AsyncSession, name: str, otp: bool, secret: str):
-        user = await self.async_get_by_name(db, name)
+    @classmethod
+    async def async_update_otp_by_name(cls, db: AsyncSession, name: str, otp: bool, secret: str):
+        """异步按用户名更新 OTP 状态，供 UserOper 通过类方法调用。"""
+        user = await cls.async_get_by_name(db, name)
         if user:
-            await user.async_update(db, {
-                'is_otp': otp,
-                'otp_secret': secret
-            })
+            user.is_otp = otp
+            user.otp_secret = secret
             return True
         return False

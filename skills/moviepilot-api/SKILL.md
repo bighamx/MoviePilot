@@ -1,6 +1,6 @@
 ---
 name: moviepilot-api
-version: 13
+version: 14
 description: >-
   Use this skill when you need to call MoviePilot REST API endpoints directly
   with the bundled Python client. Covers MoviePilot HTTP endpoints across media
@@ -209,7 +209,7 @@ Music acquisition rules:
 - Subscribe/download one recording as one track. Subscribe/download one album as a complete multi-track pack.
 - Album torrent validation compares supported audio files with `total_tracks`; incomplete resources do not complete the subscription.
 - Artist IDs are never subscription, torrent, download, transfer, or library-existence targets.
-- `/api/v1/media/scrape/{storage}` writes configured music tags/covers and can fetch LRCLIB lyrics as `.lrc`/`.txt` sidecars. External metadata, cover, exploration, statistics, and lyrics requests use bounded TTL/LRU caches in their owning modules/helpers.
+- `/api/v1/media/scrape/{storage}` writes configured music tags/covers and resolves lyrics from existing sidecars, embedded tags, plugins, LRCLIB, optional authorized Musixmatch, and TheAudioDB plain-text fallback. The default upgrade policy keeps `.lyricsfile.yaml` plus compatible `.lrc` output and never replaces higher-quality synchronized lyrics with plain text. Album lyrics requests have a batch deadline and provider cooldowns; external metadata, cover, exploration, statistics, and lyrics requests use bounded caches in their owning modules/helpers.
 
 ### Search / Torrents / Subtitles (11 endpoints)
 
@@ -235,7 +235,7 @@ Streaming search sends `{"type":"heartbeat"}` every 15 seconds without business 
 |--------|------|-------------|
 | GET | `/api/v1/download/` | List active downloads. Params: `name` (downloader name); linked history adds media type and source `site_name` |
 | POST | `/api/v1/download/` | Add download (with media info). Body: JSON |
-| POST | `/api/v1/download/add` | Add download without media info. Body: `torrent_in`, optional paired `media_source` + `media_id`, `music_type`, `downloader`, `save_path` |
+| POST | `/api/v1/download/add` | Add download without media info. Body: `torrent_in`, optional paired `media_source` + `media_id`, `music_type`, `downloader`, `save_path`; an unrecognized video or music resource returns `data.requires_confirmation=true`, and the same request may be retried with `allow_unrecognized=true` after explicit user confirmation |
 | POST | `/api/v1/download/subtitle` | Download subtitle file to the recognized media download directory. Body: `subtitle_in`, required `media_source` + `media_id`, optional `save_path` |
 | GET | `/api/v1/download/start/{hashString}` | Resume download task |
 | GET | `/api/v1/download/stop/{hashString}` | Pause download task |
@@ -356,7 +356,7 @@ Streaming search sends `{"type":"heartbeat"}` every 15 seconds without business 
 | DELETE | `/api/v1/transfer/queue` | Remove from transfer queue. Body: FileItem JSON |
 | POST | `/api/v1/transfer/manual/target-path` | Match the manual transfer target from source path and directory configuration. Body: ManualTransferItem JSON; this endpoint does not recognize media |
 | POST | `/api/v1/transfer/manual/history` | Query successful transfer-history summary for selected files or directories. Body: ManualTransferItem JSON |
-| POST | `/api/v1/transfer/manual` | Manual transfer. Params: `background`. Body: ManualTransferItem JSON; optional `media_source` + `media_id` select recognition and scraping source; matching failed history is cleared automatically, while `reorganize=true` removes matched successful history and old non-move targets before retrying |
+| POST | `/api/v1/transfer/manual` | Manual transfer. Params: `background`. Body: ManualTransferItem JSON; optional `media_source` + `media_id` select recognition and scraping source; music directories default to `music_type=album` and files to `music_type=recording` when omitted; matching failed history is cleared automatically, while `reorganize=true` removes matched successful history and old non-move targets before retrying |
 | GET | `/api/v1/transfer/now` | Run immediate transfer |
 
 ### Dashboard (19 endpoints)
@@ -434,7 +434,7 @@ Streaming search sends `{"type":"heartbeat"}` every 15 seconds without business 
 | POST | `/api/v1/workflow/fork` | Fork shared workflow. Body: WorkflowShare JSON |
 | GET | `/api/v1/workflow/shares` | List shared workflows. Params: `name`, `page`, `count` |
 
-### System (24 endpoints)
+### System (28 endpoints)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -448,7 +448,11 @@ Streaming search sends `{"type":"heartbeat"}` every 15 seconds without business 
 | GET | `/api/v1/system/global` | Non-sensitive settings. Params: `token` (required) |
 | GET | `/api/v1/system/global/user` | User-related settings |
 | GET | `/api/v1/system/restart` | Restart system |
-| POST | `/api/v1/system/upgrade` | Upgrade and restart system. Body: `"release"` or `"dev"` |
+| POST | `/api/v1/system/upgrade` | Retained Dev update and restart. Body: `"dev"` |
+| GET | `/api/v1/system/update/status` | Get Release check, download, or install state |
+| POST | `/api/v1/system/update/check` | Check the latest stable v3 GitHub Release |
+| POST | `/api/v1/system/update/download` | Start verified Release packages downloading in the background |
+| POST | `/api/v1/system/update/install` | Confirm restart and install the prepared Release packages |
 | GET | `/api/v1/system/runscheduler` | Run scheduled service. Params: `jobid` (required) |
 | GET | `/api/v1/system/runscheduler2` | Run scheduler (API_TOKEN, use `--token-param`). Params: `jobid` |
 | GET | `/api/v1/system/modulelist` | List loaded modules |

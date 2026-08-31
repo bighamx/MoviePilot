@@ -1,122 +1,179 @@
+import asyncio
 import errno
 import itertools
 import os
 import struct
 import subprocess
+import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
-from unittest import TestCase
 from unittest.mock import MagicMock, call, patch
 
+import psutil
 import pytest
 
 from app.runtime.state import SystemHelper
-from app.runtime.config import ConfigModel, settings
+from app.runtime.config import ConfigModel, Settings, settings
 from app.adapters.system.host import SystemUtils
 
 
-class SystemUtilsTest(TestCase):
+def test_get_config_path_uses_repository_config_for_source_runtime():
+    """源码运行时应从项目根目录读取配置，不能随适配器目录层级偏移。"""
+    expected = Path(__file__).resolve().parents[1] / "config"
 
-    def test_get_config_path_uses_repository_config_for_source_runtime(self):
-        """源码运行时应从项目根目录读取配置，不能随适配器目录层级偏移。"""
-        expected = Path(__file__).resolve().parents[1] / "config"
+    with patch.dict(os.environ, {}, clear=True), \
+            patch.object(SystemUtils, "is_docker", return_value=False), \
+            patch.object(SystemUtils, "is_frozen", return_value=False):
+        assert SystemUtils.get_config_path() == expected
+        assert SystemUtils.get_env_path() == expected / "app.env"
 
-        with patch.dict(os.environ, {}, clear=True), \
-                patch.object(SystemUtils, "is_docker", return_value=False), \
-                patch.object(SystemUtils, "is_frozen", return_value=False):
-            self.assertEqual(SystemUtils.get_config_path(), expected)
-            self.assertEqual(SystemUtils.get_env_path(), expected / "app.env")
 
-    def test_get_config_path_preserves_explicit_config_dir(self):
-        """显式配置目录始终优先于运行环境推导。"""
-        explicit_path = Path("/custom/moviepilot-config")
+def test_get_config_path_preserves_explicit_config_dir():
+    """显式配置目录始终优先于运行环境推导。"""
+    explicit_path = Path("/custom/moviepilot-config")
 
-        with patch.dict(os.environ, {"CONFIG_DIR": "/ignored"}, clear=True), \
-                patch.object(SystemUtils, "is_docker", return_value=True):
-            self.assertEqual(
-                SystemUtils.get_config_path(str(explicit_path)),
-                explicit_path,
-            )
+    with patch.dict(os.environ, {"CONFIG_DIR": "/ignored"}, clear=True), \
+            patch.object(SystemUtils, "is_docker", return_value=True):
+        assert SystemUtils.get_config_path(str(explicit_path)) == explicit_path
 
-    def test_get_config_path_preserves_runtime_specific_defaults(self):
-        """容器和冻结程序继续使用各自稳定的配置目录。"""
-        with patch.dict(os.environ, {}, clear=True), \
-                patch.object(SystemUtils, "is_docker", return_value=True):
-            self.assertEqual(SystemUtils.get_config_path(), Path("/config"))
 
-        with patch.dict(os.environ, {}, clear=True), \
-                patch.object(SystemUtils, "is_docker", return_value=False), \
-                patch.object(SystemUtils, "is_frozen", return_value=True), \
-                patch("app.adapters.system.host.sys.executable", "/opt/moviepilot/moviepilot"):
-            self.assertEqual(
-                SystemUtils.get_config_path(),
-                Path("/opt/moviepilot/config"),
-            )
+def test_get_config_path_preserves_runtime_specific_defaults():
+    """容器和冻结程序继续使用各自稳定的配置目录。"""
+    with patch.dict(os.environ, {}, clear=True), \
+            patch.object(SystemUtils, "is_docker", return_value=True):
+        assert SystemUtils.get_config_path() == Path("/config")
 
-    def test_execute_with_subprocess_keeps_stdout_when_command_fails(self):
-        """
-        命令失败时如果原因只写入 stdout，也需要回传给调用方用于错误提示。
-        """
-        error = subprocess.CalledProcessError(
-            returncode=1,
-            cmd=["pip", "check"],
-            output="demo requires pkg>=2, but you have pkg 1\n",
-            stderr="",
+    with patch.dict(os.environ, {}, clear=True), \
+            patch.object(SystemUtils, "is_docker", return_value=False), \
+            patch.object(SystemUtils, "is_frozen", return_value=True), \
+            patch("app.adapters.system.host.sys.executable", "/opt/moviepilot/moviepilot"):
+        assert SystemUtils.get_config_path() == Path("/opt/moviepilot/config")
+
+
+def test_execute_with_subprocess_keeps_stdout_when_command_fails():
+    """命令失败时如果原因只写入 stdout，也需要回传给调用方用于错误提示。"""
+    error = subprocess.CalledProcessError(
+        returncode=1,
+        cmd=["pip", "check"],
+        output="demo requires pkg>=2, but you have pkg 1\n",
+        stderr="",
+    )
+
+    with patch("app.adapters.system.host.subprocess.run", side_effect=error):
+        success, message = SystemUtils.execute_with_subprocess(["pip", "check"])
+
+    assert not success
+    assert "返回码：1" in message
+    assert "标准输出：demo requires pkg>=2, but you have pkg 1" in message
+
+
+def test_execute_with_subprocess_reports_empty_failure_output():
+    """命令失败且没有输出时应给出明确占位信息，避免错误原因看起来被截断。"""
+    error = subprocess.CalledProcessError(
+        returncode=2,
+        cmd=["pip", "check"],
+        output="",
+        stderr="",
+    )
+
+    with patch("app.adapters.system.host.subprocess.run", side_effect=error):
+        success, message = SystemUtils.execute_with_subprocess(["pip", "check"])
+
+    assert not success
+    assert "返回码：2" in message
+    assert "无标准输出或错误输出" in message
+
+
+def test_docker_restart_policy_marks_intent_before_sigterm():
+    """Docker 优雅重启前应写入意图标记，避免 entrypoint 误进入 doctor 保活。"""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        original_config_dir = settings.CONFIG_DIR
+        original_intent_file = SystemHelper._SystemHelper__docker_restart_intent_file
+        settings.CONFIG_DIR = temp_dir
+        SystemHelper._SystemHelper__docker_restart_intent_file = (
+            settings.TEMP_PATH / "moviepilot.intentional_restart"
         )
+        try:
+            with patch("app.runtime.state.is_docker", return_value=True), \
+                    patch.object(SystemHelper, "_check_restart_policy", return_value=True), \
+                    patch.object(SystemHelper, "_start_graceful_shutdown_monitor"), \
+                    patch("app.runtime.state.os.kill") as kill_mock:
+                ret, msg = SystemHelper.restart()
 
-        with patch("app.adapters.system.host.subprocess.run", side_effect=error):
-            success, message = SystemUtils.execute_with_subprocess(["pip", "check"])
-
-        self.assertFalse(success)
-        self.assertIn("返回码：1", message)
-        self.assertIn("标准输出：demo requires pkg>=2, but you have pkg 1", message)
-
-    def test_execute_with_subprocess_reports_empty_failure_output(self):
-        """
-        命令失败且没有任何输出时，给出明确占位信息，避免错误原因看起来被截断。
-        """
-        error = subprocess.CalledProcessError(
-            returncode=2,
-            cmd=["pip", "check"],
-            output="",
-            stderr="",
-        )
-
-        with patch("app.adapters.system.host.subprocess.run", side_effect=error):
-            success, message = SystemUtils.execute_with_subprocess(["pip", "check"])
-
-        self.assertFalse(success)
-        self.assertIn("返回码：2", message)
-        self.assertIn("无标准输出或错误输出", message)
+            assert ret
+            assert msg == ""
+            assert (settings.TEMP_PATH / "moviepilot.intentional_restart").exists()
+            kill_mock.assert_called_once()
+        finally:
+            SystemHelper._SystemHelper__docker_restart_intent_file = original_intent_file
+            settings.CONFIG_DIR = original_config_dir
 
 
-class SystemHelperRestartTest(TestCase):
+def test_graceful_shutdown_monitor_has_single_owner_and_releases_it(monkeypatch):
+    """重复重启请求应共享唯一兜底线程，线程结束后必须释放 owner。"""
+    sleep_started = threading.Event()
+    release_sleep = threading.Event()
+    restart = MagicMock(return_value=(True, ""))
+    monitor_attr = "_SystemHelper__graceful_shutdown_monitor"
+    original_monitor = getattr(SystemHelper, monitor_attr)
+    thread = None
 
-    def test_docker_restart_policy_marks_intent_before_sigterm(self):
-        """
-        Docker 内置重启走优雅退出时，应写入意图标记，避免 entrypoint 误进入 doctor 保活。
-        """
-        with tempfile.TemporaryDirectory() as temp_dir:
-            original_config_dir = settings.CONFIG_DIR
-            original_intent_file = SystemHelper._SystemHelper__docker_restart_intent_file
-            settings.CONFIG_DIR = temp_dir
-            SystemHelper._SystemHelper__docker_restart_intent_file = (
-                settings.TEMP_PATH / "moviepilot.intentional_restart"
-            )
-            try:
-                with patch("app.runtime.state.is_docker", return_value=True), \
-                        patch.object(SystemHelper, "_check_restart_policy", return_value=True), \
-                        patch.object(SystemHelper, "_start_graceful_shutdown_monitor"), \
-                        patch("app.runtime.state.os.kill") as kill_mock:
-                    ret, msg = SystemHelper.restart()
+    def wait_for_shutdown(_seconds: float) -> None:
+        """用事件屏障模拟 180 秒等待，确保第二次启动发生在首线程存活期间。"""
+        sleep_started.set()
+        release_sleep.wait(timeout=1)
 
-                self.assertTrue(ret)
-                self.assertEqual(msg, "")
-                self.assertTrue((settings.TEMP_PATH / "moviepilot.intentional_restart").exists())
-                kill_mock.assert_called_once()
-            finally:
-                SystemHelper._SystemHelper__docker_restart_intent_file = original_intent_file
-                settings.CONFIG_DIR = original_config_dir
+    setattr(SystemHelper, monitor_attr, None)
+    try:
+        monkeypatch.setattr("app.runtime.state.time.sleep", wait_for_shutdown)
+        monkeypatch.setattr(SystemHelper, "_docker_api_restart", restart)
+
+        SystemHelper._start_graceful_shutdown_monitor()
+        assert sleep_started.wait(timeout=1)
+        thread = getattr(SystemHelper, monitor_attr)
+        SystemHelper._start_graceful_shutdown_monitor()
+
+        assert getattr(SystemHelper, monitor_attr) is thread
+        release_sleep.set()
+        thread.join(timeout=1)
+
+        assert thread.is_alive() is False
+        assert getattr(SystemHelper, monitor_attr) is None
+        restart.assert_called_once_with()
+    finally:
+        release_sleep.set()
+        if thread is not None:
+            thread.join(timeout=1)
+        setattr(SystemHelper, monitor_attr, original_monitor)
+
+
+def test_graceful_shutdown_monitor_releases_owner_when_thread_start_fails(monkeypatch):
+    """兜底线程启动失败时必须释放 owner，允许后续请求重试。"""
+    monitor_attr = "_SystemHelper__graceful_shutdown_monitor"
+    original_monitor = getattr(SystemHelper, monitor_attr)
+
+    class FailingThread:
+        """模拟在登记 owner 后启动失败的线程对象。"""
+
+        def __init__(self, **_kwargs):
+            """接收真实 Thread 构造参数，但不创建系统线程。"""
+
+        def start(self):
+            """模拟底层线程资源不足导致的启动失败。"""
+            raise RuntimeError("thread start failed")
+
+    setattr(SystemHelper, monitor_attr, None)
+    try:
+        monkeypatch.setattr("app.runtime.state.threading.Thread", FailingThread)
+
+        with pytest.raises(RuntimeError, match="thread start failed"):
+            SystemHelper._start_graceful_shutdown_monitor()
+
+        assert getattr(SystemHelper, monitor_attr) is None
+    finally:
+        setattr(SystemHelper, monitor_attr, original_monitor)
 
 
 def test_execute_with_subprocess_passes_env_to_subprocess():
@@ -153,6 +210,148 @@ def test_execute_with_subprocess_uses_safe_command_in_failure_message():
     assert "https://mirror.example/simple" in message
     assert "user:pass" not in message
     assert run_mock.call_args.args[0] == command
+
+
+@pytest.mark.asyncio
+async def test_async_subprocess_timeout_reaps_process():
+    """异步安装命令超时后应终止并回收子进程。"""
+    success, message = await SystemUtils.execute_with_subprocess_async(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        timeout=0.05,
+    )
+
+    assert success is False
+    assert "执行超时" in message
+
+
+@pytest.mark.asyncio
+async def test_async_subprocess_cancellation_reaps_process(tmp_path):
+    """调用方取消安装任务时，底层子进程不得继续运行。"""
+    marker = tmp_path / "pid"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "from pathlib import Path; import os, time; "
+            f"Path({str(marker)!r}).write_text(str(os.getpid())); time.sleep(60)"
+        ),
+    ]
+    task = asyncio.create_task(
+        SystemUtils.execute_with_subprocess_async(command, timeout=30)
+    )
+    deadline = time.monotonic() + 2
+    while not marker.exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert marker.exists()
+
+    pid = int(marker.read_text())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    for _ in range(100):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail(f"子进程仍在运行：{pid}")
+
+
+@pytest.mark.asyncio
+async def test_async_subprocess_cancellation_reaps_process_tree(tmp_path):
+    """取消安装命令时，子进程派生的构建进程也不得继续运行。"""
+    marker = tmp_path / "pids"
+    child_code = "import time; time.sleep(60)"
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "from pathlib import Path; import subprocess, os, time; "
+            f"child = subprocess.Popen([{sys.executable!r}, '-c', {child_code!r}]); "
+            f"Path({str(marker)!r}).write_text(str(os.getpid()) + ':' + str(child.pid)); "
+            "time.sleep(60)"
+        ),
+    ]
+    task = asyncio.create_task(
+        SystemUtils.execute_with_subprocess_async(command, timeout=30)
+    )
+    deadline = time.monotonic() + 2
+    while not marker.exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert marker.exists()
+
+    pids = [int(value) for value in marker.read_text().split(":")]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    for _ in range(100):
+        alive = []
+        for pid in pids:
+            try:
+                process = psutil.Process(pid)
+                if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+                    continue
+            except (psutil.Error, OSError):
+                continue
+            alive.append(pid)
+        if not alive:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail(f"进程树仍在运行：{alive}")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows 没有 POSIX 进程组信号语义")
+@pytest.mark.asyncio
+async def test_async_subprocess_reaps_descendant_after_early_pipe_close(tmp_path):
+    """父进程关闭管道后，忽略终止信号的后代也必须被强制回收。"""
+    marker = tmp_path / "pids"
+    child_code = (
+        "import os, signal, time; os.close(1); os.close(2); "
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    )
+    command = [
+        sys.executable,
+        "-c",
+        (
+            "from pathlib import Path; import os, signal, subprocess, time; "
+            f"child = subprocess.Popen([{sys.executable!r}, '-c', {child_code!r}], "
+            "start_new_session=True); "
+            f"Path({str(marker)!r}).write_text(str(os.getpid()) + ':' + str(child.pid)); "
+            "signal.signal(signal.SIGTERM, lambda *_: os._exit(0)); time.sleep(60)"
+        ),
+    ]
+    task = asyncio.create_task(
+        SystemUtils.execute_with_subprocess_async(command, timeout=30)
+    )
+    deadline = time.monotonic() + 2
+    while not marker.exists() and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+    assert marker.exists()
+
+    pids = [int(value) for value in marker.read_text().split(":")]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    for _ in range(100):
+        alive = []
+        for pid in pids:
+            try:
+                process = psutil.Process(pid)
+                if not process.is_running() or process.status() == psutil.STATUS_ZOMBIE:
+                    continue
+            except (psutil.Error, OSError):
+                continue
+            alive.append(pid)
+        if not alive:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail(f"通信已结束但进程树仍在运行：{alive}")
 
 
 def test_execute_with_subprocess_redacts_userinfo_from_stdout_and_stderr():
@@ -322,6 +521,26 @@ def test_get_btrfs_fsid_is_disabled_on_unsupported_linux_architecture():
 def test_btrfs_fsid_dedup_setting_is_opt_in():
     assert ConfigModel().BTRFS_FSID_DEDUP is False
     assert ConfigModel(BTRFS_FSID_DEDUP="true").BTRFS_FSID_DEDUP is True
+
+
+def test_legacy_release_auto_update_mode_is_disabled(monkeypatch):
+    """历史 Release 启动更新值迁移为关闭，Dev 值继续保留。"""
+    updates = []
+    monkeypatch.setattr(
+        Settings,
+        "update_env_config",
+        lambda field, original, converted: updates.append(
+            (field, original, converted)
+        ),
+    )
+
+    assert Settings(MOVIEPILOT_AUTO_UPDATE="release").MOVIEPILOT_AUTO_UPDATE == "false"
+    assert Settings(MOVIEPILOT_AUTO_UPDATE="true").MOVIEPILOT_AUTO_UPDATE == "false"
+    assert Settings(MOVIEPILOT_AUTO_UPDATE="dev").MOVIEPILOT_AUTO_UPDATE == "dev"
+    assert updates == [
+        ("MOVIEPILOT_AUTO_UPDATE", "release", "false"),
+        ("MOVIEPILOT_AUTO_UPDATE", "true", "false"),
+    ]
 
 
 def test_space_usage_default_path_does_not_read_fsid():
@@ -596,12 +815,11 @@ def test_dashboard_downloader_forwards_btrfs_fsid_setting():
     from app.api.endpoints import dashboard as dashboard_module
 
     download_dir = MagicMock(download_path="/downloads")
-    with patch.object(dashboard_module.settings, "BTRFS_FSID_DEDUP", True), \
-            patch.object(dashboard_module.DirectoryHelper, "get_local_download_dirs",
+    with patch.object(dashboard_module.DirectoryHelper, "get_local_download_dirs",
                          return_value=[download_dir]), \
             patch.object(SystemUtils, "space_usage", return_value=(4.0, 2.0)) as usage_mock, \
             patch.object(dashboard_module.DashboardChain, "downloader_info", return_value=[]):
-        dashboard_module._build_downloader()
+        dashboard_module._build_downloader(btrfs_fsid_dedup=True)
 
     usage_mock.assert_called_once_with(
         [Path("/downloads")],

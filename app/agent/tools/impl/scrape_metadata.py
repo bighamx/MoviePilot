@@ -10,7 +10,8 @@ from app.agent.tools.base import MoviePilotTool
 from app.agent.tools.tags import ToolTag
 from app.chain.media import MediaChain
 from app.chain.scraping import ScrapingChain
-from app.runtime.config import settings
+from app.runtime.settings import get_runtime_setting
+
 from app.runtime.log import logger
 from app.schemas.workflow import FileItem
 from app.schemas.types import (
@@ -22,6 +23,12 @@ from app.schemas.types import (
 from app.schemas.media import normalize_media_source
 from app.domain.media import normalize_music_type
 from ._music_utils import simplify_music_info
+
+
+def _inspect_local_path(path: Path) -> tuple[bool, bool]:
+    """返回本地路径是否存在及是否为目录。"""
+    exists = path.exists()
+    return exists and path.is_dir(), exists
 
 
 class ScrapeMetadataInput(BaseModel):
@@ -149,7 +156,14 @@ class ScrapeMetadataTool(MoviePilotTool):
             media_id = normalized_media_id or None
 
             local_path = Path(path)
-            is_local_directory = (storage or "local") == "local" and local_path.is_dir()
+            is_local_directory = False
+            path_exists = True
+            if (storage or "local") == "local":
+                is_local_directory, path_exists = await self.run_blocking(
+                    "storage",
+                    _inspect_local_path,
+                    local_path,
+                )
             file_type = "dir" if is_local_directory or not local_path.suffix else "file"
             fileitem = FileItem(
                 storage=storage or "local",
@@ -159,7 +173,7 @@ class ScrapeMetadataTool(MoviePilotTool):
 
             # 检查本地存储路径是否存在
             if storage == "local":
-                if not Path(path).exists():
+                if not path_exists:
                     return json.dumps(
                         {"success": False, "message": f"刮削路径不存在: {path}"},
                         ensure_ascii=False,
@@ -169,7 +183,7 @@ class ScrapeMetadataTool(MoviePilotTool):
             scraping_chain = ScrapingChain()
             is_audio_file = (
                 fileitem.type == "file"
-                and Path(path).suffix.lower() in settings.RMT_AUDIOEXT
+                and Path(path).suffix.lower() in get_runtime_setting('RMT_AUDIOEXT')
             )
             scrape_music = media_type_enum == MediaType.MUSIC or (
                 media_type_enum is None and is_audio_file

@@ -7,22 +7,29 @@
 pytest 是唯一运行入口。`tests/conftest.py` 在收集前完成隔离引导，因此任何方式启动 pytest 都会自动隔离。
 
 ```bash
-pytest tests                              # 全量
-pytest tests/test_xxx.py                  # 单文件
-pytest tests/test_xxx.py::SomeTest::test_y   # 单用例
-python tests/run.py                       # 等价于 pytest 全量（参数透传）
+uv run --locked --no-sync pytest tests                              # 串行全量
+uv run --locked --no-sync pytest tests/test_xxx.py                  # 单文件
+uv run --locked --no-sync pytest tests/test_xxx.py::SomeTest::test_y   # 单用例
+uv run --locked --no-sync python tests/run.py                       # 默认按文件连续切成 4 片并行跑全量
+uv run --locked --no-sync python tests/run.py --serial              # 串行全量，便于调试或生成覆盖率
+uv run --locked --no-sync python tests/run.py --shard 1/4           # 只跑指定分片，供 CI 复用
 ```
+
+`tests/run.py` 的 runner 参数只有 `--serial` 和 `--shard N/TOTAL`；其余参数保持原顺序
+透传给 pytest，例如 `python tests/run.py -q --maxfail=1`。文件先按字典序排序，再以
+`ceil(文件数 / 分片数)` 的大小连续切片，确保本地与 CI 执行相同的文件集合和顺序。
 
 - 不再使用 `python -m unittest discover`：它不导入 `tests` 包、收不到纯函数用例，且绕过 `conftest.py` 的隔离。
 - 不再依赖 `python tests/test_xxx.py` 直跑：所有 `if __name__ == "__main__": unittest.main()` 尾巴已移除。
-- **复现 CI 用干净环境**：建议用一个仅 `pip install -r requirements-dev.in` 的虚拟环境运行，避免本地额外包或编译产物掩盖问题。
+- **复现 CI 用干净环境**：使用 `uv sync --locked` 从 `uv.lock` 创建环境，再以
+  `uv run --locked --no-sync` 运行测试，避免本地额外包、未锁定解析结果或编译产物掩盖问题。
 
 ## 隔离模型（`tests/conftest.py`）
 
 收集任何测试模块、`import app.*` **之前**，conftest 完成两件事：
 
 1. **临时库**：把 `CONFIG_DIR` 指向临时目录并 `init_db()` 建表。引擎本身已惰性创建（`import app.db` 不再连库），但 `settings` 在 `import app.runtime.config` 那一刻就把 `CONFIG_DIR` 读进字段并建好配置子目录，之后再改环境变量对 `settings.CONFIG_PATH` 毫无影响——引擎晚点才建，连的仍是真实 `user.db`。所以隔离必须早于首个牵入 `app.runtime.config` 的 import（`app.db` / `app.chain.*` 都会牵入）；空库会让运行期查表报 `no such table`，故必须建表。
-2. **`app.application.site.sites` 垫片**：该模块由独立仓库动态拉取、CI 无此文件，conftest 统一补最小垫片（本地存在真实模块时优先用真实模块）。兼容层会把旧插件的 `app.helper.sites` 导入路由到同一模块。
+2. **`app.application.site.sites` 垫片**：该模块由独立资源仓按平台下发，conftest 统一安装最小垫片，普通单测不会加载源码目录中的 `.so` / `.pyd`。兼容层会把旧插件的 `app.helper.sites` 导入路由到同一模块；真实制品由资源与 ABI 专项验收覆盖。
 
 由此推出两条**硬规范**：
 
@@ -138,6 +145,9 @@ def test_recognize_prefers_explicit_identity(sample_meta, monkeypatch):
 
 ## CI 与 PR
 
-- **门禁**：`.github/workflows/test.yml` 在指向 `v3` 的 `pull_request` / `push` 及手动触发时，用 `python tests/run.py` 跑全量单测。
-- **PR**：产品代码、测试基础设施、依赖或运行行为发生变化时，运行 `python tests/run.py`，确认本次改动涉及的路径通过且 socket 探针零真实出站。若存在无关失败，必须在当前 `upstream/v3` 基线上独立复现并在 PR 中如实说明；不得静默扩大当前 PR 去修复基线问题。纯文档变更按实际内容执行文本、结构和 diff 检查，CI 仍会运行全量门禁。
-- 复现 CI 用仅安装 `requirements-dev.in` 的干净环境；`requirements.in` 只承载运行时依赖，pytest 与覆盖率插件由开发依赖入口提供。
+- **门禁**：`.github/workflows/test.yml` 在指向 `v3` 的 `pull_request` / `push` 及手动触发时，从 `uv.lock` 同步环境。独立 `architecture` job 先运行宿主依赖、运行契约和基线 CLI 快速门禁；全量测试再通过 `tests/run.py --shard N/TOTAL` 稳定分到 4 个 pytest job。每个分片都有独立进程和临时 `CONFIG_DIR`，不共用 SQLite 或进程级状态。
+- **跨仓观察**：`.github/workflows/architecture-observe.yml` 每周或手工检出官方插件仓最新 `main`，使用 `--check-plugins` 比较公开导入、Hook 和动态 API 契约。它只上传 `official-plugin-architecture-report.json`，不会自动刷新 fixture；语义变化必须人工审查后显式执行 `--write-plugins`。
+- **静态检查**：`.github/workflows/pylint.yml` 对指向 `v3` 的 PR、推送和手工触发运行 Pylint。PR/推送改动到的 Python 文件是硬门禁；`app/` 全量扫描保留为建议性 JSON 构建工件，存量告警不会掩盖或阻塞本次增量治理。
+- **PR 本地验证**：提交前运行受影响测试和适用的静态检查。涉及依赖或锁文件、共享测试基建、数据库、启动链、跨模块生命周期、兼容层或大范围行为变化时，运行 `uv run --locked --no-sync python tests/run.py` 完成本地全量；需要断点、输出顺序或测试污染诊断时使用 `--serial`。所有测试都应确认受影响路径通过且 socket 探针无真实出站，验证说明准确标注执行范围。若存在无关失败，必须在当前 `upstream/v3` 基线上独立复现并在 PR 中如实说明；不得静默扩大当前 PR 去修复基线问题。纯文档变更执行适用的文本、结构和 diff 检查，CI 继续运行全量门禁。
+- **覆盖率门禁**：`Coverage Report` job 会在 `v3` 的 PR、push 和手工触发中通过 `tests/run.py --serial` 跑串行全量，先上传 JSON / XML 工件，再只读检查 Application 与 Domain 的 Ubuntu/Python 3.14 canonical 低水位。覆盖率下降会阻塞，提升或等比例快照变化也必须显式刷新 fixture；macOS 本地报告只用于诊断，不直接作为可提交基线。
+- 复现 CI 使用 `uv sync --locked`；主程序运行依赖位于 `[project].dependencies`，pytest 与覆盖率工具位于默认 `dev` 依赖组。

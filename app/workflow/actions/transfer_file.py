@@ -4,14 +4,12 @@ from typing import Optional
 
 from pydantic import Field
 
-from app.workflow.actions import BaseAction
-from app.runtime.config import global_vars
-from app.application.chain.data import TransferHistoryPortProxy as TransferHistoryOper
-from app.schemas.workflow import ActionParams
-from app.schemas.workflow import ActionContext
 from app.chain.storage import StorageChain
-from app.chain.transfer import TransferChain
+from app.chain.transfer.facade import TransferChain
 from app.runtime.log import logger
+from app.runtime.stop import runtime_stop_state
+from app.schemas.workflow import ActionContext, ActionParams
+from app.workflow.actions import BaseAction
 
 
 class TransferFileParams(ActionParams):
@@ -41,20 +39,9 @@ class TransferFileAction(BaseAction):
         self._fileitems = []
         self._has_error = False
 
-    @classmethod
-    @property
-    def name(cls) -> str:  # noqa
-        return "整理文件"
-
-    @classmethod
-    @property
-    def description(cls) -> str:  # noqa
-        return "整理队列中的文件"
-
-    @classmethod
-    @property
-    def data(cls) -> dict:  # noqa
-        return TransferFileParams().model_dump()
+    name = "整理文件"
+    description = "整理队列中的文件"
+    data = TransferFileParams().model_dump()
 
     @property
     def success(self) -> bool:
@@ -69,7 +56,7 @@ class TransferFileAction(BaseAction):
             """
             检查是否继续整理文件
             """
-            if global_vars.is_workflow_stopped(workflow_id):
+            if runtime_stop_state.is_workflow_stopped(workflow_id):
                 return False
             return True
 
@@ -78,11 +65,11 @@ class TransferFileAction(BaseAction):
         _failed_count = 0
         storagechain = StorageChain()
         transferchain = TransferChain()
-        transferhis = TransferHistoryOper()
+        transferhis = transferchain.transfer_history_repository
         if params.source == "downloads":
             # 从下载任务中整理文件
             for download in context.downloads:
-                if global_vars.is_workflow_stopped(workflow_id):
+                if runtime_stop_state.is_workflow_stopped(workflow_id):
                     break
                 if not download.completed:
                     logger.info(f"下载任务 {download.download_id} 未完成")
@@ -95,6 +82,9 @@ class TransferFileAction(BaseAction):
                 fileitem = storagechain.get_file_item(storage="local", path=Path(download.path))
                 if not fileitem:
                     logger.info(f"文件 {download.path} 不存在")
+                    continue
+                if not fileitem.path:
+                    logger.warn("工作流文件缺少可查询的源路径，跳过")
                     continue
                 transferd = transferhis.get_by_src(fileitem.path, storage=fileitem.storage)
                 if transferd:
@@ -114,6 +104,9 @@ class TransferFileAction(BaseAction):
             for fileitem in copy.deepcopy(context.fileitems):
                 if not check_continue():
                     break
+                if not fileitem.path:
+                    logger.warn("工作流文件缺少可查询的源路径，跳过")
+                    continue
                 # 检查缓存
                 cache_key = f"{fileitem.path}"
                 if self.check_cache(workflow_id, cache_key):

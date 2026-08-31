@@ -4,7 +4,6 @@ from sqlalchemy import Index, Integer, String, Text, delete, select, update
 from sqlalchemy.orm import Mapped, Session, mapped_column
 
 from app.db.base import Base, execute_dml, get_id_column
-from app.db.decorators import db_query, db_update
 from app.db.models.agenttask import AgentTask
 
 
@@ -38,10 +37,10 @@ class AgentTaskRun(Base):
     __table_args__ = (
         Index("ix_agenttaskrun_run_id", "run_id", unique=True),
         Index("ix_agenttaskrun_task_started", "task_id", "started_at", "id"),
+        Index("ix_agenttaskrun_status_started_id", "status", "started_at", "id"),
     )
 
     @classmethod
-    @db_update
     def begin_run(
             cls,
             db: Session,
@@ -107,7 +106,6 @@ class AgentTaskRun(Base):
         return run_id
 
     @classmethod
-    @db_update
     def finish_run(
             cls,
             db: Session,
@@ -174,7 +172,6 @@ class AgentTaskRun(Base):
         return True
 
     @classmethod
-    @db_update
     def interrupt_task(
             cls,
             db: Session,
@@ -226,7 +223,6 @@ class AgentTaskRun(Base):
         ))
 
     @classmethod
-    @db_update
     def delete_task_and_runs(
             cls,
             db: Session,
@@ -253,7 +249,6 @@ class AgentTaskRun(Base):
         return True
 
     @classmethod
-    @db_query
     def get_by_run_id(
             cls,
             db: Session,
@@ -265,7 +260,6 @@ class AgentTaskRun(Base):
         ).scalars().first()
 
     @classmethod
-    @db_query
     def list_for_task(
             cls,
             db: Session,

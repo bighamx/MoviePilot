@@ -1,9 +1,9 @@
 import threading
 from abc import abstractmethod, ABCMeta
-from typing import Generic, Tuple, Union, TypeVar, Type, Dict, Optional, Callable
+from typing import Any, Generic, Tuple, Union, TypeVar, Type, Dict, Optional, Callable
 from pathlib import Path
 
-from app.runtime.extensions.service_config import ServiceConfigHelper
+from app.runtime.extensions.service import ServiceConfigHelper
 from app.runtime.log import logger
 from app.schemas.message import Message
 from app.schemas.system import NotificationConf
@@ -93,10 +93,10 @@ class _ModuleBase(ConfigReloadMixin, metaclass=ABCMeta):
         pass
 
     @abstractmethod
-    def stop(self) -> None:
+    def stop(self) -> Optional[bool]:
         """
         如果关闭时模块有服务需要停止，需要实现此方法
-        :return: None，该方法可被多个模块同时处理
+        :return: False 表示资源尚未收敛；None/True 表示本次停止完成
         """
         pass
 
@@ -148,10 +148,16 @@ class ServiceBase(Generic[TService, TConf], metaclass=ABCMeta):
             # 通过服务类型或工厂函数来创建实例
             if isinstance(service_type, type):
                 # 如果传入的是类类型，调用构造函数实例化
-                self._instances[conf.name] = service_type(name=conf.name, **conf.config)
+                self._instances[conf.name] = service_type(
+                    **self._service_kwargs(conf)
+                )
             else:
                 # 如果传入的是工厂函数，直接调用工厂函数
                 self._instances[conf.name] = service_type(conf)
+
+    def _service_kwargs(self, conf: TConf) -> Dict[str, Any]:
+        """构建类服务实例参数，允许具体模块传递稳定配置身份。"""
+        return {"name": conf.name, **conf.config}
 
     def get_instances(self) -> Dict[str, TService]:
         """
@@ -202,9 +208,18 @@ class ServiceBase(Generic[TService, TConf], metaclass=ABCMeta):
         """
         获取默认服务配置的名称
 
-        :return: 默认第一个配置的名称
+        优先返回被显式标记为默认的配置。只有在没有任何配置带标记时，才退回到第一个配置——
+        配置的先后来自读取顺序，用户既看不见也控制不了，删掉一个配置会让「默认」静默改指
+        另一个，因此它只能作为无标记时的兜底，不能盖过用户的显式选择。
+
+        :return: 默认配置的名称，无配置时为 None
         """
-        # 默认使用第一个配置的名称
+        marked = next(
+            (conf for conf in self._configs.values() if getattr(conf, "default", False)),
+            None,
+        )
+        if marked:
+            return marked.name
         first_conf = next(iter(self._configs.values()), None)
         return first_conf.name if first_conf else None
 

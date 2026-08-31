@@ -2,18 +2,19 @@ import os
 import shutil
 import time
 from pathlib import Path
-from typing import Optional, List
+from typing import List, Optional
 
-from app.schemas.file import StorageUsage as _SchemaStorageUsage
-from app.schemas.workflow import FileItem as _SchemaFileItem
-from app.runtime.config import global_vars, settings
-from app.application.directory import DirectoryHelper
-from app.runtime.log import logger
 from app.adapters.system.fsproxy import fsproxy
-from app.modules.filemanager.storages import StorageBase, transfer_process
-from app.schemas.exception import StorageQueryError
-from app.schemas.types import StorageSchema
 from app.adapters.system.host import SystemUtils
+from app.application.directory import DirectoryHelper
+from app.modules.filemanager.storages import StorageBase, transfer_process
+from app.runtime.log import logger
+from app.runtime.settings import get_runtime_setting
+from app.runtime.stop import runtime_stop_state
+from app.schemas.exception import StorageQueryError
+from app.schemas.file import StorageUsage as _SchemaStorageUsage
+from app.schemas.types import StorageSchema
+from app.schemas.workflow import FileItem as _SchemaFileItem
 
 
 class LocalStorage(StorageBase):
@@ -298,7 +299,7 @@ class LocalStorage(StorageBase):
             copied = fsproxy.copy(
                 src, partial,
                 progress_cb=progress_callback,
-                cancel_cb=lambda: global_vars.is_transfer_stopped(src.as_posix()),
+                cancel_cb=lambda: runtime_stop_state.consume_transfer_stop(src.as_posix()),
                 chunk_size=self.chunk_size,
             )
             if not copied:
@@ -349,7 +350,7 @@ class LocalStorage(StorageBase):
         try:
             with open(src, "rb") as fsrc, open(dest, "wb") as fdst:
                 while True:
-                    if global_vars.is_transfer_stopped(src.as_posix()):
+                    if runtime_stop_state.consume_transfer_stop(src.as_posix()):
                         logger.info(f"【本地】{src} 复制已取消！")
                         return False
                     buf = fsrc.read(self.chunk_size)
@@ -474,7 +475,7 @@ class LocalStorage(StorageBase):
         total_storage, free_storage = SystemUtils.space_usage(
             [Path(d.download_path) for d in directory_helper.get_local_download_dirs() if d.download_path] +
             [Path(d.library_path) for d in directory_helper.get_local_library_dirs() if d.library_path],
-            btrfs_fsid_dedup=settings.BTRFS_FSID_DEDUP,
+            btrfs_fsid_dedup=get_runtime_setting('BTRFS_FSID_DEDUP'),
         )
         return _SchemaStorageUsage(
             total=total_storage,

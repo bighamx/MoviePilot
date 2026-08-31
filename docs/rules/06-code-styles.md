@@ -11,7 +11,7 @@
 
 ## Python Version and Typing
 
-- Target: **Python 3.11+**. CI runs Python 3.12.
+- Target: **Python 3.14+**. Python 3.14 is the primary CI version; dependency CI also verifies supported platforms and both Linux runtime profiles.
 - **Type annotations are required** on all public methods and function signatures.
 - Use `Optional[X]` for nullable types (do not use `X | None` — keep consistency with the existing codebase style).
 - Use `Union[X, Y]` for multi-type parameters.
@@ -35,7 +35,10 @@
 - Prefer `async def` for I/O-bound operations (network requests, database queries, file operations).
 - Use `await` consistently; do not mix sync and async code paths in the same function without using `run_in_threadpool` from FastAPI or `asyncio.to_thread`.
 - For CPU-bound work that must not block the event loop, submit to `ThreadHelper` (see `app/runtime/thread.py`).
-- Do not use bare `threading.Thread` in new code; use `ThreadHelper.submit()`.
+- Use `ThreadHelper.submit()` for finite background work. A long-lived protocol loop may use a
+  dedicated `threading.Thread` only when its existing lifecycle owner signals and joins that child,
+  while the external caller bounded-waits and retains the parent owner on non-convergence; do not
+  create a dedicated thread pool for that exception.
 
 ---
 
@@ -107,18 +110,20 @@ except:
 - Private functions in the same file are preferable to extracting a new module for single-use logic.
 - Add code to the canonical capability package that owns it, and extend an existing domain file whenever that domain already exists.
 - Do not recreate generic `core`, `helper`, or `utils` buckets; see `05-architecture.md` for placement rules.
-- New files should use a focused noun name; a role suffix is appropriate only when it distinguishes ownership, such as `plugin_manager.py`; otherwise prefer the package-owned noun, such as `adapters/system/package.py`.
+- New files use one focused lowercase noun. When the capability already names the package, put the role in a single-word child such as `plugin/manager.py`; do not flatten it back into `plugin_manager.py`.
 - Keep files focused on one domain concern.
 
 ---
 
 ## What Not To Do
 
-- Do not introduce new third-party libraries without placing them in the correct dependency entry: runtime packages in `requirements.in`, test/lint/build tooling in `requirements-dev.in`.
+- Do not introduce new third-party libraries without placing them in the correct `pyproject.toml` dependency group and updating `uv.lock`: runtime packages belong in `[project].dependencies`, test/lint/build tooling in `[dependency-groups].dev`.
 - Do not use `requests` or `httpx` directly for external HTTP calls - host code uses `RequestUtils` from `app/adapters/network/http.py`; plugins use `app.sdk.network`.
-- Do not issue raw SQLAlchemy queries from chains, modules, or endpoints — use the Oper classes in `app/db/oper/`.
+- Do not issue raw SQLAlchemy queries or import Oper classes from chains, modules,
+  or endpoints. Define/consume an Application persistence Port; its concrete
+  implementation under `app/db/adapters/` may use Oper classes from `app/db/oper/`.
 - Do not add TODO or FIXME without context. Only keep one if it is genuinely deferred and cannot be addressed in the current task.
 - Do not add noisy markers like `# change starts here`, `# important`, or `# this is a fix`.
 - Do not write comments that restate what the code already clearly says.
 
-*Last Updated: 2026-08-14*
+*Last Updated: 2026-08-19*

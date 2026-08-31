@@ -1,8 +1,13 @@
-from typing import List, Any, Dict, Annotated, Union
+from typing import Annotated, Any, Dict, List, Union
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
+from app.adapters.web.security.access import verify_apikey
+from app.agent.tools.manager import moviepilot_tool_manager
+from app.api.response import RAW_RESPONSE_OPENAPI_KEY, ResponseAPIRouter
+from app.runtime.log import logger
+from app.runtime.version import get_app_version
 from app.schemas.mcp import MCP_JSONRPC_REQUEST_SCHEMA as _SchemaMCP_JSONRPC_REQUEST_SCHEMA
 from app.schemas.mcp import McpJsonRpcError as _SchemaMcpJsonRpcError
 from app.schemas.mcp import McpJsonRpcResponse as _SchemaMcpJsonRpcResponse
@@ -11,16 +16,6 @@ from app.schemas.mcp import McpToolInfo as _SchemaMcpToolInfo
 from app.schemas.mcp import ToolCallData as _SchemaToolCallData
 from app.schemas.mcp import ToolCallRequest as _SchemaToolCallRequest
 from app.schemas.response import Response as _SchemaResponse
-from app.api.response import RAW_RESPONSE_OPENAPI_KEY, ResponseAPIRouter
-from app.agent.tools.manager import moviepilot_tool_manager
-from app.adapters.web.security.access import verify_apikey
-from app.runtime.log import logger
-
-# 导入版本号
-try:
-    from version import APP_VERSION
-except ImportError:
-    APP_VERSION = "unknown"
 
 router = ResponseAPIRouter()
 
@@ -84,6 +79,39 @@ def create_jsonrpc_error(
     return error
 
 
+async def _dispatch_jsonrpc_method(
+    method: Any,
+    params: Dict[str, Any],
+    request_id: Union[str, int, None],
+) -> Union[JSONResponse, Response]:
+    """分派一个已经通过基础格式校验的 MCP JSON-RPC 方法。"""
+    if method == "initialize":
+        result = await handle_initialize(params)
+        return JSONResponse(content=create_jsonrpc_response(request_id, result))
+    if method == "notifications/initialized":
+        if request_id is None:
+            return Response(status_code=204)
+        return JSONResponse(
+            status_code=400,
+            content=create_jsonrpc_error(
+                request_id, -32600, "initialized must be a notification"
+            ),
+        )
+    if method == "tools/list":
+        result = await handle_tools_list()
+        return JSONResponse(content=create_jsonrpc_response(request_id, result))
+    if method == "tools/call":
+        result = await handle_tools_call(params)
+        return JSONResponse(content=create_jsonrpc_response(request_id, result))
+    if method == "ping":
+        return JSONResponse(content=create_jsonrpc_response(request_id, {}))
+    return JSONResponse(
+        content=create_jsonrpc_error(
+            request_id, -32601, f"Method not found: {method}"
+        )
+    )
+
+
 @router.post(
     "",
     summary="MCP JSON-RPC 端点",
@@ -130,48 +158,8 @@ async def mcp_jsonrpc(
     params = body.get("params", {})
     request_id = body.get("id")
 
-    # 如果有 id，则为请求；没有 id 则为通知
-    is_notification = request_id is None
-
     try:
-        # 处理初始化请求
-        if method == "initialize":
-            result = await handle_initialize(params)
-            return JSONResponse(content=create_jsonrpc_response(request_id, result))
-
-        # 处理已初始化通知
-        elif method == "notifications/initialized":
-            if is_notification:
-                return Response(status_code=204)
-            else:
-                return JSONResponse(
-                    status_code=400,
-                    content=create_jsonrpc_error(
-                        request_id, -32600, "initialized must be a notification"
-                    ),
-                )
-
-        # 处理工具列表请求
-        if method == "tools/list":
-            result = await handle_tools_list()
-            return JSONResponse(content=create_jsonrpc_response(request_id, result))
-
-        # 处理工具调用请求
-        elif method == "tools/call":
-            result = await handle_tools_call(params)
-            return JSONResponse(content=create_jsonrpc_response(request_id, result))
-
-        # 处理 ping 请求
-        elif method == "ping":
-            return JSONResponse(content=create_jsonrpc_response(request_id, {}))
-
-        # 未知方法
-        else:
-            return JSONResponse(
-                content=create_jsonrpc_error(
-                    request_id, -32601, f"Method not found: {method}"
-                )
-            )
+        return await _dispatch_jsonrpc_method(method, params, request_id)
 
     except ValueError as e:
         logger.warning(f"MCP 请求参数错误: {e}")
@@ -220,7 +208,7 @@ async def handle_initialize(params: Dict[str, Any]) -> Dict[str, Any]:
         },
         "serverInfo": {
             "name": "MoviePilot",
-            "version": APP_VERSION,
+            "version": get_app_version(),
             "description": "MoviePilot MCP Server - 电影自动化管理工具",
         },
         "instructions": "MoviePilot MCP 服务器，提供媒体管理、订阅、下载等工具。",

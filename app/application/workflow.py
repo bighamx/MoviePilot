@@ -1,11 +1,12 @@
 """工作流状态与定义写操作应用用例。"""
 
-from dataclasses import dataclass
 import json
 from collections.abc import Awaitable
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, Mapping, Optional, Protocol
+from typing import Any, Callable, List, Mapping, Optional, Protocol, TypeVar
 
+from app.schemas.common import JsonData
 
 WORKFLOW_TRIGGER_TIMER = "timer"
 WORKFLOW_TRIGGER_EVENT = "event"
@@ -17,32 +18,179 @@ SUPPORTED_WORKFLOW_TRIGGERS = {
 }
 
 
-class AsyncWorkflowQueryRepository(Protocol):
-    """工作流查询用例需要的异步读取端口。"""
+@dataclass(frozen=True, slots=True)
+class WorkflowSnapshot:
+    """工作流查询返回的脱离数据库会话的冻结快照。"""
 
-    async def async_list(self) -> list[Any]:
-        """读取全部工作流。"""
+    id: int
+    name: str
+    description: Optional[str]
+    timer: Optional[str]
+    trigger_type: Optional[str]
+    event_type: Optional[str]
+    event_conditions: Mapping[str, JsonData]
+    state: str
+    current_action: Optional[str]
+    result: Optional[str]
+    run_count: Optional[int]
+    actions: tuple[Mapping[str, JsonData], ...]
+    flows: tuple[Mapping[str, JsonData], ...]
+    context: Mapping[str, JsonData]
+    execution_config: Mapping[str, JsonData]
+    execution_state: Mapping[str, JsonData]
+    add_time: Optional[str]
+    last_time: Optional[str]
+
+
+class WorkflowRuntime(Protocol):
+    """声明宿主入口与 Chain 消费的工作流运行时能力。"""
+
+    def execute(self, *args: Any, **kwargs: Any) -> Any:
+        """执行单个工作流动作，参数与 concrete 管理器保持一致。"""
         ...
 
-    async def async_get(self, workflow_id: int) -> Optional[Any]:
-        """按 ID 读取工作流。"""
+    def list_actions(self) -> list[dict[str, Any]]:
+        """返回当前运行时登记的工作流动作定义。"""
+        ...
+
+    def load_workflow_events(self, workflow_id: Optional[int] = None) -> None:
+        """加载全部或指定工作流的事件触发器。"""
+        ...
+
+    def remove_workflow_event(
+            self,
+            workflow_id: Optional[int] = None,
+            event_type_str: Optional[str] = None,
+    ) -> None:
+        """移除全部或指定工作流的事件触发器。"""
+        ...
+
+    def update_workflow_event(self, workflow: WorkflowSnapshot) -> None:
+        """按最新定义刷新工作流事件触发器。"""
+        ...
+
+    def register_execution(self, owner: "WorkflowExecutionOwner") -> bool:
+        """登记活动工作流执行 owner；停机封口后返回 False。"""
+        ...
+
+    def unregister_execution(self, owner: "WorkflowExecutionOwner") -> None:
+        """在工作流执行真实终止后释放 owner。"""
+        ...
+
+
+class WorkflowExecutionOwner(Protocol):
+    """声明 concrete 工作流管理器需要持有的执行生命周期能力。"""
+
+    def request_stop(self) -> None:
+        """请求停止继续调度，并通知支持取消的活动动作。"""
+        ...
+
+    def wait_stopped(self, timeout: float) -> bool:
+        """有限等待执行及其节点线程池真实终止。"""
+        ...
+
+
+WorkflowRuntimeProvider = Callable[[], WorkflowRuntime]
+
+
+def _unconfigured_workflow_runtime() -> WorkflowRuntime:
+    """拒绝在启动组合根装配前隐式创建工作流管理器。"""
+    raise RuntimeError("工作流运行时尚未由启动组合根装配")
+
+
+_workflow_runtime_provider: WorkflowRuntimeProvider = _unconfigured_workflow_runtime
+
+
+def configure_workflow_runtime(
+    provider: Optional[WorkflowRuntimeProvider],
+) -> WorkflowRuntimeProvider:
+    """登记工作流运行时 provider，并返回先前 provider 供失败回滚。"""
+    global _workflow_runtime_provider
+    previous = _workflow_runtime_provider
+    _workflow_runtime_provider = provider or _unconfigured_workflow_runtime
+    return previous
+
+
+def reset_workflow_runtime() -> None:
+    """恢复未装配 provider，禁止重复 lifespan 复用旧运行时。"""
+    configure_workflow_runtime(None)
+
+
+def get_workflow_manager() -> WorkflowRuntime:
+    """返回组合根提供的工作流运行时，避免消费者直接定位 Singleton。"""
+    return _workflow_runtime_provider()
+
+
+class WorkflowQueryRepository(Protocol):
+    """工作流查询用例需要的同步与异步快照端口。"""
+
+    def get(self, workflow_id: int) -> Optional[WorkflowSnapshot]:
+        """按 ID 读取工作流快照。"""
+        ...
+
+    def list_enabled(self) -> List[WorkflowSnapshot]:
+        """读取全部启用的工作流快照。"""
+        ...
+
+    def list_timer_enabled(self) -> List[WorkflowSnapshot]:
+        """读取启用的定时工作流快照。"""
+        ...
+
+    def list_event_enabled(self) -> List[WorkflowSnapshot]:
+        """读取启用的事件工作流快照。"""
+        ...
+
+    async def async_list(self) -> List[WorkflowSnapshot]:
+        """异步读取全部工作流快照。"""
+        ...
+
+    async def async_get(self, workflow_id: int) -> Optional[WorkflowSnapshot]:
+        """异步按 ID 读取工作流快照。"""
+        ...
+
+
+class WorkflowCachePort(Protocol):
+    """工作流重置所需的同步与异步配置缓存端口。"""
+
+    def delete(self, key: Any) -> Any:
+        """删除配置缓存。"""
+        ...
+
+    async def async_delete(self, key: Any) -> Any:
+        """通过异步数据库执行端口删除配置缓存。"""
         ...
 
 
 class WorkflowQueryService:
     """提供工作流列表和详情查询，隔离 API 与数据库会话。"""
 
-    def __init__(self, repository: AsyncWorkflowQueryRepository) -> None:
-        """保存请求级异步查询端口。"""
+    def __init__(self, repository: WorkflowQueryRepository) -> None:
+        """保存可返回脱离会话快照的查询端口。"""
         self._repository = repository
 
-    async def list(self) -> list[Any]:
-        """返回全部工作流。"""
+    async def list(self) -> List[WorkflowSnapshot]:
+        """返回全部工作流快照。"""
         return await self._repository.async_list()
 
-    async def get(self, workflow_id: int) -> Optional[Any]:
-        """返回指定工作流。"""
+    async def get(self, workflow_id: int) -> Optional[WorkflowSnapshot]:
+        """返回指定工作流快照。"""
         return await self._repository.async_get(workflow_id)
+
+    def get_sync(self, workflow_id: int) -> Optional[WorkflowSnapshot]:
+        """同步返回指定工作流快照。"""
+        return self._repository.get(workflow_id)
+
+    def list_enabled(self) -> List[WorkflowSnapshot]:
+        """同步返回全部启用的工作流快照。"""
+        return self._repository.list_enabled()
+
+    def list_timer_enabled(self) -> List[WorkflowSnapshot]:
+        """同步返回启用的定时工作流快照。"""
+        return self._repository.list_timer_enabled()
+
+    def list_event_enabled(self) -> List[WorkflowSnapshot]:
+        """同步返回启用的事件工作流快照。"""
+        return self._repository.list_event_enabled()
 
 
 _configured_workflow_query: WorkflowQueryService | None = None
@@ -52,6 +200,12 @@ def configure_workflow_query(service: WorkflowQueryService) -> None:
     """由启动组合根登记工作流查询服务。"""
     global _configured_workflow_query
     _configured_workflow_query = service
+
+
+def reset_workflow_query() -> None:
+    """清除当前 lifespan 的工作流查询服务。"""
+    global _configured_workflow_query
+    _configured_workflow_query = None
 
 
 def get_configured_workflow_query() -> WorkflowQueryService:
@@ -99,6 +253,173 @@ class UnitOfWork(Protocol):
     def rollback(self) -> None:
         """回滚当前事务。"""
         ...
+
+
+class WorkflowExecutionPort(Protocol):
+    """工作流 Chain 提交执行状态所需的类型化事务端口。"""
+
+    def start(self, workflow_id: int) -> bool:
+        """提交工作流运行中状态。"""
+        ...
+
+    def success(
+            self,
+            workflow_id: int,
+            result: Optional[str] = None,
+    ) -> bool:
+        """提交工作流成功状态。"""
+        ...
+
+    def fail(self, workflow_id: int, result: str) -> bool:
+        """提交工作流失败状态。"""
+        ...
+
+    def step(
+            self,
+            workflow_id: int,
+            action_id: str,
+            context: dict[str, Any],
+            execution_state: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """提交工作流动作进度。"""
+        ...
+
+    def reset(self, workflow_id: int, reset_count: bool = False) -> bool:
+        """提交工作流执行状态重置。"""
+        ...
+
+
+_configured_workflow_execution: Optional[WorkflowExecutionPort] = None
+
+
+def configure_workflow_execution(service: WorkflowExecutionPort) -> None:
+    """由启动组合根登记唯一工作流执行状态事务服务。"""
+    global _configured_workflow_execution
+    _configured_workflow_execution = service
+
+
+def reset_workflow_execution() -> None:
+    """清除当前 lifespan 的工作流执行状态事务服务。"""
+    global _configured_workflow_execution
+    _configured_workflow_execution = None
+
+
+def get_configured_workflow_execution() -> WorkflowExecutionPort:
+    """返回启动阶段登记的工作流执行状态事务服务。"""
+    if _configured_workflow_execution is None:
+        raise RuntimeError("工作流执行状态事务服务尚未配置")
+    return _configured_workflow_execution
+
+
+class WorkflowExecutionRepository(Protocol):
+    """工作流执行状态写入所需的最小暂存端口。"""
+
+    def stage_start(self, workflow_id: int) -> bool:
+        """暂存运行中状态。"""
+        ...
+
+    def stage_success(
+            self,
+            workflow_id: int,
+            result: Optional[str] = None,
+    ) -> bool:
+        """暂存成功状态和执行次数。"""
+        ...
+
+    def stage_fail(self, workflow_id: int, result: str) -> bool:
+        """暂存失败状态和错误信息。"""
+        ...
+
+    def stage_step(
+            self,
+            workflow_id: int,
+            action_id: str,
+            context: dict[str, Any],
+            execution_state: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """暂存动作进度和执行上下文。"""
+        ...
+
+    def stage_execution_reset(
+            self,
+            workflow_id: int,
+            reset_count: bool = False,
+    ) -> bool:
+        """暂存执行状态重置。"""
+        ...
+
+
+_ExecutionResult = TypeVar("_ExecutionResult")
+
+
+class WorkflowExecutionCommand:
+    """在一个显式 UnitOfWork 中提交单次工作流执行状态变更。"""
+
+    def __init__(
+            self,
+            *,
+            repository: WorkflowExecutionRepository,
+            unit_of_work: UnitOfWork,
+    ) -> None:
+        """保存工作流执行仓储和事务端口。"""
+        self._repository = repository
+        self._unit_of_work = unit_of_work
+
+    def start(self, workflow_id: int) -> bool:
+        """提交工作流运行中状态。"""
+        return self._commit(lambda: self._repository.stage_start(workflow_id))
+
+    def success(
+            self,
+            workflow_id: int,
+            result: Optional[str] = None,
+    ) -> bool:
+        """提交工作流成功状态。"""
+        return self._commit(
+            lambda: self._repository.stage_success(workflow_id, result)
+        )
+
+    def fail(self, workflow_id: int, result: str) -> bool:
+        """提交工作流失败状态。"""
+        return self._commit(
+            lambda: self._repository.stage_fail(workflow_id, result)
+        )
+
+    def step(
+            self,
+            workflow_id: int,
+            action_id: str,
+            context: dict[str, Any],
+            execution_state: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """提交工作流动作进度。"""
+        return self._commit(
+            lambda: self._repository.stage_step(
+                workflow_id,
+                action_id,
+                context,
+                execution_state,
+            )
+        )
+
+    def reset(self, workflow_id: int, reset_count: bool = False) -> bool:
+        """提交工作流执行状态重置。"""
+        return self._commit(
+            lambda: self._repository.stage_execution_reset(
+                workflow_id,
+                reset_count,
+            )
+        )
+
+    def _commit(self, operation: Callable[[], _ExecutionResult]) -> _ExecutionResult:
+        """提交暂存操作；失败时回滚并原样传播异常。"""
+        try:
+            result = operation()
+            self._unit_of_work.commit()
+            return result
+        except Exception:
+            self._unit_of_work.rollback()
+            raise
 
 
 class WorkflowMutationCommand:
@@ -175,6 +496,9 @@ class WorkflowMutationCommand:
             values["trigger_type"] = WORKFLOW_TRIGGER_TIMER
 
         updated = self._repository.stage_update(workflow_id, values)
+        if not updated:
+            self._unit_of_work.rollback()
+            return WorkflowMutationResult(False, "工作流不存在")
         self._commit()
         self._remove_timer(updated)
         if (
@@ -250,14 +574,14 @@ class WorkflowDefinitionCommand:
         repository: AsyncWorkflowDefinitionRepository,
         unit_of_work: AsyncUnitOfWork,
         stop_running: Callable[[int], None],
-        delete_cache: Callable[[int], None],
+        async_delete_cache: Callable[[int], Awaitable[Any]],
         report_fork: Optional[Callable[[int], Awaitable[object]]] = None,
     ) -> None:
         """保存异步事务和提交后运行时副作用端口。"""
         self._repository = repository
         self._unit_of_work = unit_of_work
         self._stop_running = stop_running
-        self._delete_cache = delete_cache
+        self._async_delete_cache = async_delete_cache
         self._report_fork = report_fork
 
     async def create(self, payload: Mapping[str, Any]) -> WorkflowMutationResult:
@@ -334,7 +658,7 @@ class WorkflowDefinitionCommand:
         await self._repository.stage_reset(workflow_id, reset_count=True)
         await self._commit()
         self._stop_running(workflow_id)
-        self._delete_cache(workflow_id)
+        await self._async_delete_cache(workflow_id)
         return WorkflowMutationResult(True)
 
     async def _commit(self) -> None:

@@ -1,21 +1,47 @@
+from datetime import datetime
 from typing import Optional
-from sqlalchemy import Integer, String, Boolean, DateTime, Text, select, ForeignKey
+
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import Mapped, Session, mapped_column
-from datetime import datetime
 
 from app.db.base import Base, get_id_column
-from app.db.decorators import db_query, db_update, async_db_query, async_db_update
+
+
+def _get_by_user_id_statement(model: type["PassKey"], user_id: int):
+    """构造按用户筛选启用 PassKey 的查询语句。"""
+    return select(model).where(model.user_id == user_id, model.is_active.is_(True))
+
+
+def _get_by_credential_id_statement(
+    model: type["PassKey"],
+    credential_id: str,
+):
+    """构造按凭证 ID 筛选启用 PassKey 的查询语句。"""
+    return select(model).where(
+        model.credential_id == credential_id,
+        model.is_active.is_(True),
+    )
 
 
 class PassKey(Base):
     """
     用户PassKey凭证表
     """
+
     # ID
     id = get_id_column()
     # 用户ID
-    user_id: Mapped[int] = mapped_column(Integer, ForeignKey('user.id'), nullable=False, index=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey(
+            "user.id",
+            name="fk_passkey_user_id_user",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+        index=True,
+    )
     # 凭证ID (credential_id)
     credential_id: Mapped[str] = mapped_column(String, nullable=False, unique=True, index=True)
     # 凭证公钥
@@ -36,96 +62,85 @@ class PassKey(Base):
     transports: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
     @classmethod
-    @db_query
-    def get_by_user_id(cls, db: Session, user_id: int):
-        """获取用户的所有PassKey"""
-        return list(db.execute(
-            select(cls).where(cls.user_id == user_id, cls.is_active.is_(True))
-        ).scalars().all())
+    def get_by_user_id(
+        cls,
+        db: Session,
+        user_id: int,
+    ):
+        """在调用方 Session 中获取用户的所有启用 PassKey。"""
+        return list(db.execute(_get_by_user_id_statement(cls, user_id)).scalars().all())
 
     @classmethod
-    @async_db_query
     async def async_get_by_user_id(cls, db: AsyncSession, user_id: int):
-        """异步获取用户的所有PassKey"""
-        result = await db.execute(
-            select(cls).filter(cls.user_id == user_id, cls.is_active.is_(True))
-        )
+        """在调用方 AsyncSession 中获取用户的所有启用 PassKey。"""
+        result = await db.execute(_get_by_user_id_statement(cls, user_id))
         return list(result.scalars().all())
 
     @classmethod
-    @db_query
-    def get_by_credential_id(cls, db: Session, credential_id: str):
-        """根据凭证ID获取PassKey"""
-        return db.execute(
-            select(cls).where(cls.credential_id == credential_id, cls.is_active.is_(True))
-        ).scalars().first()
+    def get_by_credential_id(
+        cls,
+        db: Session,
+        credential_id: str,
+    ):
+        """在调用方 Session 中按凭证 ID 获取启用 PassKey。"""
+        return db.execute(_get_by_credential_id_statement(cls, credential_id)).scalars().first()
 
     @classmethod
-    @async_db_query
     async def async_get_by_credential_id(cls, db: AsyncSession, credential_id: str):
-        """异步根据凭证ID获取PassKey"""
-        result = await db.execute(
-            select(cls).filter(cls.credential_id == credential_id, cls.is_active.is_(True))
-        )
+        """在调用方 AsyncSession 中根据凭证 ID 获取启用 PassKey。"""
+        result = await db.execute(_get_by_credential_id_statement(cls, credential_id))
         return result.scalars().first()
 
     @classmethod
-    @db_query
     def get_by_id(cls, db: Session, passkey_id: int):
-        """根据ID获取PassKey"""
+        """在调用方 Session 中根据 ID 获取 PassKey。"""
         return db.execute(select(cls).where(cls.id == passkey_id)).scalars().first()
 
     @classmethod
-    @async_db_query
     async def async_get_by_id(cls, db: AsyncSession, passkey_id: int):
-        """异步根据ID获取PassKey"""
-        result = await db.execute(
-            select(cls).filter(cls.id == passkey_id)
-        )
+        """在调用方 AsyncSession 中根据 ID 获取 PassKey。"""
+        result = await db.execute(select(cls).filter(cls.id == passkey_id))
         return result.scalars().first()
 
     @classmethod
-    @db_update
     def delete_by_id(cls, db: Session, passkey_id: int, user_id: int):
         """删除指定用户的PassKey"""
-        passkey = db.execute(
-            select(cls).where(cls.id == passkey_id, cls.user_id == user_id)
-        ).scalars().first()
+        passkey = db.execute(select(cls).where(cls.id == passkey_id, cls.user_id == user_id)).scalars().first()
         if passkey:
-            passkey.delete(db, passkey.id)
+            db.delete(passkey)
             return True
         return False
 
     @classmethod
-    @async_db_update
     async def async_delete_by_id(cls, db: AsyncSession, passkey_id: int, user_id: int):
         """异步删除指定用户的PassKey"""
-        result = await db.execute(
-            select(cls).filter(
-                cls.id == passkey_id,
-                cls.user_id == user_id
-            )
-        )
+        result = await db.execute(select(cls).filter(cls.id == passkey_id, cls.user_id == user_id))
         passkey = result.scalars().first()
         if passkey:
-            await passkey.async_delete(db, passkey.id)
+            await db.delete(passkey)
             return True
         return False
 
-    @db_update
     def update_last_used(self, db: Session, sign_count: int):
         """更新最后使用时间和签名计数"""
-        self.update(db, {
-            'last_used_at': datetime.now(),
-            'sign_count': sign_count
-        })
+        db.execute(
+            update(type(self))
+            .where(type(self).id == self.id)
+            .values(
+                last_used_at=datetime.now(),
+                sign_count=sign_count,
+            )
+        )
         return True
 
-    @async_db_update
     async def async_update_last_used(self, db: AsyncSession, sign_count: int):
         """异步更新最后使用时间和签名计数"""
-        await self.async_update(db, {
-            'last_used_at': datetime.now(),
-            'sign_count': sign_count
-        })
+        await db.execute(
+            update(type(self))
+            .where(type(self).id == self.id)
+            .values(
+                last_used_at=datetime.now(),
+                sign_count=sign_count,
+            )
+        )
         return True

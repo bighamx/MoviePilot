@@ -1,8 +1,7 @@
-from app.workflow.actions import BaseAction
 from app.runtime.events import eventmanager
-from app.schemas.workflow import ActionParams
-from app.schemas.workflow import ActionContext
 from app.schemas.types import ChainEventType
+from app.schemas.workflow import ActionContext, ActionParams
+from app.workflow.actions import BaseAction
 
 
 class SendEventParams(ActionParams):
@@ -19,20 +18,9 @@ class SendEventAction(BaseAction):
 
     contract = {}
 
-    @classmethod
-    @property
-    def name(cls) -> str: # noqa
-        return "发送事件"
-
-    @classmethod
-    @property
-    def description(cls) -> str: # noqa
-        return "发送任务执行事件"
-
-    @classmethod
-    @property
-    def data(cls) -> dict: # noqa
-        return SendEventParams().model_dump()
+    name = "发送事件"
+    description = "发送任务执行事件"
+    data = SendEventParams().model_dump()
 
     @property
     def success(self) -> bool:

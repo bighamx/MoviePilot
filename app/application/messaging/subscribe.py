@@ -11,9 +11,12 @@ from app.application.messaging.interaction import (
     supports_markdown,
     update_or_post_message,
 )
+from app.application.subscription.contract import (
+    SubscriptionQueryPort,
+    SubscriptionSnapshot,
+)
 from app.schemas.message import Message
-from app.schemas.types import NotificationChannel, MediaType
-
+from app.schemas.types import MediaType, NotificationChannel
 
 subscribe_interaction_manager = SlashInteractionManager()
 
@@ -23,29 +26,16 @@ class SubscribeInteractionActions(Protocol):
     声明订阅交互需要调用的业务动作。
     """
 
-    def refresh(self):
+    def refresh(self) -> Any:
         """执行订阅刷新。"""
         ...
 
-
-class SubscribeInteractionRepository(Protocol):
-    """订阅消息交互所需的同步数据端口。"""
-
-    def list(self) -> List[Any]:
-        """返回订阅列表。"""
-
-    def get(self, subscribe_id: int) -> Optional[Any]:
-        """按 ID 返回订阅。"""
-
-    def delete(self, subscribe_id: int) -> Any:
-        """删除订阅。"""
-
-    def check(self):
+    def check(self) -> Any:
         """执行订阅元数据检查。"""
         ...
 
-    def search(self, **kwargs):
-        """执行订阅搜索。"""
+    def search(self, **kwargs: Any) -> Any:
+        """按消息入口参数执行订阅搜索。"""
         ...
 
 
@@ -61,16 +51,16 @@ class SubscribeInteractionHandler:
             self,
             messenger: MessageGateway,
             actions: SubscribeInteractionActions,
-            repository: SubscribeInteractionRepository,
-            report_deleted: Callable[[dict], Any],
-    ):
+            repository: SubscriptionQueryPort,
+            delete_subscription: Callable[[int], bool],
+    ) -> None:
         """
         注入消息投递接口和订阅业务动作。
         """
         self._messenger = messenger
         self._actions = actions
         self._repository = repository
-        self._report_deleted = report_deleted
+        self._delete_subscription = delete_subscription
 
     def remote_list(
             self,
@@ -197,6 +187,17 @@ class SubscribeInteractionHandler:
         return True
 
     def handle_text_interaction(
+            self,
+            channel: NotificationChannel,
+            source: str,
+            userid: Union[str, int],
+            username: str,
+            text: str,
+    ) -> bool:
+        """处理 /subscribes 文本交互并保持消息链公开 ABI。"""
+        return self._handle_text_interaction(channel, source, userid, username, text)
+
+    def _handle_text_interaction(
             self,
             channel: NotificationChannel,
             source: str,
@@ -489,7 +490,9 @@ class SubscribeInteractionHandler:
         )
 
     def _format_subscribe_list(
-            self, subscribes: List[Any], channel: Optional[NotificationChannel]
+            self,
+            subscribes: List[SubscriptionSnapshot],
+            channel: Optional[NotificationChannel],
     ) -> str:
         """
         根据渠道能力格式化订阅列表。
@@ -535,7 +538,7 @@ class SubscribeInteractionHandler:
         return mapping.get(state or "", state or "-")
 
     @staticmethod
-    def _format_subscribe_progress(subscribe: Any) -> str:
+    def _format_subscribe_progress(subscribe: SubscriptionSnapshot) -> str:
         """
         构造订阅的季和进度说明。
         """
@@ -716,15 +719,10 @@ class SubscribeInteractionHandler:
             if not subscribe:
                 missing.append(str(subscribe_id))
                 continue
+            if not self._delete_subscription(subscribe_id):
+                missing.append(str(subscribe_id))
+                continue
             deleted.append(subscribe.name)
-            self._repository.delete(subscribe_id)
-            self._report_deleted(
-                {
-                    "media_source": subscribe.media_source,
-                    "media_id": subscribe.media_id,
-                    "season": subscribe.season,
-                }
-            )
 
         if not deleted and missing:
             return False, f"未找到订阅：{', '.join(missing)}"

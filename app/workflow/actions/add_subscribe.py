@@ -1,11 +1,11 @@
-from app.workflow.actions import BaseAction
-from app.chain.subscribe import SubscribeChain
-from app.runtime.config import settings, global_vars
+from app.application.configuration import get_chain_runtime_config_snapshot
+from app.chain.subscribe.facade import SubscribeChain
 from app.domain.context import MediaInfo
-from app.application.chain.data import SubscribePortProxy as SubscribeOper
 from app.runtime.log import logger
-from app.schemas.workflow import ActionParams
-from app.schemas.workflow import ActionContext
+from app.runtime.stop import runtime_stop_state
+from app.schemas.subscribe import Subscribe
+from app.schemas.workflow import ActionContext, ActionParams
+from app.workflow.actions import BaseAction
 
 
 class AddSubscribeParams(ActionParams):
@@ -30,20 +30,9 @@ class AddSubscribeAction(BaseAction):
         self._added_subscribes = []
         self._has_error = False
 
-    @classmethod
-    @property
-    def name(cls) -> str:  # noqa
-        return "添加订阅"
-
-    @classmethod
-    @property
-    def description(cls) -> str:  # noqa
-        return "根据媒体列表添加订阅"
-
-    @classmethod
-    @property
-    def data(cls) -> dict:  # noqa
-        return AddSubscribeParams().model_dump()
+    name = "添加订阅"
+    description = "根据媒体列表添加订阅"
+    data = AddSubscribeParams().model_dump()
 
     @property
     def success(self) -> bool:
@@ -55,7 +44,7 @@ class AddSubscribeAction(BaseAction):
         """
         _started = False
         for media in context.medias:
-            if global_vars.is_workflow_stopped(workflow_id):
+            if runtime_stop_state.is_workflow_stopped(workflow_id):
                 break
             # 检查缓存
             cache_key = f"{media.type}-{media.title}-{media.year}-{media.season}"
@@ -76,7 +65,7 @@ class AddSubscribeAction(BaseAction):
                                               season=mediainfo.season,
                                               media_source=mediainfo.media_source,
                                               media_id=mediainfo.media_id,
-                                              username=settings.SUPERUSER)
+                                              username=get_chain_runtime_config_snapshot().superuser)
             if sid:
                 self._added_subscribes.append(sid)
                 # 保存缓存
@@ -85,7 +74,11 @@ class AddSubscribeAction(BaseAction):
         if self._added_subscribes:
             logger.info(f"已添加 {len(self._added_subscribes)} 个订阅")
             for sid in self._added_subscribes:
-                context.subscribes.append(SubscribeOper().get(sid))
+                subscribe = subscribechain.subscription_repository.get(sid)
+                if subscribe:
+                    if context.subscribes is None:
+                        context.subscribes = []
+                    context.subscribes.append(Subscribe.model_validate(subscribe.to_dict()))
         elif _started:
             self._has_error = True
 

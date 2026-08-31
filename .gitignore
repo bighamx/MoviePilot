@@ -9,27 +9,18 @@ dist/
 rust/**/target/
 nginx/
 test.py
-safety_report.txt
 app/application/site/*.bin
 # 站点数据的运行期下载产物。上游 v3 架构重构后落点从 app/application/site 移到了
 # app/helper，同目录的 .so/.pyd 由上面的通配兜住，只有 .bin 漏了网
 app/helper/*.bin
 app/plugins/**
 !app/plugins/__init__.py
-config/cookies/
-config/app.env
-config/user.db*
-config/systemconfig.db*
-config/sites/**
-config/agent/
-config/logs/
-config/plugins/
-config/temp/
-config/cache/
-config/.cache/
+config/*
+!config/category.yaml
 # 运行期设置持久化目录（settings 写回 app.env 的落点）与本地验证产物
 app/config/
 .verify_tmp/
+.artifacts/
 .runtime/
 public/
 .moviepilot.env
@@ -55,5 +46,6 @@ pylint-report.json
 # Superpowers 设计/计划文档（本地协作产物，不纳入仓库）
 docs/superpowers/
 
-# 本地前端构建产物（docker build 用，不入库）
-frontend-dist/
+# 保留本地前端构建产物目录，目录内产物不纳入仓库
+frontend-dist/*
+!frontend-dist/.gitkeep

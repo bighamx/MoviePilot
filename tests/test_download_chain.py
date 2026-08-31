@@ -1,16 +1,46 @@
+from collections.abc import Iterator
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-import app.chain.download as download_module
+import app.chain.download.batch as download_batch
+import app.chain.download.existence as download_existence
+import app.chain.download.failure as download_failure
+import app.chain.download.processing as download_processing
+import app.chain.download.selection as download_selection
+import app.chain.download.submission as download_submission
+import app.chain.download.subtitle as download_subtitle
+from app.application.download.failures import (
+    DownloadFailureSnapshot,
+    DownloadFailureWrite,
+)
+from app.application.history import DownloadHistorySnapshot
 from app.chain.download import DownloadChain
-from app.runtime.config import settings
 from app.domain.context import Context, MediaInfo, SubtitleInfo, TorrentInfo
 from app.domain.metainfo import MetaInfo
-from app.schemas import DownloaderTorrent, FileItem, NotExistMediaInfo, TransferDirectoryConf
+from app.runtime.config import settings
+from app.runtime.events import eventmanager
+from app.schemas.file import FileItem
+from app.schemas.mediaserver import NotExistMediaInfo
+from app.schemas.system import TransferDirectoryConf
+from app.schemas.transfer import DownloaderTorrent
 from app.schemas.types import MediaSource, MediaType
+
+
+@pytest.fixture(autouse=True)
+def _restore_eventmanager_instance_override() -> Iterator[None]:
+    """每个用例后恢复事件单例实例属性，避免遮蔽后续类级 monkeypatch。"""
+    instance = eventmanager
+    marker = object()
+    original = vars(instance).get("send_event", marker)
+    yield
+    if original is marker:
+        vars(instance).pop("send_event", None)
+    else:
+        vars(instance)["send_event"] = original
 
 
 @pytest.fixture(autouse=True)
@@ -25,7 +55,9 @@ def _mock_tmdb_supplement(monkeypatch):
             """返回原媒体对象。"""
             return media
 
-    monkeypatch.setattr(download_module, "MediaChain", _NoopMediaChain)
+    monkeypatch.setattr(download_submission, "MediaChain", _NoopMediaChain)
+    monkeypatch.setattr(download_subtitle, "MediaChain", _NoopMediaChain)
+    monkeypatch.setattr(download_existence, "MediaChain", _NoopMediaChain)
 
 
 class _FakeDownloadHistoryOper:
@@ -33,10 +65,8 @@ class _FakeDownloadHistoryOper:
     避免单元测试写入真实下载历史，只验证下载链路的控制流。
     """
 
-    def add(self, **_kwargs):
-        pass
-
-    def add_files(self, _files):
+    def add(self, _history, _files=()):
+        """忽略当前用例无需验证的类型化历史写入。"""
         pass
 
 
@@ -141,11 +171,11 @@ def test_download_single_submits_download_added_to_background(monkeypatch):
         "app.application.directory.DirectoryHelper.get_download_dirs",
         lambda _self: _download_dirs(),
     )
-    monkeypatch.setattr(download_module, "ThreadHelper", _FakeThreadHelper)
-    monkeypatch.setattr(download_module, "DownloadHistoryOper", _FakeDownloadHistoryOper)
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeTorrentHelper)
+    monkeypatch.setattr(download_processing, "ThreadHelper", _FakeThreadHelper)
+    monkeypatch.setattr(download_submission, "TorrentHelper", _FakeTorrentHelper)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.download_history_repository = _FakeDownloadHistoryOper()
     chain.download = MagicMock(return_value=("qb", "hash123", "Original", "添加下载成功"))
     chain.download_added = MagicMock()
     chain.download_site_subtitles = MagicMock()
@@ -219,8 +249,8 @@ def test_download_single_supplements_category_before_download_event(monkeypatch)
         event_data.cancel = True
         return SimpleNamespace(event_data=event_data)
 
-    monkeypatch.setattr(download_module, "MediaChain", _FakeMediaChain)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", cancel_download)
+    monkeypatch.setattr(download_submission, "MediaChain", _FakeMediaChain)
+    monkeypatch.setattr(eventmanager, "send_event", cancel_download)
     media = MediaInfo(
         media_source=MediaSource.Bangumi,
         media_id="40000",
@@ -254,24 +284,20 @@ def test_download_single_persists_custom_words_snapshot(monkeypatch):
     class _CapturingDownloadHistoryOper:
         """捕获写入下载历史的字段，验证识别词快照确实落库。"""
 
-        def add(self, **kwargs):
+        def add(self, history, _files=()):
             """捕获下载历史字段。"""
-            captured.update(kwargs)
-
-        def add_files(self, _files):
-            """忽略与当前断言无关的下载文件记录。"""
-            pass
+            captured.update(history.to_payload())
 
     _FakeThreadHelper.submitted = []
     monkeypatch.setattr(
         "app.application.directory.DirectoryHelper.get_download_dirs",
         lambda _self: _download_dirs(),
     )
-    monkeypatch.setattr(download_module, "ThreadHelper", _FakeThreadHelper)
-    monkeypatch.setattr(download_module, "DownloadHistoryOper", _CapturingDownloadHistoryOper)
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeTorrentHelper)
+    monkeypatch.setattr(download_processing, "ThreadHelper", _FakeThreadHelper)
+    monkeypatch.setattr(download_submission, "TorrentHelper", _FakeTorrentHelper)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.download_history_repository = _CapturingDownloadHistoryOper()
     chain.download = MagicMock(return_value=("qb", "hash123", "Original", "添加下载成功"))
     chain.download_added = MagicMock()
     chain.download_site_subtitles = MagicMock()
@@ -321,13 +347,12 @@ def test_save_subtitle_response_creates_missing_temp_directory(monkeypatch, tmp_
     temp_path = tmp_path / "missing-temp"
     assert not temp_path.exists()
 
-    monkeypatch.setattr(
-        download_module,
-        "settings",
-        SimpleNamespace(TEMP_PATH=temp_path, RMT_SUBEXT=settings.RMT_SUBEXT),
-    )
-    monkeypatch.setattr(download_module, "StorageChain", lambda: storage_chain)
+    monkeypatch.setattr(download_subtitle, "StorageChain", lambda: storage_chain)
     chain = DownloadChain.__new__(DownloadChain)
+    chain.runtime_config = SimpleNamespace(
+        temporary_path=temp_path,
+        subtitle_extensions=tuple(settings.RMT_SUBEXT),
+    )
     subtitle = SubtitleInfo(
         title="Demo Movie",
         enclosure="https://example.test/subtitle.srt",
@@ -363,15 +388,17 @@ def test_save_subtitle_response_accepts_rar_filename_from_header(monkeypatch, tm
         extract_dir.mkdir(parents=True, exist_ok=True)
         extracted_subtitle.write_text("subtitle", encoding="utf-8")
 
+    monkeypatch.setattr(download_subtitle, "StorageChain", lambda: storage_chain)
     monkeypatch.setattr(
-        download_module,
-        "settings",
-        SimpleNamespace(TEMP_PATH=temp_path, RMT_SUBEXT=settings.RMT_SUBEXT),
+        "app.adapters.system.host.SystemUtils.unpack_archive",
+        fake_unpack_archive,
     )
-    monkeypatch.setattr(download_module, "StorageChain", lambda: storage_chain)
-    monkeypatch.setattr(download_module.SystemUtils, "unpack_archive", fake_unpack_archive)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.runtime_config = SimpleNamespace(
+        temporary_path=temp_path,
+        subtitle_extensions=tuple(settings.RMT_SUBEXT),
+    )
     subtitle = SubtitleInfo(
         title="Hypnosis",
         enclosure="https://audiences.me/downloadsubs.php?torrentid=666519&subid=2195",
@@ -401,14 +428,13 @@ def test_save_subtitle_response_rejects_unsupported_filename_from_header(monkeyp
         headers={"content-disposition": 'attachment; filename="error.html"'},
     )
 
-    monkeypatch.setattr(
-        download_module,
-        "settings",
-        SimpleNamespace(TEMP_PATH=temp_path, RMT_SUBEXT=settings.RMT_SUBEXT),
-    )
-    monkeypatch.setattr(download_module, "StorageChain", lambda: storage_chain)
+    monkeypatch.setattr(download_subtitle, "StorageChain", lambda: storage_chain)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.runtime_config = SimpleNamespace(
+        temporary_path=temp_path,
+        subtitle_extensions=tuple(settings.RMT_SUBEXT),
+    )
     subtitle = SubtitleInfo(
         title="Hypnosis",
         enclosure="https://audiences.me/downloadsubs.php?torrentid=666519&subid=2195",
@@ -549,10 +575,13 @@ def test_batch_download_rejects_complete_coverage_when_files_do_not_cover_target
     完整覆盖要求不能让 1-13 这种局部包冒充 1-143 的目标范围。
     """
     _FakeBatchTorrentHelper.episodes = list(range(1, 14))
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_torrent = MagicMock(return_value=(b"torrent-content", "", ["demo.mkv"]))
     chain.download_single = MagicMock(return_value="hash")
 
@@ -579,10 +608,13 @@ def test_batch_download_rejects_complete_coverage_when_files_do_not_cover_target
 def test_batch_download_preserves_special_season_zero(monkeypatch):
     """特别季整季需求必须以季 0 匹配候选，不能回退成第 1 季。"""
     _FakeBatchTorrentHelper.episodes = list(range(1, 7))
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_torrent = MagicMock(return_value=(b"torrent-content", "", ["demo.mkv"]))
     chain.download_single = MagicMock(return_value="hash")
 
@@ -614,10 +646,13 @@ def test_batch_download_rejects_complete_coverage_when_only_missing_episodes_mat
     完整覆盖要求目标范围全集，不能只覆盖当前缺口集。
     """
     _FakeBatchTorrentHelper.episodes = [4, 5]
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_torrent = MagicMock(return_value=(b"torrent-content", "", ["demo.mkv"]))
     chain.download_single = MagicMock(return_value="hash")
 
@@ -646,10 +681,13 @@ def test_batch_download_tries_next_episode_candidate_when_first_download_fails(m
     同一季集的首个候选下载失败时，应继续尝试排序后的下一个候选资源。
     """
     _FakeBatchTorrentHelper.episodes = []
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_single = MagicMock(side_effect=[None, "hash"])
 
     first_context = _build_tv_context(episode_list=[1])
@@ -683,10 +721,13 @@ def test_batch_download_does_not_download_duplicate_movie_after_success(monkeypa
     电影保留失败重试能力，但同一影片成功一次后不应继续添加后续候选。
     """
     _FakeBatchTorrentHelper.episodes = []
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_single = MagicMock(return_value="hash")
 
     first_context = SimpleNamespace(
@@ -711,10 +752,13 @@ def test_batch_download_does_not_download_duplicate_movie_after_success(monkeypa
 def test_batch_download_threads_custom_words_to_download_single(monkeypatch):
     """订阅识别词须经 batch_download 透传到 download_single，作为整理快照随下载存档。"""
     _FakeBatchTorrentHelper.episodes = []
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_single = MagicMock(return_value="hash")
 
     context = SimpleNamespace(
@@ -735,10 +779,13 @@ def test_batch_download_applies_custom_words_to_torrent_file_episodes(monkeypatc
     """订阅识别词须用于种子文件集数解析，确保跨季映射后能选中缺失集。"""
     _FakeBatchTorrentHelper.episodes = [170]
     _FakeBatchTorrentHelper.received_custom_words = None
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_torrent = MagicMock(
         return_value=(b"torrent-content", "", ["A.Will.Eternal.S04E05.mkv"]),
     )
@@ -782,22 +829,23 @@ def test_download_single_records_failure_cooldown_when_downloader_rejects(monkey
         捕获下载失败冷却记录，避免测试写入数据库。
         """
 
-        def record_failure(self, **kwargs: object) -> SimpleNamespace:
+        def record_failure(self, failure: DownloadFailureWrite) -> None:
             """
             保存写入字段供断言使用。
             """
-            captured.update(kwargs)
-            return SimpleNamespace(id=1)
+            captured.update(asdict(failure))
 
     monkeypatch.setattr(
         "app.application.directory.DirectoryHelper.get_download_dirs",
         lambda _self: _download_dirs(),
     )
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeTorrentHelper)
-    monkeypatch.setattr(download_module, "DownloadFailureOper", _CapturingDownloadFailureOper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_submission, "TorrentHelper", _FakeTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.download_failure_repository = _CapturingDownloadFailureOper()
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     error_msg = "添加种子任务失败：无法读取种子文件"
     chain.download = MagicMock(return_value=("qb", None, "Original", error_msg))
     chain.post_message = MagicMock()
@@ -830,11 +878,86 @@ def test_download_single_records_failure_cooldown_when_downloader_rejects(monkey
 
     assert download_id is None
     assert returned_error == error_msg
-    assert captured["fingerprint"] == DownloadChain._build_download_failure_fingerprint(context)
+    assert captured["fingerprint"] == DownloadChain._build_download_failure_fingerprint(
+        context
+    )
     assert captured["torrent_id"] == "example.com:id=484660"
     assert captured["site"] == 12
     assert captured["error_message"] == error_msg
-    assert captured["next_retry_at"] > captured["now_time"]
+    assert captured["next_retry_at"] > captured["failed_at"]
+
+
+def test_download_failure_query_skips_non_subscribe_sources(monkeypatch):
+    """非订阅下载不得读取失败冷却，避免改变手工下载行为。"""
+    query = MagicMock(side_effect=AssertionError("unexpected query"))
+    repository = SimpleNamespace(
+        get_active_by_fingerprints=query,
+    )
+
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.download_failure_repository = repository
+
+    assert chain._active_download_failure_fingerprints(
+        contexts=[_build_tv_context()],
+        source="Manual",
+    ) == {}
+    query.assert_not_called()
+
+
+def test_download_failure_query_failure_is_fail_open(monkeypatch):
+    """冷却查询失败时继续下载候选，并记录一次明确错误。"""
+
+    class _FailingDownloadFailureRepository:
+        """模拟失败的下载冷却查询端口。"""
+
+        def get_active_by_fingerprints(
+            self,
+            fingerprints: list[str],
+            now_time: str,
+        ) -> dict[str, DownloadFailureSnapshot]:
+            """拒绝查询以验证 Chain 的 fail-open 语义。"""
+            assert fingerprints
+            assert now_time
+            raise RuntimeError("query failed")
+
+    error = MagicMock()
+    monkeypatch.setattr(download_failure.logger, "error", error)
+
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.download_failure_repository = _FailingDownloadFailureRepository()
+
+    assert chain._active_download_failure_fingerprints(
+        contexts=[_build_tv_context()],
+        source="Subscribe|{}",
+    ) == {}
+    error.assert_called_once_with("查询下载失败冷却失败：query failed")
+
+
+def test_download_failure_write_failure_is_fail_open(monkeypatch):
+    """冷却写入失败不得覆盖原下载结果，并记录一次明确错误。"""
+
+    class _FailingDownloadFailureRepository:
+        """模拟失败的下载冷却写入端口。"""
+
+        def record_failure(self, failure: DownloadFailureWrite) -> None:
+            """拒绝写入以验证 Chain 的 fail-open 语义。"""
+            assert failure.fingerprint
+            raise RuntimeError("write failed")
+
+    error = MagicMock()
+    monkeypatch.setattr(download_failure.logger, "error", error)
+    context = _build_tv_context()
+    chain = DownloadChain.__new__(DownloadChain)
+    chain.download_failure_repository = _FailingDownloadFailureRepository()
+
+    fingerprint = chain._record_download_failure(
+        context=context,
+        error_msg="下载失败",
+        source="Subscribe|{}",
+    )
+
+    assert fingerprint == DownloadChain._build_download_failure_fingerprint(context)
+    error.assert_called_once_with("记录下载失败冷却失败：write failed")
 
 
 def test_download_failure_fingerprint_distinguishes_special_season_zero():
@@ -869,8 +992,9 @@ def test_batch_download_skips_failed_subscription_resource_and_tries_next(monkey
     订阅自动下载应跳过冷却中的失败资源，但继续尝试同媒体的后续候选。
     """
     _FakeBatchTorrentHelper.episodes = []
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     first_context = SimpleNamespace(
         media_info=SimpleNamespace(
@@ -915,21 +1039,28 @@ def test_batch_download_skips_failed_subscription_resource_and_tries_next(monkey
         返回第一个候选的活跃失败冷却记录。
         """
 
-        def get_active_by_fingerprints(self, fingerprints: list[str], now_time: str) -> dict:
+        def get_active_by_fingerprints(
+            self,
+            fingerprints: list[str],
+            now_time: str,
+        ) -> dict[str, DownloadFailureSnapshot]:
             """
             模拟数据库批量查询活跃失败记录。
             """
             assert now_time
             assert failed_fingerprint in fingerprints
-            return {failed_fingerprint: SimpleNamespace(
-                fingerprint=failed_fingerprint,
-                error_message="无法读取种子文件",
-                next_retry_at="2026-01-02 03:04:05",
-            )}
-
-    monkeypatch.setattr(download_module, "DownloadFailureOper", _ActiveDownloadFailureOper)
+            return {
+                failed_fingerprint: DownloadFailureSnapshot(
+                    fingerprint=failed_fingerprint,
+                    error_message="无法读取种子文件",
+                    next_retry_at="2026-01-02 03:04:05",
+                )
+            }
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.download_failure_repository = _ActiveDownloadFailureOper()
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_single = MagicMock(return_value="hash")
 
     downloads, lefts = chain.batch_download(
@@ -948,10 +1079,13 @@ def test_batch_download_accepts_complete_coverage_when_files_cover_target_range(
     自定义起始集场景按目标范围覆盖判断，100-143 可满足 start=100、total=143。
     """
     _FakeBatchTorrentHelper.episodes = list(range(100, 144))
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_torrent = MagicMock(return_value=(b"torrent-content", "", ["demo.mkv"]))
     chain.download_single = MagicMock(return_value="hash")
 
@@ -980,10 +1114,13 @@ def test_batch_download_rejects_complete_coverage_when_files_have_same_count_but
     完整覆盖按目标集号集合判断，不能让同数量的偏移局部包通过。
     """
     _FakeBatchTorrentHelper.episodes = list(range(1, 45))
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_torrent = MagicMock(return_value=(b"torrent-content", "", ["demo.mkv"]))
     chain.download_single = MagicMock(return_value="hash")
 
@@ -1012,10 +1149,13 @@ def test_batch_download_accepts_complete_coverage_when_title_episodes_cover_targ
     显式标出完整范围的候选也可满足完整覆盖任务。
     """
     _FakeBatchTorrentHelper.episodes = []
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_torrent = MagicMock()
     chain.download_single = MagicMock(return_value="hash")
 
@@ -1045,10 +1185,13 @@ def test_batch_download_rejects_complete_coverage_when_title_episodes_are_partia
     显式标出局部范围的候选不能满足完整覆盖任务。
     """
     _FakeBatchTorrentHelper.episodes = []
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_torrent = MagicMock()
     chain.download_single = MagicMock(return_value="hash")
 
@@ -1078,10 +1221,13 @@ def test_batch_download_complete_coverage_ignores_allowed_episode_narrowing(monk
     完整覆盖任务不能因候选允许集裁剪而把局部包误判为覆盖目标范围。
     """
     _FakeBatchTorrentHelper.episodes = []
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_torrent = MagicMock()
     chain.download_single = MagicMock(return_value="hash")
 
@@ -1112,10 +1258,13 @@ def test_batch_download_keeps_count_check_without_complete_coverage(monkeypatch)
     普通整季缺失仍沿用数量判断，避免完整覆盖语义影响非严格场景。
     """
     _FakeBatchTorrentHelper.episodes = list(range(2, 145))
-    monkeypatch.setattr(download_module, "TorrentHelper", _FakeBatchTorrentHelper)
-    monkeypatch.setattr(download_module.eventmanager, "send_event", lambda *args, **kwargs: None)
+    monkeypatch.setattr(download_batch, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(download_selection, "TorrentHelper", _FakeBatchTorrentHelper)
+    monkeypatch.setattr(eventmanager, "send_event", lambda *args, **kwargs: None)
 
     chain = DownloadChain.__new__(DownloadChain)
+    chain.eventmanager = MagicMock()
+    chain.eventmanager.send_event.return_value = None
     chain.download_torrent = MagicMock(return_value=(b"torrent-content", "", ["demo.mkv"]))
     chain.download_single = MagicMock(return_value="hash")
 
@@ -1143,13 +1292,15 @@ def test_downloading_includes_media_type_and_source_site(monkeypatch):
     正在下载任务应从下载历史回填媒体类型和来源站点。
     """
     torrent = DownloaderTorrent(hash="download-hash", title="Demo.Release")
-    history = SimpleNamespace(
+    history = DownloadHistorySnapshot(
+        id=1,
+        path="/downloads/Demo.Release.mkv",
         episodes="E02",
         image="https://images.example.com/backdrop.jpg",
         poster="https://images.example.com/poster.jpg",
         seasons="S01",
         title="示例剧集",
-        media_source=MediaSource.TMDB.value,
+        media_source=MediaSource.TMDB,
         media_id="1001",
         torrent_site="示例站点",
         type="电视剧",
@@ -1158,19 +1309,18 @@ def test_downloading_includes_media_type_and_source_site(monkeypatch):
     )
     chain = DownloadChain.__new__(DownloadChain)
     monkeypatch.setattr(chain, "list_torrents", lambda **_kwargs: [torrent])
-    monkeypatch.setattr(
-        download_module,
-        "DownloadHistoryOper",
-        lambda: SimpleNamespace(get_by_hashes=lambda _hashes: {torrent.hash: history}),
+    chain.download_history_repository = SimpleNamespace(
+        get_by_hashes=lambda _hashes: {torrent.hash: history}
     )
 
     result = chain.downloading(name="qb-main")
 
     assert result == [torrent]
-    assert torrent.media["type"] == "电视剧"
-    assert torrent.media["image"] == "https://images.example.com/poster.jpg"
-    assert torrent.media["poster"] == "https://images.example.com/poster.jpg"
-    assert torrent.media["backdrop"] == "https://images.example.com/backdrop.jpg"
+    assert torrent.media is not None
+    assert torrent.media.type == "电视剧"
+    assert torrent.media.image == "https://images.example.com/poster.jpg"
+    assert torrent.media.poster == "https://images.example.com/poster.jpg"
+    assert torrent.media.backdrop == "https://images.example.com/backdrop.jpg"
     assert torrent.site_name == "示例站点"
     assert torrent.userid == "user-1"
     assert torrent.username == "tester"

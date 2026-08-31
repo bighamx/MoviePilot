@@ -1,15 +1,81 @@
 import traceback
-from typing import List, Tuple, Union, Optional
+from typing import Any, List, Optional, Protocol, Tuple, Union
 from urllib.parse import urljoin, urlparse
 
 import dateutil.parser
 from lxml import etree
 
-from app.runtime.config import settings
-from app.adapters.network.browser import PlaywrightHelper
+from app.application.configuration import get_chain_runtime_config_snapshot
 from app.runtime.log import logger
-from app.adapters.system import rust as rust_accel
-from app.adapters.network.http import RequestUtils
+
+
+class RssResponsePort(Protocol):
+    """声明 RSS 用例实际读取的 HTTP 响应字段。"""
+
+    status_code: int
+    content: bytes
+    text: str
+    reason: str
+
+
+class RssHttpPort(Protocol):
+    """声明 RSS 用例所需的同步 HTTP 与 XML 解码能力。"""
+
+    def get(self, *, url: str, ua: Optional[str], headers: Optional[dict[str, Any]],
+            proxies: Optional[dict[str, Any]], timeout: int) -> Optional[RssResponsePort]:
+        """获取 RSS 响应。"""
+
+    def post(self, *, url: str, data: dict[str, Any], cookie: str, ua: str,
+             proxies: Optional[dict[str, Any]], timeout: int) -> Optional[RssResponsePort]:
+        """提交 RSS 链接生成表单。"""
+
+    def decode_xml(self, response: RssResponsePort, *, performance_mode: bool,
+                   confidence_threshold: float) -> str:
+        """按宿主编码策略解码 XML 响应。"""
+
+
+class RssBrowserPort(Protocol):
+    """声明 RSS 链接页面渲染能力。"""
+
+    def render(self, *, url: str, cookie: str, ua: str,
+               proxies: Optional[dict[str, Any]], timeout: int) -> Optional[str]:
+        """渲染页面并返回源码。"""
+
+
+class RssParserPort(Protocol):
+    """声明可选原生 RSS 解析加速能力。"""
+
+    def parse(self, content: str, max_items: int) -> Optional[List[dict[str, Any]]]:
+        """解析 RSS XML；不可用或失败时返回 None 触发 Python 兜底。"""
+
+
+_rss_http_port: Optional[RssHttpPort] = None
+_rss_browser_port: Optional[RssBrowserPort] = None
+_rss_parser_port: Optional[RssParserPort] = None
+
+
+def configure_rss_ports(*, http: RssHttpPort, browser: RssBrowserPort,
+                        parser: RssParserPort) -> None:
+    """由组合根装配 RSS 用例依赖的技术端口。"""
+    global _rss_http_port, _rss_browser_port, _rss_parser_port
+    _rss_http_port = http
+    _rss_browser_port = browser
+    _rss_parser_port = parser
+
+
+def reset_rss_ports() -> None:
+    """清除 RSS 端口，供生命周期退出与隔离测试使用。"""
+    global _rss_http_port, _rss_browser_port, _rss_parser_port
+    _rss_http_port = None
+    _rss_browser_port = None
+    _rss_parser_port = None
+
+
+def _require_rss_ports() -> Tuple[RssHttpPort, RssBrowserPort, RssParserPort]:
+    """返回已装配端口，缺失时明确拒绝隐式构造 Adapter。"""
+    if _rss_http_port is None or _rss_browser_port is None or _rss_parser_port is None:
+        raise RuntimeError("RSS 访问端口尚未由启动组合根装配")
+    return _rss_http_port, _rss_browser_port, _rss_parser_port
 
 
 class RssHelper:
@@ -255,7 +321,8 @@ class RssHelper:
         ret_xml_stripped = ret_xml.strip()
         if not ret_xml_stripped.startswith('<'):
             return None
-        rust_items = rust_accel.parse_rss_items(ret_xml, self.MAX_RSS_ITEMS + 1)
+        _, _, parser_port = _require_rss_ports()
+        rust_items = parser_port.parse(ret_xml, self.MAX_RSS_ITEMS + 1)
         if rust_items is None:
             return None
         if len(rust_items) > self.MAX_RSS_ITEMS:
@@ -264,6 +331,12 @@ class RssHelper:
 
     def parse(self, url, proxy: bool = False,
               timeout: Optional[int] = 15, headers: dict = None, ua: str = None) -> Union[List[dict], None, bool]:
+        """解析 RSS 地址并保留插件兼容的返回约定。"""
+        return self._parse_impl(url, proxy=proxy, timeout=timeout, headers=headers, ua=ua)
+
+    def _parse_impl(self, url, proxy: bool = False,
+                    timeout: Optional[int] = 15, headers: dict = None,
+                    ua: str = None) -> Union[List[dict], None, bool]:
         """
         解析RSS订阅URL，获取RSS中的种子信息
         :param url: RSS地址
@@ -278,10 +351,16 @@ class RssHelper:
         if not url:
             return False
 
+        http_port, _, _ = _require_rss_ports()
+
         try:
-            ret = RequestUtils(ua=ua,
-                               proxies=settings.PROXY if proxy else None,
-                               timeout=timeout or 30, headers=headers).get_res(url)
+            ret = http_port.get(
+                url=url,
+                ua=ua,
+                proxies=get_chain_runtime_config_snapshot().proxy if proxy else None,
+                timeout=timeout or 30,
+                headers=headers,
+            )
             if not ret:
                 logger.error(f"获取RSS失败：请求返回空值，URL: {url}")
                 return False
@@ -304,10 +383,10 @@ class RssHelper:
                     return False
 
                 if raw_data:
-                    ret_xml = RequestUtils.get_decoded_xml_content(
+                    ret_xml = http_port.decode_xml(
                         ret,
-                        performance_mode=settings.ENCODING_DETECTION_PERFORMANCE_MODE,
-                        confidence_threshold=settings.ENCODING_DETECTION_MIN_CONFIDENCE
+                        performance_mode=get_chain_runtime_config_snapshot().encoding_detection_performance_mode,
+                        confidence_threshold=get_chain_runtime_config_snapshot().encoding_detection_min_confidence
                     )
                     rust_items = self.__parse_with_rust(ret_xml)
                     if rust_items is not None:
@@ -480,6 +559,7 @@ class RssHelper:
         :return: rss地址、错误信息
         """
         try:
+            http_port, browser_port, _ = _require_rss_ports()
             # 获取站点域名
             domain = self._get_site_domain(url)
             # 获取配置
@@ -490,20 +570,22 @@ class RssHelper:
             rss_params = site_conf.get("params")
             # 请求RSS页面
             if site_conf.get("render"):
-                html_text = PlaywrightHelper().get_page_source(
+                html_text = browser_port.render(
                     url=rss_url,
-                    cookies=cookie,
+                    cookie=cookie,
                     ua=ua,
-                    proxies=settings.PROXY_SERVER if proxy else None,
+                    proxies=get_chain_runtime_config_snapshot().proxy_server if proxy else None,
                     timeout=timeout or 60
                 )
             else:
-                res = RequestUtils(
-                    cookies=cookie,
-                    timeout=timeout or 30,
+                res = http_port.post(
+                    url=rss_url,
+                    data=rss_params,
+                    cookie=cookie,
                     ua=ua,
-                    proxies=settings.PROXY if proxy else None
-                ).post_res(url=rss_url, data=rss_params)
+                    proxies=get_chain_runtime_config_snapshot().proxy if proxy else None,
+                    timeout=timeout or 30,
+                )
                 if res:
                     html_text = res.text
                 elif res is not None:

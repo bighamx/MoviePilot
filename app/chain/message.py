@@ -2,11 +2,14 @@ import asyncio
 import base64
 import mimetypes
 import re
+import threading
 import uuid
+from collections.abc import Mapping
+from concurrent.futures import CancelledError as FutureCancelledError
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Optional, Dict, Union, List, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 from urllib.parse import unquote, urlparse
 
 from app.application.agent import (
@@ -15,12 +18,6 @@ from app.application.agent import (
     supports_image_input,
     transcribe_audio,
 )
-from app.chain import ChainBase
-from app.chain.site import SiteChain
-from app.chain.subscribe import SubscribeChain
-from app.chain.transfer import TransferChain
-from app.chain.interaction import MediaInteractionChain as _MediaInteractionChain
-from app.runtime.config import settings, global_vars
 from app.application.messaging.agent import agent_interaction_manager, parse_agent_choice_callback
 from app.application.messaging.interaction import InteractionContext, InteractionDispatch
 from app.application.messaging.media import media_interaction_manager
@@ -30,12 +27,83 @@ from app.application.messaging.session import MessageSessionService
 from app.application.messaging.site import site_interaction_manager
 from app.application.messaging.skill import SkillInteractionHandler, skill_interaction_manager
 from app.application.messaging.subscribe import subscribe_interaction_manager
+from app.chain.base import ChainBase
+from app.chain.interaction import MediaInteractionChain as _MediaInteractionChain
+from app.chain.site import SiteChain
+from app.chain.subscribe.facade import SubscribeChain
+from app.chain.transfer.facade import TransferChain
 from app.runtime.log import logger
-from app.schemas.message import IncomingMessage
-from app.schemas.message import Message
+from app.runtime.loop import main_loop_registry
+from app.runtime.tasks import get_task_registry
+from app.schemas.message import IncomingMessage, Message
 from app.schemas.notification import ChannelCapabilityManager
 from app.schemas.types import EventType, NotificationChannel
-from app.adapters.network.http import RequestUtils
+
+
+class MessageResponsePort(Protocol):
+    """消息链读取附件所需的最小同步 HTTP 响应契约。"""
+
+    content: bytes
+    headers: Mapping[str, str]
+
+    def close(self) -> None:
+        """释放响应与连接资源。"""
+        ...
+
+
+class MessageHttpPort(Protocol):
+    """消息链读取远程附件所需的同步 GET 端口。"""
+
+    def get(self, url: str, *, timeout: int) -> Optional[MessageResponsePort]:
+        """读取附件响应，并保留无响应与有响应两态。"""
+        ...
+
+
+_message_http_lock = threading.RLock()
+_message_http_port: Optional[MessageHttpPort] = None
+
+
+def configure_message_http_port(http: MessageHttpPort) -> Optional[MessageHttpPort]:
+    """由启动组合根装配消息附件 HTTP 端口，并返回旧实现。"""
+    global _message_http_port
+    with _message_http_lock:
+        previous = _message_http_port
+        _message_http_port = http
+        return previous
+
+
+def reset_message_http_port(http: Optional[MessageHttpPort] = None) -> None:
+    """恢复指定消息 HTTP 端口；省略参数时回到未装配状态。"""
+    global _message_http_port
+    with _message_http_lock:
+        _message_http_port = http
+
+
+def _message_http_snapshot() -> MessageHttpPort:
+    """读取消息 HTTP 端口快照，未装配时稳定失败。"""
+    with _message_http_lock:
+        http = _message_http_port
+    if http is None:
+        raise RuntimeError("消息附件 HTTP 端口尚未由启动组合根装配")
+    return http
+
+
+def _read_message_http(
+    url: str,
+    *,
+    timeout: int = 30,
+) -> tuple[Optional[bytes], Mapping[str, str]]:
+    """读取远程消息附件并在复制所需字段后立即释放响应。"""
+    response = _message_http_snapshot().get(url, timeout=timeout)
+    if response is None:
+        return None, {}
+    try:
+        return response.content or None, dict(response.headers)
+    finally:
+        try:
+            response.close()
+        except Exception as err:
+            logger.debug(f"释放消息附件响应失败：{str(err)}")
 
 
 class MessageChain(ChainBase):
@@ -65,9 +133,10 @@ class MessageChain(ChainBase):
             clear_task = manager.clear_session(
                 session_id=session_id, user_id=str(userid)
             )
-            asyncio.run_coroutine_threadsafe(
+            get_task_registry().submit_threadsafe(
                 clear_task,
-                global_vars.loop,
+                loop=main_loop_registry.require(),
+                owner="chain.message.agent_session_clear",
             )
         except Exception as e:
             if clear_task:
@@ -86,6 +155,13 @@ class MessageChain(ChainBase):
             sessions=self._user_sessions,
             timeout_minutes=self._session_timeout_minutes,
             expired_handler=self._schedule_agent_session_clear,
+        )
+
+    def _plugin_input_interaction_handler(self) -> PluginInputInteractionHandler:
+        """构造使用当前 Chain 消息与事件端口的插件输入处理器。"""
+        return PluginInputInteractionHandler(
+            messenger=self,
+            event_publisher=self.eventmanager,
         )
 
     @dataclass
@@ -250,7 +326,7 @@ class MessageChain(ChainBase):
                 is_channel_admin=is_channel_admin,
             )
 
-            if PluginInputInteractionHandler(messenger=self).handle_text(
+            if self._plugin_input_interaction_handler().handle_text(
                     context=interaction_context,
                     text=text,
                     reply_to_message_id=reply_to_message_id,
@@ -412,7 +488,7 @@ class MessageChain(ChainBase):
                 )
             return False
 
-        if PluginInputInteractionHandler(messenger=self).handle_text(
+        if self._plugin_input_interaction_handler().handle_text(
                 context=context,
                 text=text,
                 reply_to_message_id=reply_to_message_id,
@@ -476,8 +552,13 @@ class MessageChain(ChainBase):
         if (
                 not no_ai_requested
                 and
-                settings.AI_AGENT_ENABLE
-                and (settings.AI_AGENT_GLOBAL or images or files or has_audio_input)
+                self.runtime_config.ai_agent_enable
+                and (
+                    self.runtime_config.ai_agent_global
+                    or images
+                    or files
+                    or has_audio_input
+                )
         ):
             return self._handle_ai_message(
                 text=text,
@@ -553,8 +634,13 @@ class MessageChain(ChainBase):
         if text.startswith("/"):
             return False
         if not (
-                settings.AI_AGENT_ENABLE
-                and (settings.AI_AGENT_GLOBAL or images or files or has_audio_input)
+                self.runtime_config.ai_agent_enable
+                and (
+                    self.runtime_config.ai_agent_global
+                    or images
+                    or files
+                    or has_audio_input
+                )
         ):
             return False
         if self._interaction_router().has_pending(userid):
@@ -945,21 +1031,7 @@ class MessageChain(ChainBase):
 
         # 如果有会话ID，同时清除智能体的会话记忆
         if session_id:
-            manager = get_running_agent_manager()
-            clear_task = None
-            if manager is not None:
-                try:
-                    clear_task = manager.clear_session(
-                        session_id=session_id, user_id=str(userid)
-                    )
-                    asyncio.run_coroutine_threadsafe(
-                        clear_task,
-                        global_vars.loop,
-                    )
-                except Exception as e:
-                    if clear_task:
-                        clear_task.close()
-                    logger.warning(f"清除智能体会话记忆失败: {e}")
+            self._schedule_agent_session_clear(session_id, userid)
 
             self.post_message(
                 Message(
@@ -1003,7 +1075,7 @@ class MessageChain(ChainBase):
                 else:
                     future = asyncio.run_coroutine_threadsafe(
                         manager.stop_current_task(session_id=session_id),
-                        global_vars.loop,
+                        main_loop_registry.require(),
                     )
                     stopped = future.result(timeout=10)
             except Exception as e:
@@ -1136,14 +1208,25 @@ class MessageChain(ChainBase):
                     else ""
                 ),
             )
+        pending_messages = status.get("pending_messages", 0)
+        queue_capacity = status.get("queue_capacity")
+        pending_text = (
+            f"{pending_messages} / {queue_capacity}"
+            if queue_capacity
+            else str(pending_messages)
+        )
         lines.extend(
             [
                 f"当前会话累计 tokens: 输入 {cls._format_token_count(status.get('total_input_tokens'))} / 输出 {cls._format_token_count(status.get('total_output_tokens'))} / 总计 {cls._format_token_count(status.get('total_tokens'))}",
                 f"模型调用次数: {status.get('model_call_count', 0)}",
-                f"排队消息数: {status.get('pending_messages', 0)}",
+                f"排队消息数: {pending_text}",
                 f"最后更新: {status.get('last_updated_at') or '暂无'}",
             ]
         )
+        if status.get("queue_rejections"):
+            lines.append(f"排队拒绝次数: {status['queue_rejections']}")
+        if status.get("shutdown_pending"):
+            lines.append("会话状态: 正在停止")
         return "\n".join(lines)
 
     def remote_session_status(
@@ -1211,7 +1294,7 @@ class MessageChain(ChainBase):
         """
         try:
             # 检查AI智能体是否启用
-            if not settings.AI_AGENT_ENABLE:
+            if not self.runtime_config.ai_agent_enable:
                 self.post_message(
                     Message(
                         channel=channel,
@@ -1268,8 +1351,8 @@ class MessageChain(ChainBase):
             original_images = images
             all_files = list(files or [])
             if images and supports_image_input(
-                    provider=settings.LLM_PROVIDER,
-                    model=settings.LLM_MODEL,
+                    provider=self.runtime_config.llm_provider,
+                    model=self.runtime_config.llm_model,
             ):
                 images = self._download_attachments_to_data_urls(
                     images, channel, source
@@ -1344,11 +1427,47 @@ class MessageChain(ChainBase):
             }
             if has_audio_input:
                 process_kwargs["has_audio_input"] = True
-            # 在事件循环中处理
-            asyncio.run_coroutine_threadsafe(
+            # 在事件循环中处理，并消费跨线程 Future 的失败，避免队列满时静默丢消息。
+            submission_future = asyncio.run_coroutine_threadsafe(
                 manager.process_message(**process_kwargs),
-                global_vars.loop,
+                main_loop_registry.require(),
             )
+
+            def _report_agent_submission_failure(completed) -> None:
+                try:
+                    completed.result()
+                except BaseException as error:
+                    if isinstance(
+                            error,
+                            (asyncio.CancelledError, FutureCancelledError),
+                    ):
+                        return
+                    error_code = getattr(error, "code", None)
+                    if error_code == "agent_manager_queue_full":
+                        title = "智能助手当前排队已满，请稍后重试"
+                    elif error_code == "agent_manager_unavailable":
+                        title = "智能助手服务暂不可用，请稍后重试"
+                    else:
+                        title = "智能助手处理失败，请查看日志"
+                    logger.warning(f"Agent 消息提交失败: {error}")
+                    try:
+                        self.post_message(
+                            Message(
+                                channel=channel,
+                                source=source,
+                                userid=userid,
+                                username=username,
+                                title=title,
+                                original_message_id=original_message_id,
+                                original_chat_id=original_chat_id,
+                                save_history=False,
+                            )
+                        )
+                    except Exception as report_error:
+                        logger.error(f"发送 Agent 提交失败提示失败: {report_error}")
+
+            if submission_future is not None:
+                submission_future.add_done_callback(_report_agent_submission_failure)
             return True
 
         except Exception as e:
@@ -1450,8 +1569,7 @@ class MessageChain(ChainBase):
                         audio_ref, default="input.opus"
                     )
                 elif audio_ref.startswith("http"):
-                    resp = RequestUtils(timeout=30).get_res(audio_ref)
-                    content = resp.content if resp and resp.content else None
+                    content, _ = _read_message_http(audio_ref)
                     filename = self._guess_audio_filename(
                         audio_ref, default="input.ogg"
                     )
@@ -1574,10 +1692,10 @@ class MessageChain(ChainBase):
                     if data_url:
                         data_urls.append(data_url)
                 elif attachment_ref.startswith("http"):
-                    resp = RequestUtils(timeout=30).get_res(attachment_ref)
-                    if resp and resp.content:
-                        base64_data = base64.b64encode(resp.content).decode()
-                        mime_type = resp.headers.get("Content-Type", "image/jpeg")
+                    content, headers = _read_message_http(attachment_ref)
+                    if content:
+                        base64_data = base64.b64encode(content).decode()
+                        mime_type = headers.get("Content-Type", "image/jpeg")
                         data_urls.append(f"data:{mime_type};base64,{base64_data}")
                 else:
                     logger.debug(
@@ -1724,8 +1842,8 @@ class MessageChain(ChainBase):
             return self._decode_data_url_bytes(data_url) if data_url else None
         if file_ref.startswith("wxbot://file/"):
             file_url = unquote(file_ref.replace("wxbot://file/", "", 1))
-            resp = RequestUtils(timeout=30).get_res(file_url)
-            return resp.content if resp and resp.content else None
+            content, _ = _read_message_http(file_url)
+            return content
         if file_ref.startswith("wxclaw://file/") or file_ref.startswith("wxclaw://voice/"):
             return self.run_module(
                 "download_wechat_media_bytes", media_ref=file_ref, source=source
@@ -1760,8 +1878,8 @@ class MessageChain(ChainBase):
                     "download_slack_file_to_data_url", file_url=file_ref, source=source
                 )
                 return self._decode_data_url_bytes(data_url) if data_url else None
-            resp = RequestUtils(timeout=30).get_res(file_ref)
-            return resp.content if resp and resp.content else None
+            content, _ = _read_message_http(file_ref)
+            return content
         logger.debug(
             "暂不支持的附件引用: channel=%s, source=%s, ref=%s",
             channel.value if channel else None,
@@ -1781,7 +1899,7 @@ class MessageChain(ChainBase):
         将用户上传文件写入临时目录，并返回本地路径。
         """
         safe_name = self._sanitize_attachment_name(filename, mime_type)
-        base_dir = settings.TEMP_PATH / "agent_uploads" / session_id
+        base_dir = self.runtime_config.temporary_path / "agent_uploads" / session_id
         base_dir.mkdir(parents=True, exist_ok=True)
 
         file_id = uuid.uuid4().hex[:8]

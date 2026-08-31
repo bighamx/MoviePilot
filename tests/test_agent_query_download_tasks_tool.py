@@ -1,9 +1,20 @@
 import asyncio
 import json
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from app.agent.tools.impl.query_download_tasks import QueryDownloadTasksTool
-from app.schemas import DownloaderTorrent
+from app.schemas.transfer import DownloaderTorrent, DownloadTaskMedia
+from app.schemas.types import MediaSource
+
+
+def _tool() -> QueryDownloadTasksTool:
+    """构造带显式下载历史端口的查询工具。"""
+    return QueryDownloadTasksTool(
+        session_id="session-1",
+        user_id="10001",
+        data=SimpleNamespace(download_history=MagicMock()),
+    )
 
 
 def test_completed_status_returns_qbittorrent_and_transmission_completed_states():
@@ -41,7 +52,7 @@ def test_completed_status_returns_qbittorrent_and_transmission_completed_states(
         "_load_history_map",
         return_value={},
     ):
-        result = QueryDownloadTasksTool._query_downloads_sync(status="completed")
+        result = _tool()._query_downloads_sync(status="completed")
 
     assert result["downloads"] == completed_torrents
     download_chain.list_torrents.assert_called_once_with(
@@ -99,6 +110,52 @@ def test_run_completed_status_formats_completed_download_tasks():
     assert payload[0]["trackers"] == ["https://tracker.example/announce"]
 
 
+def test_run_formats_pydantic_download_task_media():
+    """下载任务媒体为 Pydantic 模型时应正常转换为 Agent 输出字段。"""
+    torrent = DownloaderTorrent(
+        downloader="qb",
+        hash="hash-with-media",
+        title="Movie With Media",
+        size=1024,
+        progress=100,
+        state="completed",
+        tags="moviepilot",
+        media=DownloadTaskMedia(
+            type="电影",
+            title="补全标题",
+            season=1,
+            episode=[2, 3],
+            media_source=MediaSource.TMDB,
+            media_id="123",
+        ),
+    )
+
+    with patch.object(
+        QueryDownloadTasksTool,
+        "_query_downloads_sync",
+        return_value={"downloads": [torrent]},
+    ):
+        result = asyncio.run(
+            QueryDownloadTasksTool(session_id="session-1", user_id="10001").run()
+        )
+
+    payload = json.loads(result)
+    assert payload[0]["media"] == {
+        "type": "movie",
+        "title": "补全标题",
+        "season": 1,
+        "episode": [2, 3],
+        "media_source": MediaSource.TMDB,
+        "media_id": "123",
+        "music_type": None,
+        "artists": [],
+        "album": None,
+        "album_id": None,
+        "total_tracks": None,
+        "track_number": None,
+    }
+
+
 def test_hash_query_loads_trackers_for_matching_task():
     """
     按 Hash 查询详情时应额外加载下载器支持的 Tracker 列表。
@@ -126,7 +183,7 @@ def test_hash_query_loads_trackers_for_matching_task():
         "_load_history_map",
         return_value={},
     ):
-        result = QueryDownloadTasksTool._query_downloads_sync(hash_value="a" * 40)
+        result = _tool()._query_downloads_sync(hash_value="a" * 40)
 
     assert result["downloads"][0].trackers == ["https://tracker.example/announce"]
     download_chain.get_torrent_trackers.assert_called_once_with(
@@ -161,7 +218,7 @@ def test_include_all_tags_passes_scope_to_downloader_query():
         "_load_history_map",
         return_value={},
     ):
-        result = QueryDownloadTasksTool._query_downloads_sync(
+        result = _tool()._query_downloads_sync(
             status="all",
             include_all_tags=True,
         )
@@ -199,7 +256,7 @@ def test_include_all_tags_downloading_status_uses_list_torrents():
         "_load_history_map",
         return_value={},
     ):
-        result = QueryDownloadTasksTool._query_downloads_sync(
+        result = _tool()._query_downloads_sync(
             status="downloading",
             include_all_tags=True,
         )
@@ -238,7 +295,7 @@ def test_include_all_tags_false_string_keeps_builtin_tag_scope():
         "_load_history_map",
         return_value={},
     ):
-        result = QueryDownloadTasksTool._query_downloads_sync(
+        result = _tool()._query_downloads_sync(
             status="completed",
             include_all_tags="false",
         )

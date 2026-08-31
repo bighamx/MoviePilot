@@ -392,6 +392,8 @@ class SystemConfigKey(Enum):
     UserCustomCSS = "UserCustomCSS"
     # 用户已安装的插件
     UserInstalledPlugins = "UserInstalledPlugins"
+    # 共享源码插件的虚拟运行实例
+    PluginInstances = "PluginInstances"
     # 插件文件夹分组配置
     PluginFolders = "PluginFolders"
     # 默认电影订阅规则
@@ -418,8 +420,6 @@ class SystemConfigKey(Enum):
     ScrapingSwitchs = "ScrapingSwitchs"
     # 插件安装统计
     PluginInstallReport = "PluginInstallReport"
-    # 配置向导状态
-    SetupWizardState = "SetupWizardState"
     # 绿联影视登录会话缓存
     UgreenSessionCache = "UgreenSessionCache"
     # 共享媒体识别成功次数
@@ -490,6 +490,7 @@ class NotificationChannel(Enum):
     Telegram = "Telegram"
     Slack = "Slack"
     Discord = "Discord"
+    DingTalk = "钉钉"
     SynologyChat = "SynologyChat"
     VoceChat = "VoceChat"
     Web = "Web"
@@ -514,6 +515,8 @@ class NotificationAction(str, Enum):
     TEST_CONNECTION = "test_connection"
     # 迁移渠道名变更前的登录缓存
     MIGRATE_CACHE = "migrate_cache"
+    # 同步通知配置变更产生的缓存迁移和清理
+    RECONCILE_CONFIG = "reconcile_config"
 
 
 class StorageAction(str, Enum):
@@ -603,6 +606,8 @@ class MediaRecognizeType(Enum):
     Bangumi = "Bangumi"
     # AniList
     AniList = "AniList"
+    # IMDb
+    IMDb = "IMDb"
     # MusicBrainz
     MusicBrainz = "MusicBrainz"
     # TheAudioDB
@@ -663,6 +668,8 @@ class OtherModulesType(Enum):
     ListenBrainz = "ListenBrainz"
     # LRCLIB 歌词
     Lrclib = "LRCLIB"
+    # Musixmatch 授权歌词
+    Musixmatch = "Musixmatch"
     # AcoustID 音频指纹
     AcoustId = "AcoustID"
 
@@ -684,6 +691,7 @@ class ScrapingPolicy(NameValueEnum):
     MISSINGONLY = "仅缺失"
     SKIP = "跳过"
     OVERWRITE = "覆盖"
+    UPGRADE = "质量升级"
 
 
 # 刮削目标类型

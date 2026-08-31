@@ -2,11 +2,10 @@ from typing import List, Optional, Union
 
 from pydantic import Field
 
-from app.workflow.actions import BaseAction, ActionChain
-from app.schemas.workflow import ActionParams
-from app.schemas.workflow import ActionContext
+from app.application.configuration import get_chain_runtime_config_snapshot
 from app.schemas.message import Message
-from app.runtime.config import settings
+from app.schemas.workflow import ActionContext, ActionParams
+from app.workflow.actions import ActionChain, BaseAction
 
 
 class SendMessageParams(ActionParams):
@@ -27,20 +26,9 @@ class SendMessageAction(BaseAction):
     def __init__(self, action_id: str):
         super().__init__(action_id)
 
-    @classmethod
-    @property
-    def name(cls) -> str: # noqa
-        return "发送消息"
-
-    @classmethod
-    @property
-    def description(cls) -> str: # noqa
-        return "发送任务执行消息"
-
-    @classmethod
-    @property
-    def data(cls) -> dict: # noqa
-        return SendMessageParams().model_dump()
+    name = "发送消息"
+    description = "发送任务执行消息"
+    data = SendMessageParams().model_dump()
 
     @property
     def success(self) -> bool:
@@ -69,7 +57,7 @@ class SendMessageAction(BaseAction):
                         userid=params.userid,
                         title="【工作流执行结果】",
                         text=msg_text,
-                        link=settings.MP_DOMAIN("#/workflow")
+                        link=get_chain_runtime_config_snapshot().workflow_url
                     )
                 )
 

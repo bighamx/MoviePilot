@@ -35,6 +35,7 @@ function is_truthy_value() {
 # 设置虚拟环境路径（兼容群晖等系统必须这样配置）
 VENV_PATH="${VENV_PATH:-/opt/venv}"
 export PATH="${VENV_PATH}/bin:$PATH"
+UV_BIN="${UV_BIN:-/usr/local/bin/uv}"
 
 # 校正设置目录
 CONFIG_DIR="${CONFIG_DIR:-/config}"
@@ -42,9 +43,8 @@ CONFIG_DIR="${CONFIG_DIR:-/config}"
 function apply_package_cache_env() {
     PACKAGE_CACHE_ROOT="${PACKAGE_CACHE_ROOT:-${CONFIG_DIR}/.cache}"
     export PACKAGE_CACHE_ROOT
-    export PIP_CACHE_DIR="${PIP_CACHE_DIR:-${PACKAGE_CACHE_ROOT}/pip}"
     export UV_CACHE_DIR="${UV_CACHE_DIR:-${PACKAGE_CACHE_ROOT}/uv}"
-    mkdir -p "${PIP_CACHE_DIR}" "${UV_CACHE_DIR}"
+    mkdir -p "${UV_CACHE_DIR}"
 }
 
 function run_package_command() {
@@ -66,7 +66,7 @@ function wait_backend_ready() {
     local backend_port="${PORT:-3001}"
     local web_port="${NGINX_PORT:-3000}"
     local timeout="${MOVIEPILOT_BACKEND_READY_TIMEOUT:-300}"
-    local ready_url="http://127.0.0.1:${backend_port}/api/v1/system/global?token=moviepilot"
+    local ready_url="http://127.0.0.1:${backend_port}/health/ready"
     local deadline
     if ! [[ "${timeout}" =~ ^[0-9]+$ ]] || [ "$((10#${timeout}))" -le 0 ]; then
         WARN "→ MOVIEPILOT_BACKEND_READY_TIMEOUT=${timeout} 无效，使用默认 300 秒。"
@@ -111,7 +111,7 @@ function load_config_from_app_env() {
         ["GITHUB_PROXY"]=""
         ["PROXY_HOST"]=""
         ["GITHUB_TOKEN"]=""
-        ["MOVIEPILOT_AUTO_UPDATE"]="release"
+        ["MOVIEPILOT_AUTO_UPDATE"]="false"
         ["MOVIEPILOT_DOCKER_KEEPALIVE_ON_FAILURE"]="true"
         ["MOVIEPILOT_FORCE_CHOWN"]="false"
         ["MOVIEPILOT_SAFE_MODE"]="false"
@@ -337,26 +337,27 @@ function diagnostic_keepalive() {
 # 插件依赖和主程序共用同一套 venv 时，历史安装记录可能已经污染环境，
 # 这里优先在真正拉起后端前做一次自愈，避免容器反复起不来。
 function ensure_backend_runtime_dependencies() {
-    local probe_code="import alembic, cloakbrowser, fastapi, pydantic, pydantic_core, pydantic_settings, sqlalchemy, starlette, uvicorn; from pydantic import BaseModel, Field"
+    local probe_module="app.doctor.dependencies"
 
     INFO "→ 启动前检查后端核心依赖..."
-    if "${VENV_PATH}/bin/python3" -c "${probe_code}" >/dev/null 2>&1; then
+    if "${VENV_PATH}/bin/python3" -m "${probe_module}" >/dev/null 2>&1; then
         INFO "→ 后端核心依赖检查通过。"
         return 0
     fi
 
     WARN "→ 检测到后端核心依赖异常，开始尝试恢复主程序依赖..."
-    local -a pip_cmd=("${VENV_PATH}/bin/pip" "install" "-r" "/app/requirements.txt")
-    if [ -n "${PIP_PROXY}" ]; then
-        pip_cmd+=("-i" "${PIP_PROXY}")
+    if ! configure_package_route; then
+        ERROR "→ 无法选择可用的主程序依赖源，后端无法启动。"
+        diagnostic_keepalive 1
     fi
-
-    if ! run_package_command "${pip_cmd[@]}" > /dev/stdout 2> /dev/stderr; then
+    PACKAGE_ROUTE_READY="true"
+    INFO "依赖源：${PACKAGE_LOG}"
+    if ! sync_project_dependencies_for "/app" > /dev/stdout 2> /dev/stderr; then
         ERROR "→ 自动恢复主程序依赖失败，后端无法启动。"
         diagnostic_keepalive 1
     fi
 
-    if ! "${VENV_PATH}/bin/python3" -c "${probe_code}" >/dev/null 2>&1; then
+    if ! "${VENV_PATH}/bin/python3" -m "${probe_module}" >/dev/null 2>&1; then
         ERROR "→ 主程序依赖恢复后仍然异常，后端无法启动。"
         diagnostic_keepalive 1
     fi
@@ -463,6 +464,41 @@ function correct_config_permissions() {
     done < <(find "${CONFIG_DIR}" -mindepth 1 -maxdepth 1 -print0)
 }
 
+function correct_package_cache_permissions() {
+    local cache_dir="${UV_CACHE_DIR:-}"
+    [ -n "${cache_dir}" ] || return 0
+    if [[ "${cache_dir}" != /* ]]; then
+        ERROR "→ UV_CACHE_DIR 必须是绝对目录：${cache_dir}"
+        return 1
+    fi
+
+    local resolved_cache
+    local resolved_config
+    resolved_cache="$(python3 -c 'import os, sys; print(os.path.normpath(sys.argv[1]))' "${cache_dir}")"
+    resolved_config="$(python3 -c 'import os, sys; print(os.path.normpath(sys.argv[1]))' "${CONFIG_DIR}")"
+    case "${resolved_cache}/" in
+        "${resolved_config}/"*) return 0 ;;
+    esac
+    case "${resolved_cache}" in
+        /|/app|/public|/opt|/usr|/etc|/var|/home|/root|"${VENV_PATH}")
+            ERROR "→ UV_CACHE_DIR 不能使用受管根目录：${resolved_cache}"
+            return 1
+            ;;
+    esac
+
+    if ! mkdir -p -- "${resolved_cache}" \
+        || ! chown -R moviepilot:moviepilot "${resolved_cache}"; then
+        ERROR "→ uv 缓存目录权限修复失败：${resolved_cache}"
+        return 1
+    fi
+    if ! gosu moviepilot:moviepilot sh -c \
+        'probe="$1/.moviepilot-write-test.$$"; : > "${probe}" && rm -f "${probe}"' \
+        sh "${resolved_cache}"; then
+        ERROR "→ uv 缓存目录不可写：${resolved_cache}"
+        return 1
+    fi
+}
+
 function chown_plugin_runtime_path() {
     local plugin_path="${1:-}"
     [ -n "${plugin_path}" ] || return 0
@@ -492,6 +528,9 @@ function correct_file_permissions() {
     chown_plugin_runtime_path /app/app/plugins
     correct_home_permissions
     correct_config_permissions
+    if ! correct_package_cache_permissions; then
+        return 1
+    fi
     chown -R moviepilot:moviepilot \
         /var/lib/nginx \
         /var/log/nginx
@@ -505,23 +544,15 @@ function correct_file_permissions() {
 load_config_from_app_env
 apply_package_cache_env
 
-# 一次性升级标记仅影响本次启动，避免把临时升级模式带入运行中的 Python 进程
-ONE_SHOT_UPDATE_FLAG="${CONFIG_DIR}/temp/moviepilot.pending_update"
-ONE_SHOT_UPDATE_APPLIED="false"
+# Dev 手动更新仍沿用一次性标记；Release 安装只消费已下载并校验的清单。
+ONE_SHOT_DEV_UPDATE_FLAG="${CONFIG_DIR}/temp/moviepilot.pending_dev_update"
+ONE_SHOT_DEV_UPDATE="false"
 MOVIEPILOT_AUTO_UPDATE_ORIGINAL="${MOVIEPILOT_AUTO_UPDATE}"
-if [ -f "${ONE_SHOT_UPDATE_FLAG}" ]; then
-    ONE_SHOT_UPDATE_MODE="$(tr -d '\r\n' < "${ONE_SHOT_UPDATE_FLAG}" | tr '[:upper:]' '[:lower:]')"
-    rm -f "${ONE_SHOT_UPDATE_FLAG}"
-    if [ "${ONE_SHOT_UPDATE_MODE}" = "true" ]; then
-        ONE_SHOT_UPDATE_MODE="release"
-    fi
-    if [ "${ONE_SHOT_UPDATE_MODE}" = "release" ] || [ "${ONE_SHOT_UPDATE_MODE}" = "dev" ]; then
-        INFO "检测到一次性升级标记，本次启动将执行 ${ONE_SHOT_UPDATE_MODE} 升级..."
-        MOVIEPILOT_AUTO_UPDATE="${ONE_SHOT_UPDATE_MODE}"
-        ONE_SHOT_UPDATE_APPLIED="true"
-    elif [ -n "${ONE_SHOT_UPDATE_MODE}" ]; then
-        WARN "检测到无效的一次性升级模式：${ONE_SHOT_UPDATE_MODE}，已忽略"
-    fi
+if [ -f "${ONE_SHOT_DEV_UPDATE_FLAG}" ]; then
+    rm -f "${ONE_SHOT_DEV_UPDATE_FLAG}"
+    MOVIEPILOT_AUTO_UPDATE="dev"
+    ONE_SHOT_DEV_UPDATE="true"
+    INFO "检测到一次性 Dev 更新标记，本次启动将更新开发分支"
 fi
 
 # 使用env配置渲染 nginx 配置
@@ -529,15 +560,27 @@ render_nginx_config
 
 # 自动更新，控制脚本由 launcher 固化到同一代运行目录，源码替换不会改变本轮执行内容。
 cd /
+source "${MP_CONTROL_DIR:-/usr/local/lib/moviepilot/control}/update.sh"
 if [ "${MOVIEPILOT_BOOTSTRAP_UPDATE_DONE:-0}" != "1" ]; then
-    source "${MP_CONTROL_DIR:-/usr/local/lib/moviepilot/control}/update.sh"
-    run_moviepilot_update
+    if ! recover_pending_update; then
+        ERROR "→ 上一次容器更新未能恢复，容器将保持运行以便执行 moviepilot doctor。"
+        diagnostic_keepalive 1
+    fi
+    if [ "${UPDATE_RECOVERY_COMPLETED:-false}" = "true" ]; then
+        INFO "→ 已恢复到更新前版本，本次启动跳过自动更新。"
+    else
+        run_moviepilot_update
+    fi
     export MOVIEPILOT_BOOTSTRAP_UPDATE_DONE=1
 else
     MOVIEPILOT_UPDATE_RESULT="noop"
 fi
-if [ "${ONE_SHOT_UPDATE_APPLIED}" = "true" ]; then
+if [ "${ONE_SHOT_DEV_UPDATE}" = "true" ]; then
     MOVIEPILOT_AUTO_UPDATE="${MOVIEPILOT_AUTO_UPDATE_ORIGINAL}"
+fi
+if [ "${UPDATE_RECOVERY_REQUIRED:-false}" = "true" ]; then
+    ERROR "→ 容器更新回滚未完成，容器将保持运行以便执行 moviepilot doctor。"
+    diagnostic_keepalive 1
 fi
 
 maybe_reexec_control_bundle
@@ -551,6 +594,15 @@ usermod -o -u "${PUID}" moviepilot
 
 # 启动前优先确认主运行环境仍然健康，避免插件依赖污染导致服务直接起不来。
 ensure_backend_runtime_dependencies
+
+# 依赖阶段恢复会保留当前程序，待自愈成功后再清理旧代际备份和事务标记。
+if [ "${UPDATE_RECOVERY_BLOCKED:-false}" = "true" ]; then
+    if finalize_update_transaction; then
+        INFO "→ 当前程序依赖已恢复，已清理保留当前程序的更新事务"
+    else
+        WARN "→ 当前程序依赖已恢复，但旧代际备份清理失败，将保留事务标记重试"
+    fi
+fi
 
 # 缓存路径解析必须晚于依赖自愈，确保有效性探针使用当前运行版本。
 if ! resolve_browser_cache_dir; then

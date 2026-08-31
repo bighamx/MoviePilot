@@ -1,13 +1,27 @@
 from datetime import datetime
 from typing import Any, List, Mapping, Tuple, Optional
 
-from sqlalchemy import delete as sqlalchemy_delete
+from sqlalchemy import delete as sqlalchemy_delete, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import Session
 
 from app.db.base import DbOper
 from app.db.models.site import Site
 from app.db.models.siteicon import SiteIcon
 from app.db.models.sitestatistic import SiteStatistic
 from app.db.models.siteuserdata import SiteUserData
+
+
+async def _async_first(session: AsyncSession, statement: Any) -> Optional[Site]:
+    """执行异步站点查询并返回首条记录。"""
+    result = await session.execute(statement)
+    return result.scalars().first()
+
+
+async def _async_all(session: AsyncSession, statement: Any) -> list[Site]:
+    """执行异步站点查询并返回稳定列表。"""
+    result = await session.execute(statement)
+    return list(result.scalars().all())
 
 
 class SiteOper(DbOper):
@@ -20,8 +34,8 @@ class SiteOper(DbOper):
         新增站点
         """
         site = Site(**kwargs)
-        if not site.get_by_domain(self._db, kwargs.get("domain")):
-            site.create(self._db)
+        if not self.get_by_domain(kwargs.get("domain")):
+            self._stage_create(site)
             return True, "新增站点成功"
         return False, "站点已存在"
 
@@ -29,13 +43,22 @@ class SiteOper(DbOper):
         """
         查询单个站点
         """
-        return Site.get(self._db, sid)
+        return self._execute_sync_query(
+            lambda session: session.execute(
+                select(Site).where(Site.id == sid)
+            ).scalars().first()
+        )
 
     async def async_get(self, sid: int) -> Optional[Site]:
         """
         异步查询单个站点
         """
-        return await Site.async_get(self._db, sid)
+        return await self._execute_async_query(
+            lambda session: _async_first(
+                session,
+                select(Site).where(Site.id == sid),
+            )
+        )
 
     async def get_by_id(self, site_id: int) -> Optional[Site]:
         """读取站点写用例需要的目标站点。"""
@@ -52,7 +75,7 @@ class SiteOper(DbOper):
             site_id: int,
             payload: Mapping[str, Any],
     ) -> bool:
-        """暂存站点字段更新，不由模型装饰器提前提交。"""
+        """暂存站点字段更新，事务由调用方统一提交。"""
         site = await self.async_get(site_id)
         if not site:
             return False
@@ -79,45 +102,69 @@ class SiteOper(DbOper):
         """
         获取站点列表
         """
-        return Site.list(self._db)
+        return self._execute_sync_query(
+            lambda session: list(session.execute(select(Site)).scalars().all())
+        )
 
     async def async_list(self) -> List[Site]:
         """
         异步获取站点列表
         """
-        return await Site.async_list(self._db)
+        return await self._execute_async_query(
+            lambda session: _async_all(session, select(Site))
+        )
 
     async def async_list_order_by_pri(self) -> List[Site]:
         """异步按优先级获取站点，供站点查询应用服务使用。"""
-        return await Site.async_list_order_by_pri(self._db)
+        return await self._execute_async_query(
+            lambda session: _async_all(
+                session,
+                select(Site).order_by(Site.pri),
+            )
+        )
 
     def list_order_by_pri(self) -> List[Site]:
         """
         获取站点列表
         """
-        return Site.list_order_by_pri(self._db)
+        return self._execute_sync_query(
+            lambda session: list(
+                session.execute(select(Site).order_by(Site.pri)).scalars().all()
+            )
+        )
 
     def list_active(self) -> List[Site]:
         """
         按状态获取站点列表
         """
-        return Site.get_actives(self._db)
+        return self._execute_sync_query(
+            lambda session: list(
+                session.execute(
+                    select(Site).where(Site.is_active.is_(True))
+                ).scalars().all()
+            )
+        )
 
     async def async_list_active(self) -> List[Site]:
         """
         异步按状态获取站点列表
         """
-        return await Site.async_get_actives(self._db)
+        return await self._execute_async_query(
+            lambda session: _async_all(
+                session,
+                select(Site).where(Site.is_active.is_(True)),
+            )
+        )
 
     def delete(self, sid: int):
         """
         删除站点
         """
-        Site.delete(self._db, sid)
+        self._stage_delete(Site, sid)
 
     def reset(self) -> None:
-        """清空站点表，保留站点模型细节在数据库适配层。"""
-        Site.reset(self._db)
+        """清空站点表；兼容入口的事务由组合根统一持有。"""
+        self._execute_sync_write(Site.reset)
 
     async def stage_reset(self) -> None:
         """暂存清空站点表，由应用事务统一提交。"""
@@ -127,10 +174,10 @@ class SiteOper(DbOper):
         """
         更新站点
         """
-        site = Site.get(self._db, sid)
+        site = self.get(sid)
         if not site:
             return None
-        site.update(self._db, payload)
+        self._stage_update(site, payload)
         return site
 
     async def async_update(self, sid: int, payload: dict) -> Optional[Site]:
@@ -139,47 +186,69 @@ class SiteOper(DbOper):
         """
         site = await self.async_get(sid)
         if site:
-            await site.async_update(self._db, payload)
+            await self._stage_async_update(site, payload)
         return site
 
     def get_by_domain(self, domain: str) -> Optional[Site]:
         """
         按域名获取站点
         """
-        return Site.get_by_domain(self._db, domain)
+        return self._execute_sync_query(
+            lambda session: session.execute(
+                select(Site).where(Site.domain == domain)
+            ).scalars().first()
+        )
 
     async def async_get_by_domain(self, domain: str) -> Optional[Site]:
         """
         异步按域名获取站点
         """
-        return await Site.async_get_by_domain(self._db, domain)
+        return await self._execute_async_query(
+            lambda session: _async_first(
+                session,
+                select(Site).where(Site.domain == domain),
+            )
+        )
 
     async def async_get_by_name(self, name: str) -> Optional[Site]:
         """
         异步按名称获取站点
         """
-        return await Site.async_get_by_name(self._db, name)
+        return await self._execute_async_query(
+            lambda session: _async_first(
+                session,
+                select(Site).where(Site.name == name),
+            )
+        )
 
     def get_domains_by_ids(self, ids: List[int]) -> List[Optional[str]]:
         """
         按ID获取站点域名
         """
-        return Site.get_domains_by_ids(self._db, ids)
+        if not ids:
+            return []
+        return self._execute_sync_query(
+            lambda session: list(
+                session.execute(
+                    select(Site.domain).where(Site.id.in_(ids))
+                ).scalars().all()
+            )
+        )
 
     def exists(self, domain: str) -> bool:
         """
         判断站点是否存在
         """
-        return Site.get_by_domain(self._db, domain) is not None
+        return self.get_by_domain(domain) is not None
 
     def update_cookie(self, domain: str, cookies: str) -> Tuple[bool, str]:
         """
         更新站点Cookie
         """
-        site = Site.get_by_domain(self._db, domain)
+        site = self.get_by_domain(domain)
         if not site:
             return False, "站点不存在"
-        site.update(self._db, {
+        self._stage_update(site, {
             "cookie": cookies
         })
         return True, "更新站点Cookie成功"
@@ -188,10 +257,10 @@ class SiteOper(DbOper):
         """
         更新站点rss
         """
-        site = Site.get_by_domain(self._db, domain)
+        site = self.get_by_domain(domain)
         if not site:
             return False, "站点不存在"
-        site.update(self._db, {
+        self._stage_update(site, {
             "rss": rss
         })
         return True, "更新站点RSS地址成功"
@@ -211,27 +280,41 @@ class SiteOper(DbOper):
             "err_msg": payload.get("err_msg") or ""
         })
         # 按站点+天判断是否存在数据
-        siteuserdatas = SiteUserData.get_by_domain(self._db, domain=domain, workdate=current_day)
+        siteuserdatas = self._execute_sync_query(
+            lambda session: SiteUserData.get_by_domain(
+                session,
+                domain=domain,
+                workdate=current_day,
+            )
+        )
         if siteuserdatas:
             # 存在则更新
             if not payload.get("err_msg"):
-                siteuserdatas[0].update(self._db, payload)
+                self._stage_update(siteuserdatas[0], payload)
         else:
             # 不存在则插入
-            SiteUserData(**payload).create(self._db)
+            self._stage_create(SiteUserData(**payload))
         return True, "更新站点用户数据成功"
 
     def get_userdata(self) -> List[SiteUserData]:
         """
         获取站点用户数据
         """
-        return SiteUserData.list(self._db)
+        return self._execute_sync_query(
+            lambda session: SiteUserData.list(session)
+        )
 
     def get_userdata_by_domain(self, domain: str, workdate: Optional[str] = None) -> List[SiteUserData]:
         """
         获取站点用户数据
         """
-        return SiteUserData.get_by_domain(self._db, domain=domain, workdate=workdate)
+        return self._execute_sync_query(
+            lambda session: SiteUserData.get_by_domain(
+                session,
+                domain=domain,
+                workdate=workdate,
+            )
+        )
 
     async def async_get_userdata_by_domain(
         self, domain: str, workdate: Optional[str] = None
@@ -239,182 +322,210 @@ class SiteOper(DbOper):
         """
         异步获取站点用户数据。
         """
-        return await SiteUserData.async_get_by_domain(
-            self._db, domain=domain, workdate=workdate
+        return await self._execute_async_query(
+            lambda session: SiteUserData.async_get_by_domain(
+                session,
+                domain=domain,
+                workdate=workdate,
+            )
         )
 
     async def async_get_userdata_latest(self) -> List[SiteUserData]:
         """异步获取各站点最新用户数据。"""
-        return await SiteUserData.async_get_latest(self._db)
+        return await self._execute_async_query(
+            lambda session: SiteUserData.async_get_latest(session)
+        )
 
     async def async_get_icon_by_domain(self, domain: str) -> Optional[SiteIcon]:
         """异步按域名获取站点图标。"""
-        return await SiteIcon.async_get_by_domain(self._db, domain)
+        return await self._execute_async_query(
+            lambda session: SiteIcon.async_get_by_domain(session, domain)
+        )
 
     async def async_get_statistic_by_domain(
         self,
         domain: str,
     ) -> Optional[SiteStatistic]:
         """异步按域名获取站点统计。"""
-        return await SiteStatistic.async_get_by_domain(self._db, domain)
+        return await self._execute_async_query(
+            lambda session: SiteStatistic.async_get_by_domain(session, domain)
+        )
 
     async def async_list_statistics(self) -> List[SiteStatistic]:
         """异步获取所有站点统计。"""
-        return await SiteStatistic.async_list(self._db)
+        return await self._execute_async_query(SiteStatistic.async_list)
 
     def get_userdata_by_date(self, date: str) -> List[SiteUserData]:
         """
         获取站点用户数据
         """
-        return SiteUserData.get_by_date(self._db, date)
+        return self._execute_sync_query(
+            lambda session: SiteUserData.get_by_date(session, date)
+        )
 
     def get_userdata_latest(self) -> List[SiteUserData]:
         """
         获取站点最新数据
         """
-        return SiteUserData.get_latest(self._db)
+        return self._execute_sync_query(
+            lambda session: SiteUserData.get_latest(session)
+        )
 
     def get_icon_by_domain(self, domain: str) -> Optional[SiteIcon]:
         """
         按域名获取站点图标
         """
-        return SiteIcon.get_by_domain(self._db, domain)
+        return self._execute_sync_query(
+            lambda session: SiteIcon.get_by_domain(session, domain)
+        )
 
     def update_icon(self, name: str, domain: str, icon_url: str, icon_base64: str) -> bool:
         """
         更新站点图标
         """
         icon_base64 = f"data:image/ico;base64,{icon_base64}" if icon_base64 else ""
-        siteicon = self.get_icon_by_domain(domain)
-        if not siteicon:
-            SiteIcon(name=name, domain=domain, url=icon_url, base64=icon_base64).create(self._db)
-        elif icon_base64:
-            siteicon.update(self._db, {
-                "url": icon_url,
-                "base64": icon_base64
-            })
+
+        def write(db: Session) -> None:
+            """在同一同步事务中查询并更新站点图标。"""
+            siteicon = SiteIcon.get_by_domain(db, domain)
+            if not siteicon:
+                db.add(SiteIcon(
+                    name=name,
+                    domain=domain,
+                    url=icon_url,
+                    base64=icon_base64,
+                ))
+            elif icon_base64:
+                siteicon.url = icon_url
+                siteicon.base64 = icon_base64
+
+        self._execute_sync_write(write)
         return True
 
     def success(self, domain: str, seconds: Optional[int] = None):
         """
         站点访问成功
         """
-        lst_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        sta = SiteStatistic.get_by_domain(self._db, domain)
-        if sta:
-            # 使用深复制确保 note 是全新的字典对象
-            note = dict(sta.note) if sta.note else {}
-            avg_seconds = None
+        def write(db: Session) -> None:
+            """在同一同步事务中读取并更新站点统计。"""
+            lst_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            sta = SiteStatistic.get_by_domain(db, domain)
+            if sta:
+                # 使用深复制确保 note 是全新的字典对象
+                note = dict(sta.note) if sta.note else {}
+                avg_seconds = None
 
-            if seconds is not None:
-                note[lst_date] = seconds or 1
-                avg_times = len(note.keys())
-                if avg_times > 10:
-                    note = dict(sorted(note.items(), key=lambda x: x[0], reverse=True)[:10])
-                avg_seconds = sum([v for v in note.values()]) // avg_times
+                if seconds is not None:
+                    note[lst_date] = seconds or 1
+                    avg_times = len(note.keys())
+                    if avg_times > 10:
+                        note = dict(sorted(note.items(), key=lambda x: x[0], reverse=True)[:10])
+                    avg_seconds = sum([v for v in note.values()]) // avg_times
 
-            sta.update(self._db, {
-                "success": sta.success + 1,
-                "seconds": avg_seconds or sta.seconds,
-                "lst_state": 0,
-                "lst_mod_date": lst_date,
-                "note": note
-            })
-        else:
-            note = {}
-            if seconds is not None:
-                note = {
-                    lst_date: seconds or 1
-                }
-            SiteStatistic(
-                domain=domain,
-                success=1,
-                fail=0,
-                seconds=seconds or 1,
-                lst_state=0,
-                lst_mod_date=lst_date,
-                note=note
-            ).create(self._db)
+                for key, value in {
+                    "success": sta.success + 1,
+                    "seconds": avg_seconds or sta.seconds,
+                    "lst_state": 0,
+                    "lst_mod_date": lst_date,
+                    "note": note,
+                }.items():
+                    setattr(sta, key, value)
+            else:
+                note = {}
+                if seconds is not None:
+                    note = {lst_date: seconds or 1}
+                db.add(SiteStatistic(
+                    domain=domain,
+                    success=1,
+                    fail=0,
+                    seconds=seconds or 1,
+                    lst_state=0,
+                    lst_mod_date=lst_date,
+                    note=note,
+                ))
+
+        self._execute_sync_write(write)
 
     def fail(self, domain: str):
         """
         站点访问失败
         """
-        lst_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        sta = SiteStatistic.get_by_domain(self._db, domain)
-        if sta:
-            sta.update(self._db, {
-                "fail": sta.fail + 1,
-                "lst_state": 1,
-                "lst_mod_date": lst_date
-            })
-        else:
-            SiteStatistic(
-                domain=domain,
-                success=0,
-                fail=1,
-                lst_state=1,
-                lst_mod_date=lst_date
-            ).create(self._db)
+        def write(db: Session) -> None:
+            """在同一同步事务中读取并更新站点失败统计。"""
+            lst_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            sta = SiteStatistic.get_by_domain(db, domain)
+            if sta:
+                sta.fail += 1
+                sta.lst_state = 1
+                sta.lst_mod_date = lst_date
+            else:
+                db.add(SiteStatistic(
+                    domain=domain,
+                    success=0,
+                    fail=1,
+                    lst_state=1,
+                    lst_mod_date=lst_date,
+                ))
+
+        self._execute_sync_write(write)
 
     async def async_success(self, domain: str, seconds: Optional[int] = None):
         """
         异步站点访问成功
         """
-        lst_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        sta = await SiteStatistic.async_get_by_domain(self._db, domain)
-        if sta:
-            # 使用深复制确保 note 是全新的字典对象
-            note = dict(sta.note) if sta.note else {}
-            avg_seconds = None
-
-            if seconds is not None:
-                note[lst_date] = seconds or 1
-                avg_times = len(note.keys())
-                if avg_times > 10:
-                    note = dict(sorted(note.items(), key=lambda x: x[0], reverse=True)[:10])
-                avg_seconds = sum([v for v in note.values()]) // avg_times
-
-            await sta.async_update(self._db, {
-                "success": sta.success + 1,
-                "seconds": avg_seconds or sta.seconds,
-                "lst_state": 0,
-                "lst_mod_date": lst_date,
-                "note": note
-            })
-        else:
-            note = {}
-            if seconds is not None:
-                note = {
-                    lst_date: seconds or 1
-                }
-            await SiteStatistic(
+        async def write(session: AsyncSession) -> None:
+            """在同一异步事务中读取并更新站点成功统计。"""
+            lst_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            sta = await SiteStatistic.async_get_by_domain(session, domain)
+            if sta:
+                note = dict(sta.note) if sta.note else {}
+                avg_seconds = None
+                if seconds is not None:
+                    note[lst_date] = seconds or 1
+                    avg_times = len(note.keys())
+                    if avg_times > 10:
+                        note = dict(sorted(
+                            note.items(), key=lambda item: item[0], reverse=True
+                        )[:10])
+                    avg_seconds = sum(note.values()) // avg_times
+                sta.success += 1
+                sta.seconds = avg_seconds or sta.seconds
+                sta.lst_state = 0
+                sta.lst_mod_date = lst_date
+                sta.note = note
+                return
+            note = {lst_date: seconds or 1} if seconds is not None else {}
+            session.add(SiteStatistic(
                 domain=domain,
                 success=1,
                 fail=0,
                 seconds=seconds or 1,
                 lst_state=0,
                 lst_mod_date=lst_date,
-                note=note
-            ).async_create(self._db)
+                note=note,
+            ))
+
+        await self._execute_async_write(write)
 
     async def async_fail(self, domain: str):
         """
         异步站点访问失败
         """
-        lst_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        sta = await SiteStatistic.async_get_by_domain(self._db, domain)
-        if sta:
-            await sta.async_update(self._db, {
-                "fail": sta.fail + 1,
-                "lst_state": 1,
-                "lst_mod_date": lst_date
-            })
-        else:
-            await SiteStatistic(
+        async def write(session: AsyncSession) -> None:
+            """在同一异步事务中读取并更新站点失败统计。"""
+            lst_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            sta = await SiteStatistic.async_get_by_domain(session, domain)
+            if sta:
+                sta.fail += 1
+                sta.lst_state = 1
+                sta.lst_mod_date = lst_date
+                return
+            session.add(SiteStatistic(
                 domain=domain,
                 success=0,
                 fail=1,
                 lst_state=1,
-                lst_mod_date=lst_date
-            ).async_create(self._db)
+                lst_mod_date=lst_date,
+            ))
+
+        await self._execute_async_write(write)

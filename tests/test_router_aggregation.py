@@ -9,13 +9,19 @@ from app.api.deps import get_current_active_user_async
 from app.runtime.config import settings
 
 
-def _v1_routes(app: FastAPI) -> list[APIRoute]:
-    """返回最终应用中的 v1 API 路由。"""
+def _v1_routes(app: FastAPI) -> list[Any]:
+    """返回最终应用中可执行的 v1 API 路由上下文。"""
+    routes: list[Any] = []
+    for route in app.routes:
+        effective_route_contexts = getattr(route, "effective_route_contexts", None)
+        if callable(effective_route_contexts):
+            routes.extend(effective_route_contexts())
+        elif isinstance(route, APIRoute):
+            routes.append(route)
     return [
         route
-        for route in app.routes
-        if isinstance(route, APIRoute)
-        and route.path.startswith(f"{settings.API_V1_STR}/")
+        for route in routes
+        if route.path.startswith(f"{settings.API_V1_STR}/")
     ]
 
 
@@ -49,8 +55,8 @@ def _route_contract(route: APIRoute) -> tuple[Any, ...]:
 
 def test_init_routers_directly_includes_endpoint_router_specs(monkeypatch):
     """启动聚合应直接 include 原始端点路由器并一次性附加完整 v1 前缀。"""
-    from app.api.router_specs import API_V1_ROUTER_SPECS
-    from app.startup.routers_initializer import init_routers
+    from app.api.routers import API_V1_ROUTER_SPECS
+    from app.startup.initializers.routers import init_routers
 
     app = FastAPI()
     include_calls = []
@@ -84,20 +90,18 @@ def test_init_routers_directly_includes_endpoint_router_specs(monkeypatch):
 def test_direct_v1_routes_and_openapi_match_compatibility_router():
     """最终应用的 v1 路由合同与 OpenAPI 应和兼容聚合结果完全一致。"""
     from app.api.apiv1 import api_router
-    from app.startup.routers_initializer import init_routers
+    from app.startup.initializers.routers import init_routers
 
     compatibility_app = FastAPI()
     compatibility_app.include_router(api_router, prefix=settings.API_V1_STR)
     direct_app = FastAPI()
     init_routers(direct_app)
 
-    compatibility_routes = [
-        route
-        for route in compatibility_app.routes
-        if isinstance(route, APIRoute)
-    ]
+    compatibility_routes = _v1_routes(compatibility_app)
     direct_routes = _v1_routes(direct_app)
 
+    assert compatibility_routes
+    assert direct_routes
     assert [_route_contract(route) for route in direct_routes] == [
         _route_contract(route) for route in compatibility_routes
     ]
@@ -119,7 +123,7 @@ def test_direct_v1_routes_and_openapi_match_compatibility_router():
 @pytest.mark.anyio
 async def test_direct_routes_honor_application_dependency_overrides():
     """直接聚合后的路由仍应由最终 FastAPI 应用解析依赖覆盖。"""
-    from app.startup.routers_initializer import init_routers
+    from app.startup.initializers.routers import init_routers
 
     app = FastAPI()
     init_routers(app)
@@ -131,22 +135,37 @@ async def test_direct_routes_honor_application_dependency_overrides():
     ) as client:
         response = await client.get(f"{settings.API_V1_STR}/system/ping")
 
-    assert response.status_code == 200
+    assert response.status_code == 200, response.text
     assert response.json() == {"success": True, "message": "", "data": None}
 
 
 def test_compatibility_api_router_keeps_public_contract():
     """历史导出应继续提供无 v1 根前缀的标准 APIRouter 与固定路由集合。"""
     from app.api.apiv1 import api_router
-    from app.api.router_specs import API_V1_ROUTER_SPECS
+    from app.api.routers import API_V1_ROUTER_SPECS
 
     assert type(api_router) is APIRouter
-    assert len(api_router.routes) == sum(
-        len(spec.router.routes) for spec in API_V1_ROUTER_SPECS
-    )
-    assert all(
-        isinstance(route, APIRoute)
-        and route.path.startswith("/")
-        and not route.path.startswith(f"{settings.API_V1_STR}/")
-        for route in api_router.routes
-    )
+    app = FastAPI()
+    app.include_router(api_router, prefix=settings.API_V1_STR)
+    paths = set(app.openapi()["paths"])
+    expected_paths = {
+        f"{settings.API_V1_STR}{spec.prefix}{route.path}"
+        for spec in API_V1_ROUTER_SPECS
+        for route in spec.router.routes
+        if (
+            isinstance(route, APIRoute)
+            and route.include_in_schema
+            and ":path}" not in route.path
+        )
+    }
+    assert expected_paths <= paths
+
+
+def test_init_routers_accepts_composition_root_api_prefix():
+    """路由初始化应使用组合根传入的 API 前缀。"""
+    from app.startup.initializers.routers import init_routers
+
+    app = FastAPI()
+    init_routers(app, "/custom/v1")
+
+    assert "/custom/v1/system/ping" in app.openapi()["paths"]

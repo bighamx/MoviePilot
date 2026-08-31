@@ -2,8 +2,10 @@
 
 from typing import Any, Optional
 
-from app.application.transfer import (
+from app.application.transfer.workflow import (
     TransferQueue as CanonicalTransferQueue,
+)
+from app.application.transfer.workflow import (
     TransferTask as CanonicalTransferTask,
 )
 
@@ -24,8 +26,9 @@ class TransferTask(CanonicalTransferTask):
 
     meta: Optional[Any] = None
     mediainfo: Optional[Any] = None
+    download_history: Optional[Any] = None
 
-    def to_dict(self):
+    def to_dict(self) -> dict[str, Any]:
         """返回兼容领域对象和旧 Pydantic 对象的任务字典。"""
         values = vars(self).copy()
         values["fileitem"] = _serialize_legacy_value(self.fileitem)
